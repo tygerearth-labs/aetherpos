@@ -210,7 +210,7 @@ export default function AuthView() {
           >
             <div className="flex items-center gap-3 mb-3">
               <div className="w-11 h-11 rounded-xl bg-zinc-800/80 border border-zinc-700/50 flex items-center justify-center overflow-hidden">
-                <Image src="/logo.svg" alt="Logo" width={28} height={28} className="object-contain" priority />
+                <Image src="/logo.png" alt="Logo" width={28} height={28} className="object-contain" priority />
               </div>
               <div>
                 <h1 className="text-xl font-bold text-zinc-50 tracking-tight">
@@ -328,7 +328,7 @@ export default function AuthView() {
             className="lg:hidden flex items-center justify-center gap-3 mb-8"
           >
             <div className="w-10 h-10 rounded-xl bg-zinc-800/80 border border-zinc-700/50 flex items-center justify-center overflow-hidden">
-              <Image src="/logo.svg" alt="Logo" width={24} height={24} className="object-contain" priority />
+              <Image src="/logo.png" alt="Logo" width={24} height={24} className="object-contain" priority />
             </div>
             <div>
               <h1 className="text-lg font-bold text-zinc-50 tracking-tight">
