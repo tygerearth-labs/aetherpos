@@ -1630,7 +1630,7 @@ export default function PosPage() {
   // ==================== MAIN RENDER ====================
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 md:flex md:flex-col md:h-[calc(100vh-2rem)] md:gap-3 md:space-y-0">
       {/* Header — Mobile Compact */}
       <div className="md:hidden flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
@@ -1678,7 +1678,7 @@ export default function PosPage() {
       </div>
 
       {/* Header — Desktop Full */}
-      <div className="hidden md:flex md:items-center md:justify-between">
+      <div className="hidden md:flex md:items-center md:justify-between shrink-0">
         <div className="flex items-center gap-3">
           <div>
             <h1 className="text-lg font-bold text-zinc-100">Point of Sale</h1>
@@ -1797,7 +1797,7 @@ export default function PosPage() {
       </div>
 
       {/* Desktop Layout */}
-      <div className="hidden md:grid md:grid-cols-5 gap-4 h-[calc(100vh-10rem)]">
+      <div className="hidden md:grid md:grid-cols-5 gap-4 flex-1 min-h-0">
         {/* Products - Left */}
         <div className="md:col-span-3 flex flex-col">
           {/* Search */}
@@ -1826,7 +1826,7 @@ export default function PosPage() {
         </div>
 
         {/* Cart - Right */}
-        <div className="md:col-span-2 flex flex-col bg-zinc-900/80 border border-zinc-800 rounded-2xl overflow-hidden shadow-xl shadow-black/10">
+        <div className="md:col-span-2 flex flex-col h-full bg-zinc-900/80 border border-zinc-800 rounded-2xl overflow-hidden shadow-xl shadow-black/10">
           <div className="py-3 px-4 border-b border-zinc-800 bg-zinc-900">
             <h2 className="text-xs font-bold text-zinc-300 flex items-center gap-2">
               <div className="w-6 h-6 rounded-lg bg-emerald-500/20 flex items-center justify-center">
@@ -2003,7 +2003,7 @@ export default function PosPage() {
       </div>
 
       {/* Mobile Layout — Product view + floating cart */}
-      <div className="md:hidden">
+      <div className="md:hidden shrink-0">
         <div className="relative mb-3">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-500" />
           <Input
