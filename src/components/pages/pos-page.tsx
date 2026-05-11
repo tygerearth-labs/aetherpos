@@ -2024,7 +2024,7 @@ export default function PosPage() {
         </div>
         {renderCategoryChips()}
         <div className="grid grid-cols-2 gap-2.5 pb-2">{renderProductGrid()}</div>
-        <div className="pb-24">{renderPagination()}</div>
+        <div className="pb-16">{renderPagination()}</div>
 
         {/* Floating Cart Button */}
         {cart.length > 0 && (
