@@ -1799,9 +1799,9 @@ export default function PosPage() {
       {/* Desktop Layout */}
       <div className="hidden md:grid md:grid-cols-5 gap-4 flex-1 min-h-0">
         {/* Products - Left */}
-        <div className="md:col-span-3 flex flex-col">
+        <div className="md:col-span-3 flex flex-col min-h-0">
           {/* Search */}
-          <div className="relative mb-3">
+          <div className="relative mb-3 shrink-0">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-500" />
             <Input
               ref={searchInputRef}
@@ -1814,15 +1814,17 @@ export default function PosPage() {
           </div>
 
           {/* Category Chips */}
-          {renderCategoryChips()}
+          <div className="shrink-0">{renderCategoryChips()}</div>
 
-          {/* Product Grid */}
+          {/* Product Grid — scrollable middle */}
           <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
-            <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2 pb-3">
+            <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2 pb-2">
               {renderProductGrid()}
             </div>
           </div>
-          {renderPagination()}
+
+          {/* Pagination — fixed bottom */}
+          <div className="shrink-0">{renderPagination()}</div>
         </div>
 
         {/* Cart - Right */}
@@ -1839,7 +1841,7 @@ export default function PosPage() {
             </h2>
           </div>
 
-          {/* Scrollable area: customer + items + summary */}
+          {/* Items — scrollable middle */}
           <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
             {renderCustomerSelector(false)}
 
@@ -1899,9 +1901,11 @@ export default function PosPage() {
               </div>
             )}
             </div>
+          </div>
 
-          {/* Summary & Payment */}
-          <div className="border-t border-zinc-800 p-4 space-y-3 bg-zinc-900">
+          {/* Summary & Payment — fixed bottom, scrollable if tall */}
+          <div className="shrink-0 border-t border-zinc-800 bg-zinc-900 overflow-y-auto overscroll-contain max-h-[45%]">
+            <div className="p-4 space-y-3">
             <div className="space-y-1 text-xs">
               <div className="flex justify-between text-zinc-400"><span>Subtotal</span><span className="text-zinc-200">{formatCurrency(subtotal)}</span></div>
               {settings.loyaltyEnabled && selectedCustomer && maxPointsToUse > 0 && (
@@ -2000,7 +2004,7 @@ export default function PosPage() {
               {checkingOut ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
               Proses Pembayaran
             </Button>
-          </div>
+            </div>
           </div>
         </div>
       </div>
