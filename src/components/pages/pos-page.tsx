@@ -1630,7 +1630,7 @@ export default function PosPage() {
   // ==================== MAIN RENDER ====================
 
   return (
-    <div className="space-y-3 md:flex md:flex-col md:h-full md:gap-3 md:space-y-0">
+    <div className="space-y-3 md:flex md:flex-col md:h-full md:gap-3 md:space-y-0 md:overflow-hidden">
       {/* Header — Mobile Compact */}
       <div className="md:hidden flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
@@ -1827,7 +1827,7 @@ export default function PosPage() {
 
         {/* Cart - Right */}
         <div className="md:col-span-2 flex flex-col h-full bg-zinc-900/80 border border-zinc-800 rounded-2xl overflow-hidden shadow-xl shadow-black/10">
-          <div className="py-3 px-4 border-b border-zinc-800 bg-zinc-900">
+          <div className="py-3 px-4 border-b border-zinc-800 bg-zinc-900 shrink-0">
             <h2 className="text-xs font-bold text-zinc-300 flex items-center gap-2">
               <div className="w-6 h-6 rounded-lg bg-emerald-500/20 flex items-center justify-center">
                 <ShoppingCart className="h-3.5 w-3.5 text-emerald-400" />
@@ -1839,9 +1839,11 @@ export default function PosPage() {
             </h2>
           </div>
 
-          {renderCustomerSelector(false)}
+          {/* Scrollable area: customer + items + summary */}
+          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
+            {renderCustomerSelector(false)}
 
-          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-4 py-2">
+            <div className="px-4 py-2">
             {cart.length === 0 ? (
               <div className="text-center py-12">
                 <div className="w-16 h-16 rounded-2xl bg-zinc-800 flex items-center justify-center mx-auto mb-3">
@@ -1896,7 +1898,7 @@ export default function PosPage() {
                 })}
               </div>
             )}
-          </div>
+            </div>
 
           {/* Summary & Payment */}
           <div className="border-t border-zinc-800 p-4 space-y-3 bg-zinc-900">
@@ -1998,6 +2000,7 @@ export default function PosPage() {
               {checkingOut ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
               Proses Pembayaran
             </Button>
+          </div>
           </div>
         </div>
       </div>

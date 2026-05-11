@@ -69,7 +69,7 @@ function AppContent() {
         className={`transition-all duration-300 ease-in-out overflow-x-hidden ${
           collapsed ? 'md:ml-[68px]' : 'md:ml-64'
         } ${
-          currentPage === 'pos' ? 'md:h-screen md:overflow-hidden' : 'min-h-screen'
+          currentPage === 'pos' ? 'md:h-screen' : 'min-h-screen'
         }`}
       >
         {/* Mobile: bottom padding for nav. Desktop POS: full screen. Others: normal padding */}
