@@ -66,13 +66,18 @@ function AppContent() {
       <Sidebar />
       <MobileBottomNav />
       <main
-        className={`min-h-screen transition-all duration-300 ease-in-out overflow-x-hidden ${
+        className={`transition-all duration-300 ease-in-out overflow-x-hidden ${
           collapsed ? 'md:ml-[68px]' : 'md:ml-64'
+        } ${
+          currentPage === 'pos' ? 'md:h-screen md:overflow-hidden' : 'min-h-screen'
         }`}
       >
-        {/* Mobile: no top padding (no hamburger bar), bottom padding for nav */}
-        {/* Desktop: no top padding, no bottom padding */}
-        <div className="pb-20 md:pb-0 px-3 sm:px-4 md:py-4 lg:px-5 lg:py-4 max-w-full">
+        {/* Mobile: bottom padding for nav. Desktop POS: full screen. Others: normal padding */}
+        <div className={`max-w-full ${
+          currentPage === 'pos'
+            ? 'pb-20 px-3 sm:px-4 md:h-full md:pb-0 md:px-3 md:py-3'
+            : 'pb-20 md:pb-0 px-3 sm:px-4 md:py-4 lg:px-5 lg:py-4'
+        }`}>
           {renderPage()}
         </div>
       </main>

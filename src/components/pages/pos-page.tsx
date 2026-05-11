@@ -1630,7 +1630,7 @@ export default function PosPage() {
   // ==================== MAIN RENDER ====================
 
   return (
-    <div className="space-y-3 md:flex md:flex-col md:h-[calc(100vh-2rem)] md:gap-3 md:space-y-0">
+    <div className="space-y-3 md:flex md:flex-col md:h-full md:gap-3 md:space-y-0">
       {/* Header — Mobile Compact */}
       <div className="md:hidden flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
