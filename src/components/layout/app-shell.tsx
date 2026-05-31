@@ -29,7 +29,7 @@ function AppContent() {
   if (status === 'loading') {
     return (
       <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
-        <Loader2 className="h-6 w-6 animate-spin text-emerald-400" />
+        <Loader2 className="h-6 w-6 animate-spin theme-text" />
       </div>
     )
   }
@@ -62,20 +62,20 @@ function AppContent() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-950 overflow-x-hidden">
+    <div className={`bg-zinc-950 overflow-x-clip ${currentPage === 'pos' ? 'md:h-screen md:overflow-y-hidden' : 'min-h-screen'}`}>
       <Sidebar />
       <MobileBottomNav />
       <main
-        className={`transition-all duration-300 ease-in-out overflow-x-hidden ${
+        className={`transition-all duration-300 ease-in-out ${
           collapsed ? 'md:ml-[68px]' : 'md:ml-64'
         } ${
-          currentPage === 'pos' ? 'md:h-screen' : 'min-h-screen'
+          currentPage === 'pos' ? 'md:h-full' : 'min-h-screen'
         }`}
       >
         {/* Mobile: bottom padding for nav. Desktop POS: full screen. Others: normal padding */}
         <div className={`max-w-full ${
           currentPage === 'pos'
-            ? 'pb-20 px-3 pt-3 sm:px-4 md:h-full md:pb-0 md:px-3 md:py-3'
+            ? 'pb-20 px-3 pt-3 sm:px-4 md:h-full md:pb-0 md:px-3 md:py-2 md:overflow-y-hidden'
             : 'pb-20 md:pb-0 px-3 sm:px-4 md:py-4 lg:px-5 lg:py-4'
         }`}>
           {renderPage()}
