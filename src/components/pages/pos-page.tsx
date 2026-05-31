@@ -1816,9 +1816,9 @@ export default function PosPage() {
           {/* Category Chips */}
           <div className="shrink-0">{renderCategoryChips()}</div>
 
-          {/* Product Grid — scrollable middle */}
-          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
-            <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2 pb-2">
+          {/* Product Grid — scrollable middle (pt-2 for badge clearance) */}
+          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain pt-2">
+            <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5 pb-2">
               {renderProductGrid()}
             </div>
           </div>
@@ -2100,26 +2100,26 @@ export default function PosPage() {
           />
         </div>
         {renderCategoryChips()}
-        <div className="grid grid-cols-2 gap-2.5 pb-2">{renderProductGrid()}</div>
+        <div className="grid grid-cols-2 gap-2.5 pt-2 pb-2">{renderProductGrid()}</div>
         <div className="pb-8">{renderPagination()}</div>
-
-        {/* Floating Cart Button — Redesigned */}
-        {cart.length > 0 && (
-          <button
-            onClick={() => setMobileCartOpen(true)}
-            className="fixed bottom-20 right-4 z-40 flex items-center gap-3 h-14 pl-4 pr-5 rounded-2xl theme-gradient text-white shadow-2xl theme-shadow hover:theme-shadow active:scale-95 transition-all duration-150"
-          >
-            <div className="relative">
-              <ShoppingCart className="h-5 w-5" />
-              <span className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-white theme-bg-dark text-[9px] font-bold flex items-center justify-center shadow-sm">{cart.reduce((s, i) => s + i.qty, 0)}</span>
-            </div>
-            <div className="flex flex-col items-start leading-tight">
-              <span className="text-[10px] font-medium theme-text-light">{cart.length} produk</span>
-              <span className="text-sm font-bold">{formatCurrency(total)}</span>
-            </div>
-          </button>
-        )}
       </div>
+
+      {/* Floating Cart Button — Mobile only, outside scroll area to prevent clipping */}
+      {cart.length > 0 && (
+        <button
+          onClick={() => setMobileCartOpen(true)}
+          className="md:hidden fixed bottom-20 right-4 z-50 flex items-center gap-3 h-14 pl-4 pr-5 rounded-2xl theme-gradient text-white shadow-2xl theme-shadow hover:theme-shadow active:scale-95 transition-all duration-150"
+        >
+          <div className="relative">
+            <ShoppingCart className="h-5 w-5" />
+            <span className="absolute -top-1.5 -right-1.5 min-w-4 h-4 rounded-full bg-white theme-bg-dark text-[9px] font-bold flex items-center justify-center shadow-sm px-1">{cart.reduce((s, i) => s + i.qty, 0)}</span>
+          </div>
+          <div className="flex flex-col items-start leading-tight">
+            <span className="text-[10px] font-medium theme-text-light">{cart.length} produk</span>
+            <span className="text-sm font-bold">{formatCurrency(total)}</span>
+          </div>
+        </button>
+      )}
 
       {/* ── Mobile Cart Sheet — Redesigned ── */}
       <Sheet open={mobileCartOpen} onOpenChange={(open) => { if (!open) setMobileCartOpen(false) }}>
