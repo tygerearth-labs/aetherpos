@@ -89,10 +89,16 @@ import {
   AlertCircle,
   Layers,
   FilePenLine,
+  ScanBarcode,
+  Printer,
 } from 'lucide-react'
 // Collapsible removed — analytics section removed in redesign
 import { ProGate } from '@/components/shared/pro-gate'
 import ProductFormDialog from './product-form-dialog'
+import dynamic from 'next/dynamic'
+
+const BarcodeDisplay = dynamic(() => import('@/components/shared/barcode-display'), { ssr: false })
+const BatchBarcodeDialog = dynamic(() => import('@/components/shared/batch-barcode-dialog'), { ssr: false })
 
 interface Category {
   id: string
@@ -105,6 +111,7 @@ interface Product {
   id: string
   name: string
   sku: string | null
+  barcode: string | null
   hpp: number
   price: number
   bruto: number
@@ -118,6 +125,15 @@ interface Product {
   hasVariants?: boolean
   _variantCount?: number
   _maxPrice?: number
+  variants?: Array<{
+    id: string
+    name: string
+    sku: string | null
+    barcode: string | null
+    price: number
+    hpp: number
+    stock: number
+  }>
 }
 
 interface ProductStats {
@@ -419,6 +435,7 @@ export default function ProductsPage() {
   const [editExcelUploading, setEditExcelUploading] = useState(false)
   const [editExcelProgress, setEditExcelProgress] = useState(0)
   const [editExcelPhase, setEditExcelPhase] = useState('')
+  const [batchBarcodeOpen, setBatchBarcodeOpen] = useState(false)
   const [editExcelResult, setEditExcelResult] = useState<{
     updated: number
     notFound: number
@@ -1063,7 +1080,7 @@ export default function ProductsPage() {
           <h1 className="text-xl font-bold text-zinc-100 tracking-tight">Produk</h1>
           <p className="text-sm text-zinc-500 mt-0.5">Kelola inventori produk kamu</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 overflow-x-auto scrollbar-hide -mx-1 px-1 sm:overflow-visible sm:mx-0 sm:px-0 sm:flex-wrap">
           {isPro && isOwner && (
             <Button
               variant={bulkMode ? 'default' : 'outline'}
@@ -1074,8 +1091,8 @@ export default function ProductsPage() {
               }}
               className={
                 bulkMode
-                  ? 'bg-amber-500 hover:bg-amber-600 text-white border-amber-500 h-9 text-xs font-medium'
-                  : 'bg-zinc-800/80 border-zinc-700/80 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700 h-9 text-xs font-medium'
+                  ? 'bg-amber-500 hover:bg-amber-600 text-white border-amber-500 h-9 text-xs font-medium shrink-0'
+                  : 'bg-zinc-800/80 border-zinc-700/80 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700 h-9 text-xs font-medium shrink-0'
               }
             >
               <ListChecks className="mr-1.5 h-3.5 w-3.5" />
@@ -1083,10 +1100,18 @@ export default function ProductsPage() {
             </Button>
           )}
           <Button onClick={handleExportExcel} disabled={exporting}
-              className="bg-zinc-800/80 border-zinc-700/80 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700 h-9 text-xs font-medium disabled:opacity-50"
+              className="bg-zinc-800/80 border-zinc-700/80 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700 h-9 text-xs font-medium disabled:opacity-50 shrink-0"
             >
               {exporting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Download className="mr-1.5 h-3.5 w-3.5" />}
               Export Excel
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => setBatchBarcodeOpen(true)}
+              className="bg-zinc-800/80 border-zinc-700/80 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700 h-9 text-xs font-medium shrink-0"
+            >
+              <Printer className="mr-1.5 h-3.5 w-3.5" />
+              Cetak Barcode
             </Button>
           <ProGate feature="bulkUpload" label="Upload Excel" description="Upload produk massal via file Excel" variant="inline">
             <Button
@@ -1096,7 +1121,7 @@ export default function ProductsPage() {
                 setUploadFile(null)
                 setUploadResult(null)
               }}
-              className="bg-zinc-800/80 border-zinc-700/80 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700 h-9 text-xs font-medium"
+              className="bg-zinc-800/80 border-zinc-700/80 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700 h-9 text-xs font-medium shrink-0"
             >
               <Upload className="mr-1.5 h-3.5 w-3.5" />
               Upload Excel
@@ -1112,13 +1137,13 @@ export default function ProductsPage() {
                 setEditExcelProgress(0)
                 setEditExcelPhase('')
               }}
-              className="bg-zinc-800/80 border-zinc-700/80 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700 h-9 text-xs font-medium"
+              className="bg-zinc-800/80 border-zinc-700/80 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700 h-9 text-xs font-medium shrink-0"
             >
               <FilePenLine className="mr-1.5 h-3.5 w-3.5" />
               Edit Excel
             </Button>
           </ProGate>
-          <Button onClick={handleAdd} className="theme-bg theme-hover text-white h-9 text-xs font-medium shadow-lg theme-shadow">
+          <Button onClick={handleAdd} className="theme-bg theme-hover text-white h-9 text-xs font-medium shadow-lg theme-shadow shrink-0">
             <Plus className="mr-1.5 h-3.5 w-3.5" />
             Tambah Produk
           </Button>
@@ -2953,7 +2978,7 @@ export default function ProductsPage() {
                         <div className="grid grid-cols-2 gap-2 text-xs">
                           <div>
                             <span className="text-zinc-500 text-[11px]">SKU</span>
-                            <p className="text-zinc-200">{detailData.product.sku || '-'}</p>
+                            <p className="text-zinc-200 font-mono">{detailData.product.sku || '-'}</p>
                           </div>
                           <div>
                             <span className="text-zinc-500 text-[11px]">Stock</span>
@@ -3028,6 +3053,35 @@ export default function ProductsPage() {
                         </div>
                       </div>
 
+                      {/* Barcode Card */}
+                      {detailData.product.barcode && (
+                        <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3 space-y-2">
+                          <h3 className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
+                            <ScanBarcode className="h-3.5 w-3.5 theme-text" />
+                            Barcode
+                          </h3>
+                          <div className="flex justify-center bg-white rounded-lg p-3">
+                            <BarcodeDisplay
+                              value={detailData.product.barcode}
+                              width={2}
+                              height={50}
+                              fontSize={11}
+                              margin={2}
+                              showPrint
+                              label={detailData.product.name}
+                              priceLabel={(() => {
+                                const p = detailData.product
+                                const price = p.price || 0
+                                const maxP = p._maxPrice || 0
+                                return maxP && maxP !== price
+                                  ? `${formatCurrency(price)} ~ ${formatCurrency(maxP)}`
+                                  : formatCurrency(price)
+                              })()}
+                            />
+                          </div>
+                        </div>
+                      )}
+
                       {/* Variant List Card */}
                       {detailData.product.hasVariants && detailData.product.variants && detailData.product.variants.length > 0 && (
                         <div className="rounded-lg border border-violet-500/20 bg-violet-500/[0.03] p-3 space-y-2">
@@ -3047,24 +3101,42 @@ export default function ProductsPage() {
                               const isOutOfStock = v.stock <= 0
                               const isLowStock = v.stock > 0 && v.stock <= (detailData.product.lowStockAlert || 10)
                               return (
-                                <div key={v.id} className="grid grid-cols-4 gap-1 bg-zinc-800/40 rounded-lg px-2.5 py-2 items-center">
-                                  <div className="min-w-0 col-span-1">
-                                    <p className="text-xs font-medium text-zinc-200 truncate">{v.name}</p>
-                                    {v.sku && <p className="text-[10px] text-zinc-600 font-mono truncate">{v.sku}</p>}
+                                <div key={v.id} className="bg-zinc-800/40 rounded-lg px-2.5 py-2">
+                                  <div className="grid grid-cols-4 gap-1 items-center">
+                                    <div className="min-w-0 col-span-1">
+                                      <p className="text-xs font-medium text-zinc-200 truncate">{v.name}</p>
+                                      {v.sku && <p className="text-[10px] text-zinc-600 font-mono truncate">{v.sku}</p>}
+                                    </div>
+                                    <div className="text-right col-span-1">
+                                      {isOwner && (
+                                        <p className="text-[11px] text-zinc-500">{formatCurrency(v.hpp)}</p>
+                                      )}
+                                    </div>
+                                    <div className="text-right col-span-1">
+                                      <p className="text-xs font-medium text-zinc-200">{formatCurrency(v.price)}</p>
+                                    </div>
+                                    <div className="text-right col-span-1">
+                                      <span className={`text-[10px] px-1.5 py-0.5 rounded-md font-medium ${isOutOfStock ? 'bg-red-500/10 text-red-400' : isLowStock ? 'bg-amber-500/10 text-amber-400' : 'bg-zinc-800 text-zinc-500'}`}>
+                                        {formatNumber(v.stock)}
+                                      </span>
+                                    </div>
                                   </div>
-                                  <div className="text-right col-span-1">
-                                    {isOwner && (
-                                      <p className="text-[11px] text-zinc-500">{formatCurrency(v.hpp)}</p>
-                                    )}
-                                  </div>
-                                  <div className="text-right col-span-1">
-                                    <p className="text-xs font-medium text-zinc-200">{formatCurrency(v.price)}</p>
-                                  </div>
-                                  <div className="text-right col-span-1">
-                                    <span className={`text-[10px] px-1.5 py-0.5 rounded-md font-medium ${isOutOfStock ? 'bg-red-500/10 text-red-400' : isLowStock ? 'bg-amber-500/10 text-amber-400' : 'bg-zinc-800 text-zinc-500'}`}>
-                                      {formatNumber(v.stock)}
-                                    </span>
-                                  </div>
+                                  {v.barcode && (
+                                    <div className="mt-1.5 pt-1.5 border-t border-zinc-700/50 flex flex-col items-center">
+                                      <div className="bg-white rounded p-1.5">
+                                        <BarcodeDisplay
+                                          value={v.barcode}
+                                          width={1.5}
+                                          height={35}
+                                          fontSize={9}
+                                          margin={1}
+                                          showPrint
+                                          label={`${detailData.product.name} - ${v.name}`}
+                                          priceLabel={formatCurrency(v.price)}
+                                        />
+                                      </div>
+                                    </div>
+                                  )}
                                 </div>
                               )
                             })}
@@ -3232,6 +3304,13 @@ export default function ProductsPage() {
           )}
         </SheetContent>
       </Sheet>
+
+      {/* Batch Barcode Print Dialog */}
+      <BatchBarcodeDialog
+        open={batchBarcodeOpen}
+        onOpenChange={setBatchBarcodeOpen}
+        categories={categories}
+      />
     </div>
   )
 }
