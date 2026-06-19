@@ -92,6 +92,19 @@ export interface CachedSettings {
   updatedAt: string
 }
 
+export interface PendingTransaction {
+  id?: number
+  items: Record<string, unknown>[]
+  customerId: string | null
+  customerName: string | null
+  customerPhone: string | null
+  note: string
+  subtotal: number
+  createdAt: number
+  userId: string
+  userName: string
+}
+
 // ============================================================
 // Database
 // ============================================================
@@ -102,6 +115,7 @@ class AetherDB extends Dexie {
   customers!: EntityTable<CachedCustomer, 'id'>
   promos!: EntityTable<CachedPromo, 'id'>
   transactions!: EntityTable<OfflineTransaction, 'id'>
+  pendingTransactions!: EntityTable<PendingTransaction, 'id'>
   syncMeta!: EntityTable<SyncMeta, 'key'>
   settings!: EntityTable<CachedSettings, 'key'>
 
@@ -114,6 +128,17 @@ class AetherDB extends Dexie {
       customers: 'id, name, whatsapp, updatedAt',
       promos: 'id, name, type, active, updatedAt',
       transactions: '++id, isSynced, createdAt',
+      syncMeta: 'key',
+      settings: 'key',
+    })
+
+    this.version(4).stores({
+      products: 'id, name, sku, barcode, categoryId, updatedAt',
+      categories: 'id, name, updatedAt',
+      customers: 'id, name, whatsapp, updatedAt',
+      promos: 'id, name, type, active, updatedAt',
+      transactions: '++id, isSynced, createdAt',
+      pendingTransactions: '++id, createdAt',
       syncMeta: 'key',
       settings: 'key',
     })

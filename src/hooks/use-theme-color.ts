@@ -36,6 +36,7 @@ export function getThemeColorMap() {
 
 export function useThemeColor() {
   const [theme, setTheme] = useState<string>('emerald')
+  const [loaded, setLoaded] = useState(false)
 
   useEffect(() => {
     const loadTheme = async () => {
@@ -46,6 +47,7 @@ export function useThemeColor() {
           setTheme(data.themePrimaryColor || 'emerald')
         }
       } catch { /* silent */ }
+      finally { setLoaded(true) }
     }
     loadTheme()
   }, [])
@@ -83,5 +85,5 @@ export function useThemeColor() {
     }
   }, [theme])
 
-  return { theme, themeColors: THEME_COLORS[theme] || THEME_COLORS.emerald }
+  return { theme, themeColors: THEME_COLORS[theme] || THEME_COLORS.emerald, loaded }
 }
