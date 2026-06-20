@@ -16,15 +16,21 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Aether POS — Point of Sale System",
-  description: "High-performance POS for MSME. Modern, fast, and reliable point-of-sale system for small and medium businesses.",
+  title: "AETHER",
+  description: "AETHER — High-performance POS for MSME. Modern, fast, and reliable point-of-sale system.",
   manifest: "/manifest.json",
   icons: {
-    icon: "/favicon.png",
-    apple: "/logo.png",
+    icon: [
+      { url: "/favicon.ico", sizes: "48x48" },
+      { url: "/favicon-16x16.png", sizes: "16x16", type: "image/png" },
+      { url: "/favicon-32x32.png", sizes: "32x32", type: "image/png" },
+    ],
+    apple: [
+      { url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" },
+    ],
   },
   openGraph: {
-    title: "Aether POS",
+    title: "AETHER",
     description: "High-performance POS for MSME",
     type: "website",
   },
@@ -32,9 +38,9 @@ export const metadata: Metadata = {
     "mobile-web-app-capable": "yes",
     "apple-mobile-web-app-capable": "yes",
     "apple-mobile-web-app-status-bar-style": "black-translucent",
-    "apple-mobile-web-app-title": "AetherPOS",
-    "application-name": "AetherPOS",
-    "msapplication-TileColor": "#09090b",
+    "apple-mobile-web-app-title": "AETHER",
+    "application-name": "AETHER",
+    "msapplication-TileColor": "#020617",
   },
 };
 
@@ -47,11 +53,11 @@ export default function RootLayout({
     <html lang="en" className="dark" suppressHydrationWarning>
         <head>
           <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover" />
-          <meta name="theme-color" content="#059669" />
-          <link rel="apple-touch-icon" href="/logo.png" />
+          <meta name="theme-color" content="#020617" />
+          <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
         </head>
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-zinc-950 text-zinc-100 overflow-x-hidden`}
+        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-deep-space text-slate-100 overflow-x-hidden`}
       >
         <ThemeProvider>
           {children}
