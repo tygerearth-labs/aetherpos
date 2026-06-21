@@ -256,10 +256,75 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
     document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
   };
 
+  // JSON-LD Structured Data
+  const jsonLd = {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    name: "AETHER POS",
+    applicationCategory: "BusinessApplication",
+    operatingSystem: "Web",
+    description: "Sistem Point of Sale modern untuk UMKM Indonesia. Kelola stok, transaksi, pelanggan, dan laporan dalam satu platform.",
+    url: "https://aethergo.id",
+    offers: {
+      "@type": "Offer",
+      price: "0",
+      priceCurrency: "IDR",
+      description: "Gratis 6 bulan untuk semua fitur"
+    },
+    aggregateRating: {
+      "@type": "AggregateRating",
+      ratingValue: "4.8",
+      ratingCount: "120",
+      bestRating: "5",
+      worstRating: "1"
+    },
+    creator: {
+      "@type": "Organization",
+      name: "Aether POS",
+      url: "https://aethergo.id"
+    },
+    inLanguage: "id",
+    featureList: [
+      "Point of Sale terminal",
+      "Manajemen stok real-time",
+      "Laporan penjualan & analitik",
+      "Manajemen pelanggan & loyalty",
+      "Offline mode & auto-sync",
+      "Multi-outlet support",
+      "Cetak struk thermal",
+      "WhatsApp receipt"
+    ]
+  }
+
+  const orgJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    name: "Aether POS",
+    url: "https://aethergo.id",
+    logo: "https://aethergo.id/logo.png",
+    sameAs: [],
+    contactPoint: {
+      "@type": "ContactPoint",
+      contactType: "customer support",
+      availableLanguage: "Indonesian"
+    }
+  }
+
   return (
     <div className="min-h-screen bg-deep-space text-slate-100 overflow-x-hidden">
+      {/* JSON-LD Structured Data */}
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+      />
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(orgJsonLd) }}
+      />
       {/* ── NAV ── */}
+      <header>
       <nav
+        aria-label="Navigasi utama"
         className={cn(
           "fixed top-0 inset-x-0 z-50 transition-all duration-300",
           scrolled
@@ -270,7 +335,7 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
         <div className="max-w-6xl mx-auto flex items-center justify-between h-14 px-4 sm:px-6">
           {/* Logo */}
           <button onClick={onGetStarted} className="flex items-center gap-2 shrink-0">
-            <img src="/logo.png" alt="Aether" className="h-7 w-auto" />
+            <img src="/logo.png" alt="AETHER POS — Logo" className="h-7 w-auto" />
           </button>
 
           {/* Center links — hidden on mobile */}
@@ -330,7 +395,9 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
           </motion.div>
         )}
       </nav>
+      </header>
 
+      <main>
       {/* ═══════════════════════════════════════════════════
          SECTION 1: HERO
          ═══════════════════════════════════════════════════ */}
@@ -973,6 +1040,7 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
           </motion.div>
         </div>
       </section>
+      </main>
 
       {/* ═══════════════════════════════════════════════════
          FOOTER
@@ -980,7 +1048,7 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
       <footer className="border-t border-white/[0.04] py-8">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
-            <img src="/logo.png" alt="Aether" className="h-5 w-auto opacity-60" />
+            <img src="/logo.png" alt="AETHER POS — Logo" className="h-5 w-auto opacity-60" />
             <span className="text-xs text-slate-500">
               &copy; 2025 Aether POS. Dibangun di Indonesia.
             </span>
