@@ -39,9 +39,9 @@ import {
   Store,
   Tag,
   Layers,
-  Pause,
-  Play,
+  ClockArrowDown,
   Clock,
+  MessageSquare,
 } from 'lucide-react'
 import {
   Select,
@@ -51,7 +51,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useLiveQuery } from 'dexie-react-hooks'
-import { localDB, type PendingTransaction } from '@/lib/local-db'
+import { localDB, type PendingTransaction, type OfflineTransaction } from '@/lib/local-db'
 import { syncAllData, getAllSyncTimes, syncSettingsFromServer, getCachedSettings } from '@/lib/sync-service'
 import { cn } from '@/lib/utils'
 import { useSession } from 'next-auth/react'
@@ -452,9 +452,12 @@ export default function PosPage() {
   const [editingQtyId, setEditingQtyId] = useState<string | null>(null)
   const [editingQtyValue, setEditingQtyValue] = useState('')
   const qtyInputRef = useRef<HTMLInputElement>(null)
+  const [holdNote, setHoldNote] = useState('')
+  const [holdNoteOpen, setHoldNoteOpen] = useState(false)
 
   // Pending Transactions
   const [pendingListOpen, setPendingListOpen] = useState(false)
+  const [offlineListOpen, setOfflineListOpen] = useState(false)
   const pendingCount = useLiveQuery(
     () => localDB.pendingTransactions.count(),
     []
@@ -517,7 +520,8 @@ export default function PosPage() {
               body: JSON.stringify({ transactions: pending }),
             })
             const data = await res.json()
-            if (res.ok && data.synced > 0) {
+            if (res.ok) {
+              let synced = 0
               for (const result of data.results || []) {
                 if (result.success) {
                   await localDB.transactions.update(result.localId, {
@@ -526,9 +530,23 @@ export default function PosPage() {
                     invoiceNumber: result.invoiceNumber,
                     serverTransactionId: result.serverId,
                   })
+                  synced++
+                } else {
+                  const existing = await localDB.transactions.get(result.localId)
+                  await localDB.transactions.update(result.localId, {
+                    retryCount: (existing?.retryCount || 0) + 1,
+                    lastError: result.error,
+                  })
                 }
               }
-              toast.success(`${data.synced} transaction(s) auto-synced!`)
+              if (synced > 0) {
+                toast.success(`${synced} transaction(s) auto-synced!`)
+                fetchProducts(productSearch, productPage, selectedCategoryId)
+                loadCustomersFromCache()
+              }
+              if (data.failed > 0) {
+                toast.warning(`${data.failed} transaksi gagal sync`, { description: 'Buka menu "Offline" untuk detail.' })
+              }
             }
           }
 
@@ -908,6 +926,12 @@ export default function PosPage() {
 
   const handleHoldTransaction = async () => {
     if (cart.length === 0) return
+    // Show note dialog first
+    setHoldNoteOpen(true)
+  }
+
+  const confirmHoldTransaction = async () => {
+    setHoldNoteOpen(false)
     try {
       const userName = session?.user?.name || 'Unknown'
       const userId = (session?.user as any)?.id || ''
@@ -919,12 +943,13 @@ export default function PosPage() {
         })),
         customerId: selectedCustomer?.id || null,
         customerName: selectedCustomer?.name || null,
-        note: '',
+        note: holdNote.trim(),
         subtotal,
         createdAt: Date.now(),
         userId,
         userName,
       })
+      setHoldNote('')
       clearCart()
       setMobileCartOpen(false)
       toast.success('Transaksi ditunda')
@@ -1310,7 +1335,7 @@ export default function PosPage() {
         className={`shrink-0 px-3 py-1.5 sm:px-3 sm:py-1.5 rounded-full text-[11px] font-medium border transition-all backdrop-blur-sm ${
           !selectedCategoryId
             ? `${themeColors.activeBg} ${themeColors.text} ${themeColors.border} shadow-sm`
-            : 'bg-nebula/60 border-white/[0.06] text-slate-500 hover:border-white/[0.08] hover:text-slate-300'
+            : 'aether-card text-slate-500 hover:text-slate-300'
         }`}
       >
         <LayoutGrid className="inline h-3 w-3 mr-1 -mt-0.5" strokeWidth={1.5} />
@@ -1326,7 +1351,7 @@ export default function PosPage() {
             className={`shrink-0 px-3 py-1.5 sm:px-3 sm:py-1.5 rounded-full text-[11px] font-medium border transition-all backdrop-blur-sm ${
               isActive
                 ? `${colors.activeBg} ${colors.text} ${colors.border} shadow-sm`
-                : 'bg-nebula/60 border-white/[0.06] text-slate-500 hover:border-white/[0.08] hover:text-slate-300'
+                : 'aether-card text-slate-500 hover:text-slate-300'
             }`}
           >
             {cat.name}
@@ -1339,14 +1364,14 @@ export default function PosPage() {
   const renderProductGrid = () => {
     if (productsLoading) {
       return Array.from({ length: 8 }).map((_, i) => (
-        <div key={i} className="h-[88px] md:h-[72px] rounded-xl bg-white/[0.02] animate-pulse" />
+        <div key={i} className="h-[88px] md:h-[72px] rounded-xl aether-shimmer" />
       ))
     }
 
     if (products.length === 0) {
       return (
         <div className="col-span-full text-center py-12">
-          <Package className="h-10 w-10 text-slate-700 mx-auto mb-2" strokeWidth={1.5} />
+          <Package className="h-10 w-10 text-slate-600 mx-auto mb-2" strokeWidth={1.5} />
           <p className="text-xs text-slate-500">
             {selectedCategoryId ? 'Tidak ada produk di kategori ini' : 'Tidak ada produk ditemukan'}
           </p>
@@ -1388,10 +1413,10 @@ export default function PosPage() {
           className={cn(
             'relative group min-h-[68px] md:min-h-0 rounded-2xl md:rounded-xl border text-left transition-all duration-200',
             outOfStock
-              ? 'opacity-40 cursor-not-allowed border-white/[0.04] bg-white/[0.02] p-2.5 md:p-3'
+              ? 'opacity-40 cursor-not-allowed aether-card p-2.5 md:p-3'
               : hasCartItems
               ? `${accentColor.border} ${accentColor.bg} ring-1 ring-inset ${accentColor.border.replace('border-', 'ring-')} cursor-pointer active:scale-[0.98]`
-              : 'border-white/[0.04] bg-nebula/60 hover:border-white/[0.08] hover:bg-white/[0.03] hover:shadow-lg hover:shadow-black/20 backdrop-blur-sm cursor-pointer active:scale-[0.98]'
+              : 'aether-card cursor-pointer active:scale-[0.98]'
           )}
         >
           {!outOfStock && (
@@ -1409,6 +1434,24 @@ export default function PosPage() {
             'relative z-[1] pointer-events-none',
             'p-2.5 md:p-3'
           )}>
+            {/* Product Image */}
+            {product.image && (
+              <div className="relative w-full aspect-square max-h-[72px] md:max-h-[96px] mx-auto mb-2 md:mb-2.5 rounded-lg overflow-hidden bg-white/[0.03]">
+                <img
+                  src={product.image}
+                  alt={product.name}
+                  className="w-full h-full object-cover"
+                  onError={(e) => {
+                    e.currentTarget.style.display = 'none'
+                    const next = e.currentTarget.nextElementSibling
+                    if (next) next.setAttribute('style', 'display:flex')
+                  }}
+                />
+                <div className="absolute inset-0 items-center justify-center bg-white/[0.02] hidden">
+                  <Package className="h-5 w-5 text-slate-700" strokeWidth={1.5} />
+                </div>
+              </div>
+            )}
             <div className="flex items-start justify-between gap-1 mb-1 md:mb-1.5">
               <p className="text-[11px] md:text-xs font-medium text-slate-200 truncate">{product.name}</p>
               {isVariantProduct && (
@@ -1476,7 +1519,7 @@ export default function PosPage() {
 
   // Customer selector for mobile cart sheet
   const renderCustomerSelector = (isMobile = false) => (
-    <div className={isMobile ? 'bg-nebula/80 border border-white/[0.06] rounded-2xl p-3.5 space-y-2' : 'border-b border-white/[0.06] px-4 py-3'}>
+    <div className={isMobile ? 'aether-card rounded-2xl p-3.5 space-y-2' : 'border-b border-white/[0.06] px-4 py-3'}>
       <div className="flex items-center justify-between">
         <Label className="text-[11px] text-slate-500 font-medium tracking-wide uppercase">Customer</Label>
         <button onClick={() => setAddCustomerOpen(true)} className="text-[10px] theme-text hover:theme-text font-semibold flex items-center gap-1 transition-colors">
@@ -1490,7 +1533,7 @@ export default function PosPage() {
           value={customerSearch}
           onChange={(e) => { setCustomerSearch(e.target.value); setCustomerDropdownOpen(true) }}
           onFocus={() => setCustomerDropdownOpen(true)}
-          className="pl-10 pr-8 h-10 text-sm bg-white/[0.03] border-white/[0.08] text-white placeholder:text-slate-500 rounded-xl backdrop-blur-sm"
+          className="pl-10 pr-8 h-10 text-sm bg-white/[0.04] border-white/[0.06] text-white placeholder:text-slate-500 rounded-xl backdrop-blur-sm"
         />
         {selectedCustomer && (
           <button onClick={() => { setSelectedCustomer(null); setCustomerSearch(''); setPointsToUse(0) }}
@@ -1500,7 +1543,7 @@ export default function PosPage() {
         )}
       </div>
       {customerDropdownOpen && filteredCustomers.length > 0 && !selectedCustomer && (
-        <div className={`absolute z-30 ${isMobile ? 'w-[calc(100%-1.75rem)]' : 'w-full'} mt-1 bg-nebula border border-white/[0.08] rounded-2xl shadow-2xl shadow-black/40 max-h-44 overflow-y-auto backdrop-blur-xl`}>
+        <div className={`absolute z-30 ${isMobile ? 'w-[calc(100%-1.75rem)]' : 'w-full'} mt-1 aether-card-elevated rounded-2xl max-h-44 overflow-y-auto`}>
           {filteredCustomers.map((customer) => (
             <button key={customer.id} onClick={() => { setSelectedCustomer(customer); setCustomerSearch(''); setCustomerDropdownOpen(false); setPointsToUse(0) }}
               className="w-full text-left px-4 py-2.5 hover:bg-white/[0.04] border-b border-white/[0.04] last:border-0 transition-colors first:rounded-t-2xl last:rounded-b-2xl">
@@ -1537,9 +1580,37 @@ export default function PosPage() {
           const itemTotal = getItemPrice(item) * item.qty
           return (
             <div key={itemKey} className={cn(
-              'group flex items-center gap-2.5 rounded-xl bg-nebula/60 border border-white/[0.04] hover:border-white/[0.08] transition-all duration-150',
+              'group flex items-center gap-2.5 rounded-xl aether-card transition-all duration-150',
               compact ? 'p-3' : 'p-2.5'
             )}>
+              {/* Product Image */}
+              {item.product.image ? (
+                <div className={cn(
+                  'shrink-0 relative rounded-lg overflow-hidden bg-white/[0.03]',
+                  compact ? 'w-11 h-11' : 'w-9 h-9'
+                )}>
+                  <img
+                    src={item.product.image}
+                    alt={item.product.name}
+                    className="w-full h-full object-cover"
+                    onError={(e) => {
+                      e.currentTarget.style.display = 'none'
+                      const fb = e.currentTarget.parentElement?.querySelector('.img-fallback')
+                      if (fb) fb.setAttribute('style', 'display:flex')
+                    }}
+                  />
+                  <div className="img-fallback absolute inset-0 items-center justify-center bg-white/[0.03] hidden">
+                    <Package className="h-3.5 w-3.5 text-slate-700" strokeWidth={1.5} />
+                  </div>
+                </div>
+              ) : (
+                <div className={cn(
+                  'shrink-0 rounded-lg bg-white/[0.03] flex items-center justify-center',
+                  compact ? 'w-11 h-11' : 'w-9 h-9'
+                )}>
+                  <Package className="h-3.5 w-3.5 text-slate-700" strokeWidth={1.5} />
+                </div>
+              )}
               {/* Product Info */}
               <div className="flex-1 min-w-0">
                 <p className={cn('font-semibold text-white truncate leading-tight', compact ? 'text-[13px]' : 'text-xs')}>{item.product.name}</p>
@@ -1647,12 +1718,12 @@ export default function PosPage() {
       <div className="md:hidden flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
           {outletInfo ? (
-            <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-nebula border border-white/[0.06] text-[11px] font-semibold text-slate-300 min-w-0">
+            <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl aether-card text-[11px] font-semibold text-slate-300 min-w-0">
               <Store className="h-3.5 w-3.5 theme-text shrink-0" strokeWidth={1.5} />
               <span className="truncate">{outletInfo.name}</span>
             </div>
           ) : (
-            <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-nebula border border-white/[0.06] text-[11px] font-medium text-slate-600">
+            <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl aether-card text-[11px] font-medium text-slate-600">
               <Store className="h-3.5 w-3.5" strokeWidth={1.5} />
               <span>No outlet</span>
             </div>
@@ -1663,9 +1734,9 @@ export default function PosPage() {
             {isOnline ? <Wifi className="h-3 w-3" strokeWidth={1.5} /> : <WifiOff className="h-3 w-3" strokeWidth={1.5} />}
           </div>
           {unsyncedCount > 0 && (
-            <button onClick={handleSync} disabled={isOnline}
-              className="flex items-center gap-1 px-2 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[10px] font-medium shrink-0 disabled:opacity-40">
-              {isOnline ? <RefreshCw className="h-3 w-3 animate-spin" strokeWidth={1.5} /> : <RefreshCw className="h-3 w-3" strokeWidth={1.5} />}
+            <button onClick={() => setOfflineListOpen(true)}
+              className="flex items-center gap-1 px-2 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[10px] font-medium shrink-0 hover:bg-amber-500/15 active:scale-95 transition-all">
+              <CloudOff className="h-3 w-3" strokeWidth={1.5} />
               {unsyncedCount}
             </button>
           )}
@@ -1684,7 +1755,7 @@ export default function PosPage() {
           } catch { toast.error('Gagal refresh data') }
           finally { setDataSyncing(false) }
         }} disabled={dataSyncing || !isOnline}
-          className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-nebula border border-white/[0.06] text-slate-500 text-[10px] font-medium shrink-0 disabled:opacity-50">
+          className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl aether-card text-slate-500 text-[10px] font-medium shrink-0 disabled:opacity-50">
           {dataSyncing ? <Loader2 className="h-3 w-3 animate-spin" /> : <ArrowDownToLine className="h-3 w-3" strokeWidth={1.5} />}
         </button>
       </div>
@@ -1773,9 +1844,10 @@ export default function PosPage() {
 
           {/* Unsynced */}
           {unsyncedCount > 0 && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[11px] font-medium">
+            <button onClick={() => setOfflineListOpen(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[11px] font-medium hover:bg-amber-500/15 transition-all cursor-pointer">
               <CloudOff className="h-3 w-3" strokeWidth={1.5} /><span>{unsyncedCount} pending</span>
-            </div>
+            </button>
           )}
 
           {/* Buttons */}
@@ -1799,10 +1871,10 @@ export default function PosPage() {
           </Button>
 
           {unsyncedCount > 0 && (
-            <Button onClick={handleSync} disabled={isOnline} variant="outline" size="sm"
-              className="bg-amber-600/20 border-amber-500/30 text-amber-400 hover:bg-amber-600/30 disabled:opacity-40 h-7 text-xs gap-1.5">
-              {isOnline ? <RefreshCw className="h-3 w-3 animate-spin" strokeWidth={1.5} /> : <RefreshCw className="h-3 w-3" strokeWidth={1.5} />}
-              Sync {unsyncedCount}
+            <Button onClick={() => setOfflineListOpen(true)} variant="outline" size="sm"
+              className="bg-amber-600/20 border-amber-500/30 text-amber-400 hover:bg-amber-600/30 h-7 text-xs gap-1.5">
+              <CloudOff className="h-3 w-3" strokeWidth={1.5} />
+              {unsyncedCount} Offline
             </Button>
           )}
         </div>
@@ -1855,9 +1927,14 @@ export default function PosPage() {
               </div>
               {cart.length > 0 && (
                 <div className="flex items-center gap-1.5">
-                  <button onClick={() => setPendingListOpen(true)} className="relative h-7 px-2.5 rounded-lg text-[10px] font-semibold text-slate-500 hover:text-amber-400 hover:bg-amber-500/10 border border-transparent hover:border-amber-500/20 transition-all">
-                    <Clock className="h-3 w-3" strokeWidth={1.5} />
-                    {pendingCount > 0 && <span className="ml-1">{pendingCount}</span>}
+                  <button onClick={() => setPendingListOpen(true)} className={cn(
+                    "relative flex items-center gap-1.5 h-7 px-2.5 rounded-lg text-[10px] font-semibold transition-all",
+                    pendingCount > 0
+                      ? "text-amber-400 bg-amber-500/10 border border-amber-500/20 hover:bg-amber-500/15"
+                      : "text-slate-500 hover:text-amber-400 hover:bg-amber-500/10 border border-transparent hover:border-amber-500/20"
+                  )}>
+                    <ClockArrowDown className="h-3 w-3" strokeWidth={1.5} />
+                    {pendingCount > 0 && <span>{pendingCount}</span>}
                   </button>
                   <button onClick={clearCart} className="h-7 px-2.5 rounded-lg text-[10px] font-semibold text-slate-500 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 transition-all">
                     Hapus Semua
@@ -1865,9 +1942,9 @@ export default function PosPage() {
                 </div>
               )}
               {cart.length === 0 && pendingCount > 0 && (
-                <button onClick={() => setPendingListOpen(true)} className="relative h-7 px-2.5 rounded-lg text-[10px] font-semibold text-slate-500 hover:text-amber-400 hover:bg-amber-500/10 border border-transparent hover:border-amber-500/20 transition-all">
-                  <Clock className="h-3 w-3" strokeWidth={1.5} />
-                  <span className="ml-1">{pendingCount} pending</span>
+                <button onClick={() => setPendingListOpen(true)} className="relative flex items-center gap-1.5 h-7 px-2.5 rounded-lg text-[10px] font-semibold text-amber-400 bg-amber-500/10 border border-amber-500/20 hover:bg-amber-500/15 transition-all">
+                  <ClockArrowDown className="h-3 w-3" strokeWidth={1.5} />
+                  <span>{pendingCount} pending</span>
                 </button>
               )}
             </div>
@@ -1943,7 +2020,7 @@ export default function PosPage() {
               <div className="flex gap-2">
                 <Button onClick={handleHoldTransaction} variant="outline"
                   className="h-11 px-4 font-semibold text-sm rounded-xl border-white/[0.08] text-slate-300 hover:bg-white/[0.04] hover:text-white transition-all shrink-0">
-                  <Pause className="mr-1.5 h-4 w-4" strokeWidth={1.5} />
+                  <ClockArrowDown className="mr-1.5 h-4 w-4" strokeWidth={1.5} />
                   Tunda
                 </Button>
                 <Button onClick={openPaymentDialog} disabled={cart.length === 0}
@@ -1983,10 +2060,10 @@ export default function PosPage() {
       {isMobile && pendingCount > 0 && cart.length === 0 && (
         <button
           onClick={() => setPendingListOpen(true)}
-          className="md:hidden fixed bottom-20 right-4 z-50 flex items-center gap-2.5 h-12 pl-3.5 pr-4 rounded-2xl bg-white/[0.04] border border-white/[0.08] text-white shadow-2xl shadow-black/30 hover:bg-white/[0.06] active:scale-95 transition-all duration-150"
+          className="md:hidden fixed bottom-20 right-4 z-50 flex items-center gap-2.5 h-12 pl-3.5 pr-4 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-400 shadow-2xl shadow-black/30 hover:bg-amber-500/15 active:scale-95 transition-all duration-150"
         >
           <div className="relative">
-            <Clock className="h-5 w-5 text-amber-400" strokeWidth={1.5} />
+            <ClockArrowDown className="h-5 w-5" strokeWidth={1.5} />
             <span className="absolute -top-1.5 -right-1.5 min-w-4 h-4 rounded-full bg-amber-500 text-white text-[9px] font-bold flex items-center justify-center shadow-sm px-1">{pendingCount}</span>
           </div>
           <span className="text-xs font-semibold">Pending</span>
@@ -2032,9 +2109,14 @@ export default function PosPage() {
               </div>
               {cart.length > 0 && (
                 <div className="flex items-center gap-1.5">
-                  <button onClick={() => setPendingListOpen(true)} className="relative h-8 px-2.5 rounded-lg text-[11px] font-semibold text-slate-500 hover:text-amber-400 hover:bg-amber-500/10 border border-white/[0.06] hover:border-amber-500/20 transition-all">
-                    <Clock className="h-3.5 w-3.5" strokeWidth={1.5} />
-                    {pendingCount > 0 && <span className="ml-1">{pendingCount}</span>}
+                  <button onClick={() => setPendingListOpen(true)} className={cn(
+                    "relative flex items-center gap-1.5 h-8 px-2.5 rounded-lg text-[11px] font-semibold transition-all",
+                    pendingCount > 0
+                      ? "text-amber-400 bg-amber-500/10 border border-amber-500/20 hover:bg-amber-500/15"
+                      : "text-slate-500 hover:text-amber-400 hover:bg-amber-500/10 border border-white/[0.06] hover:border-amber-500/20"
+                  )}>
+                    <ClockArrowDown className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    {pendingCount > 0 && <span>{pendingCount}</span>}
                   </button>
                   <button onClick={clearCart} className="h-8 px-3 rounded-lg text-[11px] font-semibold text-slate-500 hover:text-red-400 hover:bg-red-500/10 border border-white/[0.06] hover:border-red-500/20 transition-all">
                     Hapus Semua
@@ -2042,8 +2124,8 @@ export default function PosPage() {
                 </div>
               )}
               {cart.length === 0 && pendingCount > 0 && (
-                <button onClick={() => setPendingListOpen(true)} className="h-8 px-3 rounded-lg text-[11px] font-semibold text-slate-500 hover:text-amber-400 hover:bg-amber-500/10 border border-white/[0.06] hover:border-amber-500/20 transition-all">
-                  <Clock className="h-3.5 w-3.5 mr-1" strokeWidth={1.5} />
+                <button onClick={() => setPendingListOpen(true)} className="flex items-center gap-1.5 h-8 px-3 rounded-lg text-[11px] font-semibold text-amber-400 bg-amber-500/10 border border-amber-500/20 hover:bg-amber-500/15 transition-all">
+                  <ClockArrowDown className="h-3.5 w-3.5" strokeWidth={1.5} />
                   {pendingCount} pending
                 </button>
               )}
@@ -2092,7 +2174,7 @@ export default function PosPage() {
                 </div>
                 <Button onClick={handleHoldTransaction} variant="outline"
                   className="h-12 px-3 font-semibold text-xs rounded-2xl border-white/[0.08] text-slate-300 hover:bg-white/[0.04] hover:text-white transition-all shrink-0">
-                  <Pause className="h-4 w-4" strokeWidth={1.5} />
+                  <ClockArrowDown className="h-4 w-4" strokeWidth={1.5} />
                 </Button>
                 <Button onClick={openPaymentDialog}
                   className="h-12 px-6 font-bold text-sm rounded-2xl theme-gradient hover:theme-hover text-white shadow-lg theme-shadow transition-all active:scale-[0.98] shrink-0">
@@ -2298,12 +2380,36 @@ export default function PosPage() {
         </ResponsiveDialogContent>
       </ResponsiveDialog>
 
+      {/* Offline Transactions Sync Dialog */}
+      <ResponsiveDialog open={offlineListOpen} onOpenChange={setOfflineListOpen}>
+        <ResponsiveDialogContent desktopClassName="max-w-lg rounded-2xl">
+          <ResponsiveDialogHeader>
+            <ResponsiveDialogTitle className="text-sm font-bold text-white flex items-center gap-2">
+              <CloudOff className="h-4 w-4 text-amber-400" strokeWidth={1.5} /> Transaksi Offline
+              {unsyncedCount > 0 && (
+                <Badge variant="secondary" className="ml-1 bg-amber-500/10 text-amber-400 border-amber-500/20 text-[10px] px-1.5">{unsyncedCount}</Badge>
+              )}
+            </ResponsiveDialogTitle>
+            <ResponsiveDialogDescription className="text-[11px] text-slate-500">
+              Transaksi yang belum berhasil disinkronkan ke server
+            </ResponsiveDialogDescription>
+          </ResponsiveDialogHeader>
+          <OfflineSyncContent
+            isOnline={isOnline}
+            onSynced={() => {
+              fetchProducts(productSearch, productPage, selectedCategoryId)
+              loadCustomersFromCache()
+            }}
+          />
+        </ResponsiveDialogContent>
+      </ResponsiveDialog>
+
       {/* Pending Transactions List Dialog */}
       <ResponsiveDialog open={pendingListOpen} onOpenChange={setPendingListOpen}>
         <ResponsiveDialogContent desktopClassName="max-w-md rounded-2xl">
           <ResponsiveDialogHeader>
             <ResponsiveDialogTitle className="text-sm font-bold text-white flex items-center gap-2">
-              <Clock className="h-4 w-4 text-amber-400" strokeWidth={1.5} /> Transaksi Pending
+              <ClockArrowDown className="h-4 w-4 text-amber-400" strokeWidth={1.5} /> Transaksi Pending
               {pendingCount > 0 && (
                 <Badge variant="secondary" className="ml-1 bg-amber-500/10 text-amber-400 border-amber-500/20 text-[10px] px-1.5">{pendingCount}</Badge>
               )}
@@ -2313,6 +2419,41 @@ export default function PosPage() {
             onResume={handleResumePending}
             onDelete={handleDeletePending}
           />
+        </ResponsiveDialogContent>
+      </ResponsiveDialog>
+
+      {/* Hold Note Dialog */}
+      <ResponsiveDialog open={holdNoteOpen} onOpenChange={setHoldNoteOpen}>
+        <ResponsiveDialogContent desktopClassName="max-w-sm rounded-2xl">
+          <ResponsiveDialogHeader>
+            <ResponsiveDialogTitle className="text-sm font-bold text-white flex items-center gap-2">
+              <MessageSquare className="h-4 w-4 text-amber-400" strokeWidth={1.5} /> Catatan Tunda
+            </ResponsiveDialogTitle>
+            <ResponsiveDialogDescription className="text-[11px] text-slate-500">
+              Tambahkan catatan opsional untuk transaksi ini
+            </ResponsiveDialogDescription>
+          </ResponsiveDialogHeader>
+          <div className="py-2">
+            <textarea
+              value={holdNote}
+              onChange={(e) => setHoldNote(e.target.value)}
+              placeholder="Contoh: customer minta ditunda, menunggu pembayaran..."
+              rows={3}
+              autoFocus
+              className="w-full bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-slate-600 text-sm rounded-xl px-3.5 py-2.5 resize-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-500/50 focus-visible:border-cyan-500/30 transition-all"
+            />
+          </div>
+          <ResponsiveDialogFooter className="gap-2">
+            <Button variant="ghost" onClick={() => { setHoldNoteOpen(false); setHoldNote('') }}
+              className="bg-white/[0.04] border-white/[0.08] text-slate-300 hover:bg-white/[0.06] text-xs rounded-xl">
+              Batal
+            </Button>
+            <Button onClick={confirmHoldTransaction}
+              className="theme-bg hover:theme-hover text-white text-xs rounded-xl font-medium">
+              <ClockArrowDown className="mr-1.5 h-3 w-3" strokeWidth={1.5} />
+              Tunda Transaksi
+            </Button>
+          </ResponsiveDialogFooter>
         </ResponsiveDialogContent>
       </ResponsiveDialog>
     </div>
@@ -2344,8 +2485,8 @@ function PendingListContent({
   if (pendingList.length === 0) {
     return (
       <div className="text-center py-10">
-        <div className="w-12 h-12 rounded-2xl bg-white/[0.04] flex items-center justify-center mx-auto mb-3">
-          <Clock className="h-5 w-5 text-slate-600" strokeWidth={1.5} />
+        <div className="w-12 h-12 rounded-2xl bg-white/[0.06] flex items-center justify-center mx-auto mb-3">
+          <ClockArrowDown className="h-5 w-5 text-slate-600" strokeWidth={1.5} />
         </div>
         <p className="text-sm text-slate-400 font-medium">Belum ada transaksi pending</p>
         <p className="text-[11px] text-slate-600 mt-1">Tunda transaksi untuk melayani customer lain</p>
@@ -2365,12 +2506,12 @@ function PendingListContent({
         const totalItems = items.reduce((s, i) => s + i.qty, 0)
 
         return (
-          <div key={pending.id} className="bg-nebula border border-white/[0.06] rounded-xl p-3.5 space-y-2.5">
+          <div key={pending.id} className="aether-card p-3.5 space-y-2.5">
             {/* Header */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <div className="w-7 h-7 rounded-lg bg-amber-500/10 flex items-center justify-center">
-                  <Pause className="h-3.5 w-3.5 text-amber-400" strokeWidth={1.5} />
+                  <ClockArrowDown className="h-3.5 w-3.5 text-amber-400" strokeWidth={1.5} />
                 </div>
                 <div>
                   <p className="text-xs font-semibold text-slate-200">{totalItems} item</p>
@@ -2381,11 +2522,22 @@ function PendingListContent({
             </div>
 
             {/* Items preview */}
-            <div className="flex flex-wrap gap-1">
+            <div className="flex flex-wrap gap-1.5">
               {items.slice(0, 4).map((item, idx) => (
-                <span key={idx} className="text-[10px] bg-white/[0.04] text-slate-400 px-2 py-0.5 rounded-md truncate max-w-[140px]">
-                  {item.variant ? `${item.product.name} (${item.variant.name})` : item.product.name} ×{item.qty}
-                </span>
+                <div key={idx} className="inline-flex items-center gap-1.5 bg-white/[0.04] text-slate-400 pl-1 pr-2 py-0.5 rounded-md truncate max-w-[180px]">
+                  {item.product.image ? (
+                    <div className="w-5 h-5 shrink-0 rounded overflow-hidden bg-white/[0.03]">
+                      <img src={item.product.image} alt="" className="w-full h-full object-cover" onError={(e) => { e.currentTarget.style.display = 'none' }} />
+                    </div>
+                  ) : (
+                    <div className="w-5 h-5 shrink-0 rounded bg-white/[0.03] flex items-center justify-center">
+                      <Package className="h-2.5 w-2.5 text-slate-700" strokeWidth={1.5} />
+                    </div>
+                  )}
+                  <span className="text-[10px] truncate">
+                    {item.variant ? `${item.product.name} (${item.variant.name})` : item.product.name} ×{item.qty}
+                  </span>
+                </div>
               ))}
               {items.length > 4 && (
                 <span className="text-[10px] bg-white/[0.04] text-slate-500 px-2 py-0.5 rounded-md">
@@ -2393,6 +2545,14 @@ function PendingListContent({
                 </span>
               )}
             </div>
+
+            {/* Note */}
+            {pending.note && (
+              <div className="flex items-start gap-1.5 px-2.5 py-2 rounded-lg bg-white/[0.03] border border-white/[0.04]">
+                <MessageSquare className="h-3 w-3 text-slate-500 shrink-0 mt-0.5" strokeWidth={1.5} />
+                <p className="text-[11px] text-slate-400 leading-relaxed">{pending.note}</p>
+              </div>
+            )}
 
             {/* Customer */}
             {pending.customerName && (
@@ -2403,7 +2563,7 @@ function PendingListContent({
             <div className="flex gap-2 pt-1">
               <Button size="sm" onClick={() => onResume(pending)}
                 className="flex-1 h-8 text-[11px] font-medium rounded-lg theme-bg hover:theme-hover text-white transition-colors">
-                <Play className="mr-1.5 h-3 w-3" strokeWidth={1.5} /> Lanjutkan
+                <ShoppingCart className="mr-1.5 h-3 w-3" strokeWidth={1.5} /> Lanjutkan
               </Button>
               <Button size="sm" variant="ghost" onClick={() => onDelete(pending.id!)}
                 className="h-8 px-3 text-[11px] text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors">
@@ -2413,6 +2573,247 @@ function PendingListContent({
           </div>
         )
       })}
+    </div>
+  )
+}
+
+// ==================== OFFLINE SYNC SUB-COMPONENT ====================
+
+function OfflineSyncContent({
+  isOnline,
+  onSynced,
+}: {
+  isOnline: boolean
+  onSynced: () => void
+}) {
+  const offlineList = useLiveQuery(
+    async () => {
+      const list = await localDB.transactions.where('isSynced').equals(0).toArray()
+      return list.sort((a, b) => b.createdAt - a.createdAt)
+    },
+    []
+  )
+  const [syncingIds, setSyncingIds] = useState<Set<number>>(new Set())
+  const [syncingAll, setSyncingAll] = useState(false)
+
+  const syncOne = async (tx: OfflineTransaction) => {
+    if (!tx.id || syncingIds.has(tx.id)) return
+    setSyncingIds(prev => new Set(prev).add(tx.id!))
+    try {
+      const res = await fetch('/api/transactions/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transactions: [tx] }),
+      })
+      const data = await res.json()
+      if (res.ok && data.results?.[0]?.success) {
+        await localDB.transactions.update(tx.id, {
+          isSynced: 1,
+          syncedAt: Date.now(),
+          invoiceNumber: data.results[0].invoiceNumber,
+          serverTransactionId: data.results[0].serverId,
+        })
+        toast.success('Transaksi berhasil disync!')
+        onSynced()
+      } else {
+        const error = data.results?.[0]?.error || data.error || 'Gagal sync'
+        await localDB.transactions.update(tx.id, {
+          retryCount: (tx.retryCount || 0) + 1,
+          lastError: error,
+        })
+        toast.error('Sync gagal', { description: error })
+      }
+    } catch {
+      await localDB.transactions.update(tx.id, {
+        retryCount: (tx.retryCount || 0) + 1,
+        lastError: 'Tidak ada koneksi internet',
+      })
+      toast.error('Sync gagal — tidak ada koneksi')
+    } finally {
+      setSyncingIds(prev => {
+        const next = new Set(prev)
+        next.delete(tx.id!)
+        return next
+      })
+    }
+  }
+
+  const syncAll = async () => {
+    if (!offlineList || offlineList.length === 0 || syncingAll) return
+    setSyncingAll(true)
+    try {
+      const res = await fetch('/api/transactions/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transactions: offlineList }),
+      })
+      const data = await res.json()
+      if (res.ok) {
+        let synced = 0
+        let failed = 0
+        for (const result of data.results || []) {
+          if (result.success) {
+            await localDB.transactions.update(result.localId, {
+              isSynced: 1,
+              syncedAt: Date.now(),
+              invoiceNumber: result.invoiceNumber,
+              serverTransactionId: result.serverId,
+            })
+            synced++
+          } else {
+            const existing = await localDB.transactions.get(result.localId)
+            await localDB.transactions.update(result.localId, {
+              retryCount: (existing?.retryCount || 0) + 1,
+              lastError: result.error,
+            })
+            failed++
+          }
+        }
+        if (synced > 0) {
+          toast.success(`${synced} transaksi berhasil disync!`)
+          onSynced()
+        }
+        if (failed > 0) {
+          toast.error(`${failed} transaksi gagal sync`, { description: 'Periksa stok produk.' })
+        }
+      } else {
+        toast.error('Sync gagal — server error')
+      }
+    } catch {
+      toast.error('Sync gagal — tidak ada koneksi internet')
+    } finally {
+      setSyncingAll(false)
+    }
+  }
+
+  const deleteOne = async (id: number) => {
+    await localDB.transactions.delete(id)
+    toast.success('Transaksi offline dihapus')
+  }
+
+  const deleteAll = async () => {
+    if (!offlineList) return
+    for (const tx of offlineList) {
+      if (tx.id) await localDB.transactions.delete(tx.id)
+    }
+    toast.success(`${offlineList.length} transaksi offline dihapus`)
+  }
+
+  const formatTime = (ts: number) => {
+    const d = new Date(ts)
+    return d.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+  }
+
+  const getTxInfo = (tx: OfflineTransaction) => {
+    const p = tx.payload
+    const invoice = (tx.invoiceNumber as string) || (p.invoiceNumber as string) || `OFF-${tx.createdAt.toString(36).toUpperCase()}`
+    const total = (p.total as number) || (p.subtotal as number) || 0
+    const items = (p.items as Array<{ product?: { name: string }; variant?: { name: string }; qty: number }>) || []
+    const itemCount = items.reduce((s, i) => s + (i.qty || 1), 0)
+    return { invoice, total, itemCount }
+  }
+
+  if (!offlineList) {
+    return (
+      <div className="flex items-center justify-center py-10">
+        <Loader2 className="h-5 w-5 text-slate-500 animate-spin" />
+      </div>
+    )
+  }
+
+  if (offlineList.length === 0) {
+    return (
+      <div className="text-center py-10">
+        <div className="w-12 h-12 rounded-2xl bg-emerald-500/10 flex items-center justify-center mx-auto mb-3">
+          <Check className="h-5 w-5 text-emerald-400" strokeWidth={1.5} />
+        </div>
+        <p className="text-sm text-slate-400 font-medium">Semua transaksi tersinkronisasi</p>
+        <p className="text-[11px] text-slate-600 mt-1">Tidak ada transaksi offline yang pending</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-3 py-2">
+      {/* Bulk Actions */}
+      <div className="flex gap-2">
+        <Button
+          size="sm"
+          onClick={syncAll}
+          disabled={syncingAll || !isOnline}
+          className="flex-1 h-9 text-xs font-medium rounded-xl theme-bg hover:theme-hover text-white transition-colors disabled:opacity-40"
+        >
+          {syncingAll ? <Loader2 className="mr-1.5 h-3 w-3 animate-spin" /> : <RefreshCw className="mr-1.5 h-3 w-3" strokeWidth={1.5} />}
+          Sync Semua
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={deleteAll}
+          className="h-9 px-3 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-xl transition-colors"
+        >
+          <Trash2 className="h-3 w-3" strokeWidth={1.5} />
+        </Button>
+      </div>
+
+      {!isOnline && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20">
+          <WifiOff className="h-3.5 w-3.5 text-red-400 shrink-0" strokeWidth={1.5} />
+          <p className="text-[11px] text-red-400 font-medium">Anda sedang offline. Sync hanya bisa dilakukan saat online.</p>
+        </div>
+      )}
+
+      {/* Transaction List */}
+      <div className="space-y-2 max-h-[50vh] overflow-y-auto">
+        {offlineList.map((tx) => {
+          const { invoice, total, itemCount } = getTxInfo(tx)
+          const isSyncing = syncingIds.has(tx.id!)
+
+          return (
+            <div key={tx.id} className="aether-card p-3.5 space-y-2.5">
+              {/* Header */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="w-7 h-7 rounded-lg bg-amber-500/10 flex items-center justify-center shrink-0">
+                    <CloudOff className="h-3.5 w-3.5 text-amber-400" strokeWidth={1.5} />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-xs font-semibold text-slate-200 font-mono truncate">{invoice}</p>
+                    <p className="text-[10px] text-slate-500">{formatTime(tx.createdAt)} · {itemCount} item</p>
+                  </div>
+                </div>
+                <p className="text-sm font-bold text-white tabular-nums shrink-0 ml-2">{formatCurrency(total)}</p>
+              </div>
+
+              {/* Status Info */}
+              <div className="flex items-center gap-3 text-[10px]">
+                <span className="flex items-center gap-1 text-slate-500">
+                  <RefreshCw className="h-2.5 w-2.5" strokeWidth={1.5} />
+                  {tx.retryCount}x dicoba
+                </span>
+                {tx.lastError && (
+                  <span className="text-red-400/80 truncate max-w-[200px]" title={tx.lastError}>
+                    {tx.lastError}
+                  </span>
+                )}
+              </div>
+
+              {/* Actions */}
+              <div className="flex gap-2 pt-0.5">
+                <Button size="sm" onClick={() => syncOne(tx)} disabled={isSyncing || !isOnline}
+                  className="flex-1 h-8 text-[11px] font-medium rounded-lg theme-bg hover:theme-hover text-white transition-colors disabled:opacity-40">
+                  {isSyncing ? <Loader2 className="mr-1.5 h-3 w-3 animate-spin" /> : <RefreshCw className="mr-1.5 h-3 w-3" strokeWidth={1.5} />}
+                  {isSyncing ? 'Syncing...' : 'Sync'}
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => deleteOne(tx.id!)}
+                  className="h-8 px-3 text-[11px] text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors">
+                  <Trash2 className="h-3 w-3" strokeWidth={1.5} />
+                </Button>
+              </div>
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }
