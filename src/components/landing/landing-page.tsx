@@ -785,7 +785,7 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
               Tampilan Aplikasi
             </h2>
             <p className="text-sm text-slate-500">
-              Tampilan asli Aether — bukan mockup.
+              Tampilan webapp Aether POS.
             </p>
           </motion.div>
 
@@ -960,7 +960,7 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
               variants={fadeUp}
               className="text-overline text-slate-500 mb-12"
             >
-              Dari Lantai Toko
+              Ahtjong, Founder Aether POS
             </motion.p>
 
             {/* Founder photo */}
