@@ -56,6 +56,7 @@ interface CartItem {
   product: Product
   variant: ProductVariant | null
   qty: number
+  customPrice: number | null
 }
 
 interface CheckoutResult {
@@ -80,6 +81,7 @@ export interface PaymentDialogProps {
   subtotal: number
   pointsDiscount: number
   promoDiscount: number
+  manualDiscountTotal: number
   ppnAmount: number
   total: number
   // Customer
@@ -109,6 +111,7 @@ export interface PaymentDialogProps {
 // ==================== HELPERS ====================
 
 const getItemPrice = (item: CartItem) => item.variant ? item.variant.price : item.product.price
+const getItemEffectivePrice = (item: CartItem) => item.customPrice != null ? item.customPrice : getItemPrice(item)
 const getItemDisplayName = (item: CartItem) => item.variant ? `${item.product.name} - ${item.variant.name}` : item.product.name
 const getCartKey = (productId: string, variantId: string | null) => variantId ? `${productId}_${variantId}` : productId
 
@@ -128,6 +131,7 @@ export function PaymentDialog({
   subtotal,
   pointsDiscount,
   promoDiscount,
+  manualDiscountTotal,
   ppnAmount,
   total,
   selectedCustomer,
@@ -202,20 +206,29 @@ export function PaymentDialog({
               <div className="aether-card p-3.5 space-y-2">
                 <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">Ringkasan Pesanan</p>
                 <div className="space-y-1.5 max-h-40 overflow-y-auto">
-                  {cart.map((item) => (
+                  {cart.map((item) => {
+                    const itemSubtotal = getItemPrice(item) * item.qty
+                    const effSubtotal = getItemEffectivePrice(item) * item.qty
+                    const hasCustomPrice = item.customPrice != null
+                    return (
                     <div
                       key={getCartKey(item.product.id, item.variant?.id || null)}
-                      className="flex items-center justify-between text-xs gap-2"
                     >
-                      <span className="text-slate-300 truncate">
-                        {getItemDisplayName(item)}
-                        <span className="text-slate-500 ml-1">×{item.qty}</span>
-                      </span>
-                      <span className="text-slate-200 font-medium shrink-0 tabular-nums">
-                        {formatCurrency(getItemPrice(item) * item.qty)}
-                      </span>
+                      <div className="flex items-center justify-between text-xs gap-2">
+                        <span className="text-slate-300 truncate">
+                          {getItemDisplayName(item)}
+                          <span className="text-slate-500 ml-1">×{item.qty}</span>
+                          {hasCustomPrice && (
+                            <span className="ml-1 text-amber-400">@{formatCurrency(item.customPrice!)}</span>
+                          )}
+                        </span>
+                        <span className={cn('font-medium shrink-0 tabular-nums', hasCustomPrice ? 'text-amber-400' : 'text-slate-200')}>
+                          {formatCurrency(effSubtotal)}
+                        </span>
+                      </div>
                     </div>
-                  ))}
+                    )
+                  })}
                 </div>
                 <Separator className="bg-white/[0.04] !my-2" />
                 <div className="space-y-1 text-xs">
@@ -233,6 +246,12 @@ export function PaymentDialog({
                     <div className="flex justify-between text-amber-400">
                       <span className="flex items-center gap-1"><Tag className="h-3 w-3" strokeWidth={1.5} /> {selectedPromo.name}</span>
                       <span className="tabular-nums">-{formatCurrency(promoDiscount)}</span>
+                    </div>
+                  )}
+                  {manualDiscountTotal > 0 && (
+                    <div className="flex justify-between text-amber-400">
+                      <span className="flex items-center gap-1"><Tag className="h-3 w-3" strokeWidth={1.5} /> Diskon Manual</span>
+                      <span className="tabular-nums">-{formatCurrency(manualDiscountTotal)}</span>
                     </div>
                   )}
                   {ppnAmount > 0 && (

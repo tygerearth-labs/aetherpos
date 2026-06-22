@@ -18,6 +18,7 @@ import {
   Check,
   CloudOff,
   AlertCircle,
+  Tag,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -50,6 +51,7 @@ interface CartItem {
   product: Product
   variant: ProductVariant | null
   qty: number
+  customPrice: number | null
 }
 
 interface CheckoutResult {
@@ -89,6 +91,7 @@ export interface ReceiptDialogProps {
   subtotal: number
   pointsDiscount: number
   promoDiscount: number
+  manualDiscountTotal: number
   ppnAmount: number
   total: number
   // Payment
@@ -110,6 +113,7 @@ export interface ReceiptDialogProps {
 // ==================== HELPERS ====================
 
 const getItemPrice = (item: CartItem) => item.variant ? item.variant.price : item.product.price
+const getItemEffectivePrice = (item: CartItem) => item.customPrice != null ? item.customPrice : getItemPrice(item)
 const getCartKey = (productId: string, variantId: string | null) => variantId ? `${productId}_${variantId}` : productId
 
 const RECEIPT_CSS = `
@@ -143,6 +147,7 @@ function generateWhatsAppReceiptText(props: {
   subtotal: number
   pointsDiscount: number
   promoDiscount: number
+  manualDiscountTotal: number
   ppnAmount: number
   total: number
   paymentMethod: string
@@ -154,7 +159,7 @@ function generateWhatsAppReceiptText(props: {
   settings: OutletSettings
 }): string {
   const {
-    cart, subtotal, pointsDiscount, promoDiscount, ppnAmount, total,
+    cart, subtotal, pointsDiscount, promoDiscount, manualDiscountTotal, ppnAmount, total,
     paymentMethod, paidAmount, change: changeAmount,
     selectedCustomer, selectedPromo, checkoutResult, settings,
   } = props
@@ -181,14 +186,21 @@ function generateWhatsAppReceiptText(props: {
 
   for (const item of cart) {
     const name = item.variant ? `${item.product.name} (${item.variant.name})` : item.product.name
+    const effPrice = getItemEffectivePrice(item)
+    const effSubtotal = effPrice * item.qty
     text += `${name}\n`
-    text += `  @${formatCurrency(getItemPrice(item))} × ${item.qty} = ${formatCurrency(getItemPrice(item) * item.qty)}\n`
+    if (item.customPrice != null) {
+      text += `  ~~@${formatCurrency(getItemPrice(item))}~~ → @${formatCurrency(effPrice)} × ${item.qty} = ${formatCurrency(effSubtotal)}\n`
+    } else {
+      text += `  @${formatCurrency(effPrice)} × ${item.qty} = ${formatCurrency(effSubtotal)}\n`
+    }
   }
 
   text += `${'─'.repeat(28)}\n`
   text += `Subtotal: ${formatCurrency(subtotal)}\n`
   if (pointsDiscount > 0) text += `Poin Diskon: -${formatCurrency(pointsDiscount)}\n`
   if (promoDiscount > 0 && selectedPromo) text += `Promo (${selectedPromo.name}): -${formatCurrency(promoDiscount)}\n`
+  if (manualDiscountTotal > 0) text += `Diskon Manual: -${formatCurrency(manualDiscountTotal)}\n`
   if (ppnAmount > 0) text += `PPN (${settings.ppnRate}%): +${formatCurrency(ppnAmount)}\n`
   text += `${'═'.repeat(28)}\n`
   text += `*TOTAL: ${formatCurrency(total)}*\n`
@@ -215,6 +227,7 @@ export function ReceiptDialog({
   subtotal,
   pointsDiscount,
   promoDiscount,
+  manualDiscountTotal,
   ppnAmount,
   total,
   paymentMethod,
@@ -263,7 +276,7 @@ export function ReceiptDialog({
   const handleWhatsApp = () => {
     if (!selectedCustomer?.whatsapp || !checkoutResult) return
     const text = generateWhatsAppReceiptText({
-      cart, subtotal, pointsDiscount, promoDiscount, ppnAmount, total,
+      cart, subtotal, pointsDiscount, promoDiscount, manualDiscountTotal, ppnAmount, total,
       paymentMethod, paidAmount, change: changeAmount,
       selectedCustomer, selectedPromo, checkoutResult, settings,
     })
@@ -323,17 +336,27 @@ export function ReceiptDialog({
 
         {/* Items */}
         <div className="r-space-md">
-          {cart.map((item) => (
+          {cart.map((item) => {
+            const effPrice = getItemEffectivePrice(item)
+            const effSubtotal = effPrice * item.qty
+            return (
             <div key={getCartKey(item.product.id, item.variant?.id || null)} className="r-space-sm">
               <p className="r-item-name">{item.product.name}</p>
               {item.variant && <p className="r-item-variant">{item.variant.name}</p>}
               <div className="r-row-items r-gap">
-                <span className="r-flex1 r-item-price">@ {formatCurrency(getItemPrice(item))}</span>
+                <span className="r-flex1 r-item-price">@ {formatCurrency(effPrice)}</span>
                 <span className="r-w8 r-value">{item.qty}</span>
-                <span className="r-w20 r-value-bold">{formatCurrency(getItemPrice(item) * item.qty)}</span>
+                <span className="r-w20 r-value-bold">{formatCurrency(effSubtotal)}</span>
               </div>
+              {item.customPrice != null && (
+                <div className="r-row-items r-gap" style={{ paddingLeft: '28px' }}>
+                  <span className="r-flex1 r-item-price" style={{ color: '#b45309', textDecoration: 'line-through' }}>@ {formatCurrency(getItemPrice(item))}</span>
+                  <span className="r-w20" style={{ color: '#b45309', fontWeight: 600, fontSize: '9px', textAlign: 'right' }}>diskon: -{formatCurrency((getItemPrice(item) - effPrice) * item.qty)}</span>
+                </div>
+              )}
             </div>
-          ))}
+            )
+          })}
         </div>
 
         <hr className="r-sep" />
@@ -343,6 +366,9 @@ export function ReceiptDialog({
           <div className="r-row"><span className="r-label">Subtotal</span><span className="r-value">{formatCurrency(subtotal)}</span></div>
           {pointsDiscount > 0 && <div className="r-row"><span className="r-success r-medium">Poin Diskon</span><span className="r-success r-bold">-{formatCurrency(pointsDiscount)}</span></div>}
           {promoDiscount > 0 && selectedPromo && <div className="r-row"><span className="r-warning r-medium">Promo ({selectedPromo.name})</span><span className="r-warning r-bold">-{formatCurrency(promoDiscount)}</span></div>}
+          {manualDiscountTotal > 0 && (
+            <div className="r-row"><span className="r-warning r-medium">Diskon Manual</span><span className="r-warning r-bold">-{formatCurrency(manualDiscountTotal)}</span></div>
+          )}
           {ppnAmount > 0 && <div className="r-row"><span className="r-label">PPN ({settings.ppnRate}%)</span><span className="r-value">+{formatCurrency(ppnAmount)}</span></div>}
         </div>
 

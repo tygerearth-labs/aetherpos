@@ -3,11 +3,15 @@ import { getAuthUser, unauthorized } from '@/lib/get-auth'
 import { db } from '@/lib/db'
 import { safeAuditLog } from '@/lib/safe-audit'
 import { safeJson, safeJsonError } from '@/lib/safe-response'
+import { ensureMigrated } from '@/lib/db-migrate'
 
 // GET /api/settings - fetch outlet settings + outlet info
 export async function GET(request: NextRequest) {
   const user = await getAuthUser(request)
   if (!user) return unauthorized()
+
+  // Auto-migrate: ensure new columns exist in database
+  await ensureMigrated()
 
   try {
     let setting = await db.outletSetting.findUnique({
@@ -37,6 +41,7 @@ export async function GET(request: NextRequest) {
       receiptLogo: setting.receiptLogo,
       ppnEnabled: setting.ppnEnabled,
       ppnRate: setting.ppnRate,
+      manualDiscountEnabled: setting.manualDiscountEnabled,
       themePrimaryColor: setting.themePrimaryColor,
       telegramChatId: setting.telegramChatId,
       telegramBotToken: setting.telegramBotToken ? '••••••' : null,
@@ -56,8 +61,34 @@ export async function GET(request: NextRequest) {
         : null,
     })
   } catch (error) {
-    console.error('GET /api/settings error:', error)
-    return safeJsonError('Internal server error', 500)
+    // Fallback: if query fails (e.g. column still missing after migrate attempt),
+    // try a minimal query and merge default values for new fields
+    console.error('GET /api/settings error (attempting fallback):', error)
+    try {
+      const minimal = await db.outletSetting.findUnique({
+        where: { outletId: user.outletId },
+        select: {
+          id: true, outletId: true, paymentMethods: true,
+          loyaltyEnabled: true, loyaltyPointsPerAmount: true, loyaltyPointValue: true,
+          receiptBusinessName: true, receiptAddress: true, receiptPhone: true,
+          receiptFooter: true, receiptLogo: true,
+          ppnEnabled: true, ppnRate: true,
+          themePrimaryColor: true, telegramChatId: true, telegramBotToken: true,
+          notifyOnTransaction: true, notifyOnCustomer: true, notifyDailyReport: true,
+          notifyWeeklyReport: true, notifyMonthlyReport: true, notifyOnInsight: true,
+          outlet: { select: { id: true, name: true, address: true, phone: true } },
+        },
+      })
+      return safeJson({
+        ...minimal,
+        // Safe defaults for new columns that may not exist yet
+        manualDiscountEnabled: false,
+        telegramBotToken: minimal?.telegramBotToken ? '••••••' : null,
+      })
+    } catch (fallbackError) {
+      console.error('GET /api/settings fallback also failed:', fallbackError)
+      return safeJsonError('Internal server error', 500)
+    }
   }
 }
 
@@ -65,6 +96,9 @@ export async function GET(request: NextRequest) {
 export async function PUT(request: NextRequest) {
   const user = await getAuthUser(request)
   if (!user) return unauthorized()
+
+  // Auto-migrate: ensure new columns exist before writing
+  await ensureMigrated()
 
   // Only OWNER can update outlet settings
   if (user.role !== 'OWNER') {
@@ -101,6 +135,9 @@ export async function PUT(request: NextRequest) {
     }
     const ppnRate = ppnRateRaw
 
+    // Manual discount toggle
+    const manualDiscountEnabled = typeof body.manualDiscountEnabled === 'boolean' ? body.manualDiscountEnabled : undefined
+
     const settingsData = {
       outletId: user.outletId,
       ...(body.paymentMethods !== undefined && { paymentMethods: String(body.paymentMethods) }),
@@ -114,6 +151,7 @@ export async function PUT(request: NextRequest) {
       ...(body.receiptLogo !== undefined && { receiptLogo: String(body.receiptLogo ?? '') }),
       ...(ppnEnabled !== undefined && { ppnEnabled }),
       ...(ppnRate !== undefined && { ppnRate }),
+      ...(manualDiscountEnabled !== undefined && { manualDiscountEnabled }),
       ...(body.themePrimaryColor !== undefined && { themePrimaryColor: String(body.themePrimaryColor) }),
       ...(body.telegramBotToken !== undefined && { telegramBotToken: body.telegramBotToken ? String(body.telegramBotToken) : null }),
       ...(body.telegramChatId !== undefined && { telegramChatId: body.telegramChatId ? String(body.telegramChatId) : null }),
@@ -165,7 +203,7 @@ export async function PUT(request: NextRequest) {
     const SETTINGS_KEYS = [
       'paymentMethods', 'loyaltyEnabled', 'loyaltyPointsPerAmount', 'loyaltyPointValue',
       'receiptBusinessName', 'receiptAddress', 'receiptPhone', 'receiptFooter', 'receiptLogo',
-      'ppnEnabled', 'ppnRate',
+      'ppnEnabled', 'ppnRate', 'manualDiscountEnabled',
       'themePrimaryColor', 'telegramBotToken', 'telegramChatId',
       'notifyOnTransaction', 'notifyOnCustomer', 'notifyDailyReport', 'notifyWeeklyReport', 'notifyMonthlyReport', 'notifyOnInsight',
     ] as const
@@ -213,6 +251,7 @@ export async function PUT(request: NextRequest) {
       receiptLogo: response.receiptLogo,
       ppnEnabled: response.ppnEnabled,
       ppnRate: response.ppnRate,
+      manualDiscountEnabled: response.manualDiscountEnabled,
       themePrimaryColor: response.themePrimaryColor,
       telegramChatId: response.telegramChatId,
       telegramBotToken: response.telegramBotToken ? '••••••' : null,

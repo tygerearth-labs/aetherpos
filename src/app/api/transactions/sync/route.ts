@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { getAuthUser, unauthorized } from '@/lib/get-auth'
 import { generateInvoiceNumber } from '@/lib/api-helpers'
 import { safeJson, safeJsonError } from '@/lib/safe-response'
+import { ensureMigrated } from '@/lib/db-migrate'
 
 interface SyncTransactionItem {
   productId: string
@@ -12,6 +13,7 @@ interface SyncTransactionItem {
   subtotal: number
   variantId?: string | null
   variantName?: string | null
+  itemDiscount?: number
 }
 
 interface SyncTransaction {
@@ -49,6 +51,9 @@ export async function POST(request: NextRequest) {
     }
     const userId = user.id
     const outletId = user.outletId
+
+    // Auto-migrate: ensure new columns exist (e.g. itemDiscount)
+    await ensureMigrated()
 
     const body = await request.json()
     const { transactions }: { transactions: SyncTransaction[] } = body
@@ -190,6 +195,7 @@ export async function POST(request: NextRequest) {
                 price: item.price,
                 qty: item.qty,
                 subtotal: item.subtotal,
+                itemDiscount: item.itemDiscount || 0,
                 hpp: itemHpp,
                 transactionId: transaction.id,
               }
