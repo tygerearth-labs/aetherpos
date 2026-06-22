@@ -638,7 +638,7 @@ function ManualDiscountTab() {
             <ul className="space-y-1 text-xs text-slate-300">
               <li className="flex items-start gap-1.5">
                 <Check className="h-3 w-3 theme-text shrink-0 mt-0.5" strokeWidth={1.5} />
-                <span>Saat menambahkan produk ke keranjang, setiap item akan memiliki kolom harga<span className="font-medium text-white">18.000 x 1</span></span>
+                <span>Saat menambahkan produk ke keranjang, setiap item akan memiliki kolom harga<span className="font-medium text-white"> 18.000 x 1</span></span>
               </li>
               <li className="flex items-start gap-1.5">
                 <Check className="h-3 w-3 theme-text shrink-0 mt-0.5" strokeWidth={1.5} />
