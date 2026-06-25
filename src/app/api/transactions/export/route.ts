@@ -110,7 +110,6 @@ export async function GET(request: NextRequest) {
           'No': detailRows.length + 1,
           'Invoice #': t.invoiceNumber,
           'Tanggal': formatDate(t.createdAt),
-          'Jam': t.createdAt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
           'Kasir': t.user?.name || '-',
           'Customer': t.customer?.name || 'Walk-in',
           'Nama Produk': item.variantName ? `${item.productName} - ${item.variantName}` : item.productName,
