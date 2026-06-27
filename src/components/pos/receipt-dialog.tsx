@@ -74,6 +74,10 @@ interface OutletSettings {
   themePrimaryColor: string
   ppnEnabled: boolean
   ppnRate: number
+  receiptDoublePrintEnabled?: boolean
+  receiptMerchantCopyEnabled?: boolean
+  receiptCustomerCopyEnabled?: boolean
+  receiptBatchOrderEnabled?: boolean
 }
 
 interface Customer {
@@ -168,54 +172,51 @@ function generateWhatsAppReceiptText(props: {
   const dateStr = now.toLocaleDateString('id-ID', { day: '2-digit', month: '2-digit', year: 'numeric' })
   const timeStr = now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 
-  const isOffline = checkoutResult.invoiceNumber?.startsWith('OFF-')
+  const lines: string[] = []
 
-  let text = ``
-  text += `📋 *STRUK PEMBELIAN*\n`
-  text += `${'═'.repeat(28)}\n`
-  text += `${settings.receiptBusinessName}\n`
-  if (settings.receiptAddress) text += `${settings.receiptAddress}\n`
-  if (settings.receiptPhone) text += `${settings.receiptPhone}\n`
-  text += `${'═'.repeat(28)}\n`
-  text += `No: ${checkoutResult.invoiceNumber}\n`
-  text += `Tanggal: ${dateStr} ${timeStr}\n`
-  text += `Customer: ${selectedCustomer ? selectedCustomer.name : 'Walk-in'}\n`
-  if (isOffline) text += `⚠️ *Offline — Pending Sync*\n`
-  text += `${'─'.repeat(28)}\n`
-  text += `*ITEM:*\n`
+  // Header
+  lines.push(settings.receiptBusinessName)
+  if (settings.receiptAddress) lines.push(settings.receiptAddress)
+  if (settings.receiptPhone) lines.push(settings.receiptPhone)
+  lines.push('')
 
+  // Transaction info
+  lines.push(`No: ${checkoutResult.invoiceNumber}`)
+  lines.push(`Tanggal: ${dateStr} ${timeStr}`)
+  lines.push(`Customer: ${selectedCustomer ? selectedCustomer.name : 'Walk-in'}`)
+  lines.push('')
+
+  // Items
   for (const item of cart) {
     const name = item.variant ? `${item.product.name} (${item.variant.name})` : item.product.name
     const effPrice = getItemEffectivePrice(item)
     const effSubtotal = effPrice * item.qty
-    text += `${name}\n`
-    if (item.customPrice != null) {
-      text += `  ~~@${formatCurrency(getItemPrice(item))}~~ → @${formatCurrency(effPrice)} × ${item.qty} = ${formatCurrency(effSubtotal)}\n`
-    } else {
-      text += `  @${formatCurrency(effPrice)} × ${item.qty} = ${formatCurrency(effSubtotal)}\n`
-    }
+    lines.push(`${name}`)
+    lines.push(`  ${formatCurrency(effPrice)} x ${item.qty} = ${formatCurrency(effSubtotal)}`)
   }
+  lines.push('')
 
-  text += `${'─'.repeat(28)}\n`
-  text += `Subtotal: ${formatCurrency(subtotal)}\n`
-  if (pointsDiscount > 0) text += `Poin Diskon: -${formatCurrency(pointsDiscount)}\n`
-  if (promoDiscount > 0 && selectedPromo) text += `Promo (${selectedPromo.name}): -${formatCurrency(promoDiscount)}\n`
-  if (manualDiscountTotal > 0) text += `Diskon Manual: -${formatCurrency(manualDiscountTotal)}\n`
-  if (ppnAmount > 0) text += `PPN (${settings.ppnRate}%): +${formatCurrency(ppnAmount)}\n`
-  text += `${'═'.repeat(28)}\n`
-  text += `*TOTAL: ${formatCurrency(total)}*\n`
-  text += `${'─'.repeat(28)}\n`
-  text += `Metode: ${paymentMethod}\n`
-  text += `Dibayar: ${formatCurrency(paymentMethod === 'CASH' ? Number(paidAmount) : total)}\n`
-  if (paymentMethod === 'CASH' && changeAmount > 0) text += `Kembalian: ${formatCurrency(changeAmount)}\n`
+  // Totals
+  lines.push(`Subtotal: ${formatCurrency(subtotal)}`)
+  if (pointsDiscount > 0) lines.push(`Poin Diskon: -${formatCurrency(pointsDiscount)}`)
+  if (promoDiscount > 0 && selectedPromo) lines.push(`Promo (${selectedPromo.name}): -${formatCurrency(promoDiscount)}`)
+  if (manualDiscountTotal > 0) lines.push(`Diskon Manual: -${formatCurrency(manualDiscountTotal)}`)
+  if (ppnAmount > 0) lines.push(`PPN (${settings.ppnRate}%): +${formatCurrency(ppnAmount)}`)
+  lines.push(`TOTAL: ${formatCurrency(total)}`)
+  lines.push('')
+
+  // Payment
+  lines.push(`Pembayaran: ${paymentMethod}`)
+  lines.push(`Dibayar: ${formatCurrency(paymentMethod === 'CASH' ? Number(paidAmount) : total)}`)
+  if (paymentMethod === 'CASH' && changeAmount > 0) lines.push(`Kembalian: ${formatCurrency(changeAmount)}`)
+
+  // Footer
   if (settings.receiptFooter) {
-    text += `${'─'.repeat(28)}\n`
-    text += `${settings.receiptFooter}\n`
+    lines.push('')
+    lines.push(settings.receiptFooter)
   }
-  text += `${'═'.repeat(28)}\n`
-  text += `Terima kasih! 🙏`
 
-  return text
+  return lines.join('\n')
 }
 
 // ==================== COMPONENT ====================
@@ -248,13 +249,42 @@ export function ReceiptDialog({
     return `${now.toLocaleDateString('id-ID', { day: '2-digit', month: '2-digit', year: 'numeric' })} ${now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
   }
 
-  // Print handler
+  // Print handler — supports double receipt
   const handlePrint = () => {
     const content = receiptContentRef.current?.innerHTML
     if (!content) return
+
+    const doublePrint = settings.receiptDoublePrintEnabled
+    const merchantCopy = settings.receiptMerchantCopyEnabled !== false
+    const customerCopy = settings.receiptCustomerCopyEnabled !== false
+    const batchOrder = settings.receiptBatchOrderEnabled === true
+
+    const copies: { label: string; content: string }[] = []
+    if (!doublePrint) {
+      copies.push({ label: 'Struk', content })
+    } else {
+      if (merchantCopy) {
+        copies.push({ label: 'Merchant Copy', content: `<div style="text-align:center;font-size:9px;font-weight:bold;margin-bottom:4px;color:#555;">*** MERCHANT COPY ***</div>${content}` })
+      }
+      if (customerCopy) {
+        copies.push({ label: 'Customer Copy', content: `<div style="text-align:center;font-size:9px;font-weight:bold;margin-bottom:4px;color:#555;">*** CUSTOMER COPY ***</div>${content}` })
+      }
+      if (batchOrder) {
+        copies.push({ label: 'Batch Order', content: `<div style="text-align:center;font-size:9px;font-weight:bold;margin-bottom:4px;color:#555;">*** BATCH ORDER ***</div>${content}` })
+      }
+      if (copies.length === 0) {
+        copies.push({ label: 'Struk', content })
+      }
+    }
+
+    const combinedContent = copies.map((c, i) => {
+      const separator = i > 0 ? `<div style="page-break-before:always;border-top:2px dashed #000;margin:8px 0;"></div>` : ''
+      return separator + c.content
+    }).join('')
+
     const win = window.open('', '_blank', 'width=320,height=800')
     if (!win) { toast.error('Gagal membuka jendela cetak'); return }
-    win.document.write(`<!DOCTYPE html><html><head><title>Receipt</title>
+    win.document.write(`<!DOCTYPE html><html><head><title>Receipt${copies.length > 1 ? ` (${copies.length} copies)` : ''}</title>
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { width: 72mm; margin: 0 auto; padding: 10px 8px; }
@@ -266,24 +296,26 @@ export function ReceiptDialog({
           .r-sep { border-top: 1px dashed #000; }
         }
       </style>
-    </head><body>${content}</body></html>`)
+    </head><body>${combinedContent}</body></html>`)
     win.document.close()
     setTimeout(() => { win.print(); setTimeout(() => win.close(), 500) }, 250)
     handleClose()
   }
 
-  // WhatsApp handler
+  // WhatsApp handler — sends receipt as clean text
   const handleWhatsApp = () => {
     if (!selectedCustomer?.whatsapp || !checkoutResult) return
-    const text = generateWhatsAppReceiptText({
-      cart, subtotal, pointsDiscount, promoDiscount, manualDiscountTotal, ppnAmount, total,
-      paymentMethod, paidAmount, change: changeAmount,
+
+    const message = generateWhatsAppReceiptText({
+      cart, subtotal, pointsDiscount, promoDiscount, manualDiscountTotal,
+      ppnAmount, total, paymentMethod, paidAmount, change: changeAmount,
       selectedCustomer, selectedPromo, checkoutResult, settings,
     })
+
     let phone = selectedCustomer.whatsapp.replace(/[^0-9]/g, '')
     if (phone.startsWith('0')) phone = phone.substring(1)
-    const url = `https://wa.me/62${phone}?text=${encodeURIComponent(text)}`
-    window.open(url, '_blank')
+    const waUrl = `https://wa.me/62${phone}?text=${encodeURIComponent(message)}`
+    window.open(waUrl, '_blank')
   }
 
   // Close handler

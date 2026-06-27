@@ -234,6 +234,12 @@ model OutletSetting {
   // Manual per-item discount toggle for POS Terminal
   manualDiscountEnabled Boolean @default(false) // Enable/disable manual discount per item in cart
 
+  // Double receipt print settings
+  receiptDoublePrintEnabled Boolean @default(false)  // Enable double receipt printing
+  receiptMerchantCopyEnabled Boolean @default(true)   // Print merchant copy
+  receiptCustomerCopyEnabled Boolean @default(true)   // Print customer copy
+  receiptBatchOrderEnabled Boolean @default(false)    // Enable batch order copy
+
   // Theme
   themePrimaryColor String @default("emerald") // tailwind color name: emerald, blue, violet, rose, amber
 
@@ -286,4 +292,20 @@ model CrewPermission {
   outlet Outlet @relation(fields: [outletId], references: [id])
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+// ==================== PLAN ====================
+model Plan {
+  id          String   @id @default(cuid())
+  name        String                        // Display name: "Free", "Pro", "Enterprise"
+  slug        String   @unique               // URL-safe key: "free", "pro", "enterprise"
+  price       Float    @default(0)           // Price in IDR (0 = free)
+  duration    Int      @default(1)           // Duration in months (1 = per bulan, 12 = per tahun)
+  paymentLink String?                       // External payment URL for upgrade
+  features    String   @default("{}")       // JSON: feature key-value pairs (booleans & numbers)
+  active      Boolean  @default(true)       // Show/enable this plan
+  sortOrder   Int      @default(0)          // Display order (lower = first)
+  description String?                       // Short tagline
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }

@@ -3,7 +3,7 @@ import { db } from '@/lib/db'
 import { getAuthUser, unauthorized } from '@/lib/api/get-auth'
 import { buildDateFilter, resolvePlanType } from '@/lib/api/api-helpers'
 import { getPlanFeatures } from '@/lib/config/plan-config'
-import { formatCurrency, formatDate } from '@/lib/format'
+import { formatDate } from '@/lib/format'
 import * as XLSX from 'xlsx'
 import { safeJsonError } from '@/lib/api/safe-response'
 
@@ -115,11 +115,11 @@ export async function GET(request: NextRequest) {
           'Nama Produk': item.variantName ? `${item.productName} - ${item.variantName}` : item.productName,
           'SKU': item.variant?.sku || item.product?.sku || '-',
           'QTY': item.qty,
-          'Harga Satuan': formatCurrency(item.price),
-          'Subtotal Item': formatCurrency(item.subtotal),
+          'Harga Satuan': item.price,
+          'Subtotal Item': item.subtotal,
           'Metode Pembayaran': t.paymentMethod,
-          'PPN': formatCurrency(t.taxAmount),
-          'Total Transaksi': formatCurrency(t.total),
+          'PPN': t.taxAmount,
+          'Total Transaksi': t.total,
           'Status': voidSet.has(t.id) ? 'VOID' : 'Aktif',
         })
       }
@@ -143,12 +143,12 @@ export async function GET(request: NextRequest) {
       'Customer': t.customer?.name || 'Walk-in',
       'Jumlah Item': t.items.reduce((s, i) => s + i.qty, 0),
       'Metode Pembayaran': t.paymentMethod,
-      'Subtotal': formatCurrency(t.subtotal),
-      'Diskon': formatCurrency(t.discount),
-      'PPN': formatCurrency(t.taxAmount),
-      'Total': formatCurrency(t.total),
-      'Dibayar': formatCurrency(t.paidAmount),
-      'Kembalian': formatCurrency(t.change),
+      'Subtotal': t.subtotal,
+      'Diskon': t.discount,
+      'PPN': t.taxAmount,
+      'Total': t.total,
+      'Dibayar': t.paidAmount,
+      'Kembalian': t.change,
       'Status': voidSet.has(t.id) ? 'VOID' : 'Aktif',
     }))
 
