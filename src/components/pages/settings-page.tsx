@@ -2475,14 +2475,6 @@ function MultiOutletTab() {
                 {outlets.length} outlet terdaftar
               </p>
             </div>
-            {canAddMore && (
-              <Button disabled
-                className="theme-btn-primary h-8 text-xs opacity-50 cursor-not-allowed flex items-center gap-1.5">
-                <Plus className="h-3.5 w-3.5" />
-                Tambah Cabang
-                <Lock className="h-3 w-3 ml-1" />
-              </Button>
-            )}
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
