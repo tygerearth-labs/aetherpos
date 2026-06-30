@@ -279,10 +279,18 @@ function getActionDescription(action: string, details: Record<string, unknown>):
   const parentLabel = parentName ? ` (${parentName})` : ''
 
   switch (action) {
-    case 'CREATE':
+    case 'CREATE': {
+      if (details.action === 'TRANSFER_IN_NEW') {
+        return `Produk baru dari transfer ${details.transferNumber || ''} — Stok awal: ${formatNumber(Number(details.initialStock) || 0)}`
+      }
       return `Product created — Price: ${formatCurrency(Number(details.price) || 0)}, Stock: ${formatNumber(Number(details.stock) || 0)}`
-    case 'RESTOCK':
+    }
+    case 'RESTOCK': {
+      if (details.action === 'TRANSFER_IN') {
+        return `+${formatNumber(Number(details.quantityAdded) || 0)} dari transfer ${details.transferNumber || ''} (${details.fromOutlet || 'outlet lain'}) — Stok: ${formatNumber(Number(details.previousStock) || 0)} → ${formatNumber(Number(details.newStock) || 0)}`
+      }
       return `+${formatNumber(Number(details.quantityAdded) || 0)} units${variantLabel} (Stock: ${formatNumber(Number(details.previousStock) || 0)} → ${formatNumber(Number(details.newStock) || 0)})`
+    }
     case 'SALE':
       return `Sold ${formatNumber(Number(details.quantitySold) || Number(details.qty) || 0)} units${variantLabel} — ${formatCurrency(Number(details.subtotal) || 0)}`
     case 'UPDATE':
@@ -479,7 +487,7 @@ export default function ProductsPage() {
   }, [])
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+     
     void fetchCategories()
   }, [fetchCategories])
 
@@ -509,7 +517,7 @@ export default function ProductsPage() {
   }, [page, search, sort, activeCategoryId])
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+     
     void fetchProducts()
   }, [fetchProducts])
 
@@ -548,7 +556,7 @@ export default function ProductsPage() {
 
   useEffect(() => {
     if (detailOpen && detailProduct) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
+       
       void fetchDetail(detailProduct, detailPage)
     }
   }, [detailOpen, detailProduct, detailPage, fetchDetail])
@@ -601,6 +609,9 @@ export default function ProductsPage() {
         if (res.ok) {
           toast.success(`Restocked ${restockProduct.name} (${variantData.length} varian)`)
           fetchProducts()
+          if (detailOpen && detailProduct?.id === restockProduct.id) {
+            fetchDetail(restockProduct, detailPage)
+          }
         } else {
           toast.error('Failed to restock')
         }
@@ -3049,20 +3060,21 @@ export default function ProductsPage() {
                               {formatNumber(detailData.product.stock)}
                             </p>
                           </div>
-                          {!detailData.product.hasVariants && (
-                            <div className="col-span-2 flex gap-1.5 mt-0.5">
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-6 text-[10px] px-2 theme-bg-very-light theme-text border theme-border-light hover:theme-bg-subtle"
-                                onClick={() => {
-                                  setRestockProduct(detailProduct!)
-                                  setRestockQty('')
-                                  setRestockOpen(true)
-                                }}
-                              >
-                                <RefreshCw className="h-2.5 w-2.5 mr-0.5" /> Restock
-                              </Button>
+                          <div className="col-span-2 flex gap-1.5 mt-0.5">
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-6 text-[10px] px-2 theme-bg-very-light theme-text border theme-border-light hover:theme-bg-subtle"
+                              onClick={() => {
+                                setRestockProduct(detailData.product as unknown as Product)
+                                setRestockQty('')
+                                setVariantRestocks([])
+                                setRestockOpen(true)
+                              }}
+                            >
+                              <RefreshCw className="h-2.5 w-2.5 mr-0.5" /> Restock
+                            </Button>
+                            {!detailData.product.hasVariants && (
                               <Button
                                 size="sm"
                                 variant="ghost"
@@ -3076,8 +3088,8 @@ export default function ProductsPage() {
                               >
                                 <FilePenLine className="h-2.5 w-2.5 mr-0.5" /> Penyesuaian
                               </Button>
-                            </div>
-                          )}
+                            )}
+                          </div>
                           {isOwner && (
                             <div>
                               <span className="text-slate-500 text-[11px]">HPP</span>
