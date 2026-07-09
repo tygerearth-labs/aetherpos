@@ -4,6 +4,7 @@ import { getAuthUser, unauthorized } from '@/lib/api/get-auth'
 import { generateInvoiceNumber } from '@/lib/api/api-helpers'
 import { safeJson, safeJsonError } from '@/lib/api/safe-response'
 import { ensureMigrated } from '@/lib/db-migrate'
+import { InventoryConsumptionService } from '@/lib/inventory-consumption-service'
 
 interface SyncTransactionItem {
   productId: string
@@ -174,24 +175,42 @@ export async function POST(request: NextRequest) {
           })
 
           // 6. Create TransactionItems — with variant support
+          //    productName & variantName: server-verified from DB
+          //    productSku & variantSku: snapshotted from DB at sale time
+          //    hpp: snapshotted from DB at sync time
+          //    price: kept from client (offline effective price)
           await txDb.transactionItem.createMany({
             data: payload.items.map((item) => {
               const product = productMap.get(item.productId)!
+              const variant = item.variantId ? variantMap.get(item.variantId) : null
               let itemHpp = product.hpp
 
               // Use variant HPP if variant is specified
-              if (item.variantId) {
-                const variant = variantMap.get(item.variantId)
-                if (variant) {
-                  itemHpp = variant.hpp
-                }
+              if (item.variantId && variant) {
+                itemHpp = variant.hpp
+              }
+
+              // Server-side name verification — log if client name differs from DB
+              const verifiedProductName = product.name
+              const verifiedVariantName = variant?.name || item.variantName || null
+              if (item.productName && item.productName !== product.name) {
+                console.warn(
+                  `[sync] productName mismatch: client="${item.productName}" db="${product.name}" productId=${product.id}`
+                )
+              }
+              if (item.variantName && variant && item.variantName !== variant.name) {
+                console.warn(
+                  `[sync] variantName mismatch: client="${item.variantName}" db="${variant.name}" variantId=${variant.id}`
+                )
               }
 
               return {
                 productId: item.productId,
-                productName: item.productName,
+                productName: verifiedProductName,
+                productSku: product.sku || null,
                 variantId: item.variantId || null,
-                variantName: item.variantName || null,
+                variantName: verifiedVariantName,
+                variantSku: variant?.sku || null,
                 price: item.price,
                 qty: item.qty,
                 subtotal: item.subtotal,
@@ -219,6 +238,31 @@ export async function POST(request: NextRequest) {
             }
           }
 
+          // 7c. Deduct inventory via InventoryConsumptionService (atomic, yield-aware)
+          //     Jika stok bahan tidak cukup → error → seluruh transaksi di-rollback
+          const syncConsumptionResult = await InventoryConsumptionService.consumeForTransaction(txDb, {
+            items: payload.items.map(item => ({
+              productId: item.productId,
+              variantId: item.variantId || null,
+              productName: item.productName,
+              variantName: item.variantName || null,
+              qty: item.qty,
+            })),
+            transactionId: transaction.id,
+            invoiceNumber,
+            outletId,
+            userId,
+          })
+
+          // 7d. Snapshot consumption data for accurate void reversal
+          if (syncConsumptionResult.deductions.length > 0) {
+            const snapshots = InventoryConsumptionService.buildConsumptionSnapshots(
+              syncConsumptionResult.deductions,
+              transaction.id,
+            )
+            await txDb.transactionConsumption.createMany({ data: snapshots })
+          }
+
           // 8. Create audit logs — VARIANT type for variant items, PRODUCT for normal
           const auditLogs = []
           for (const item of payload.items) {
@@ -236,6 +280,8 @@ export async function POST(request: NextRequest) {
                   variantName: item.variantName,
                   variantSku: variant?.sku || null,
                   quantitySold: item.qty,
+                  price: item.price,
+                  subtotal: item.price * item.qty,
                   previousStock: variant?.stock || 0,
                   newStock: (variant?.stock || 0) - item.qty,
                   syncedFromOffline: true,
@@ -255,6 +301,8 @@ export async function POST(request: NextRequest) {
                   productName: item.productName,
                   productSku: product.sku || null,
                   quantitySold: item.qty,
+                  price: item.price,
+                  subtotal: item.price * item.qty,
                   previousStock: product.stock,
                   newStock: product.stock - item.qty,
                   syncedFromOffline: true,

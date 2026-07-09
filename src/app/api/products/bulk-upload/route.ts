@@ -30,9 +30,16 @@ function sanitizeNumber(val: unknown): number {
   const str = String(val).trim()
   if (!str) return 0
 
-  // Remove currency symbols & whitespace
-  let cleaned = str.replace(/[Rp\s$€¥£.,\-]/g, (match) => {
-    // Keep dots and commas for number reconstruction, remove the rest
+  // Detect leading negative sign before stripping
+  let isNegative = false
+  let trimmed = str
+  if (trimmed.startsWith('-') || trimmed.startsWith('−')) { // also handle unicode minus
+    isNegative = true
+    trimmed = trimmed.slice(1)
+  }
+
+  // Remove currency symbols & whitespace (keep dots, commas, digits)
+  let cleaned = trimmed.replace(/[Rp\s$€¥£.,]/g, (match) => {
     if (match === '.' || match === ',') return match
     return ''
   }).trim()
@@ -70,7 +77,7 @@ function sanitizeNumber(val: unknown): number {
   }
 
   const num = Number(cleaned)
-  return isNaN(num) ? 0 : num
+  return isNaN(num) ? 0 : (isNegative ? -Math.abs(num) : num)
 }
 
 /** Normalize header key for flexible matching */
@@ -211,7 +218,13 @@ export async function POST(request: NextRequest) {
         continue
       }
 
-      if (!price || price <= 0) {
+      if (!price || price < 0) {
+        errors.push(`Baris ${rowNum}: Harga Jual tidak boleh negatif (Nama: ${name})`)
+        continue
+      }
+
+      // Variant parent products must have price > 0 (price=0 only allowed for products WITH variants)
+      if (price <= 0 && !hasVariants) {
         errors.push(`Baris ${rowNum}: Harga Jual harus lebih dari 0 (Nama: ${name})`)
         continue
       }
@@ -352,6 +365,15 @@ export async function POST(request: NextRequest) {
           // Auto-generate variant barcode from SKU if not provided
           const finalVariantBarcode = variantBarcode || finalVariantSku
 
+          // Skip duplicate variants (by name + productId) — allows safe re-upload
+          const existingVariant = await db.productVariant.findFirst({
+            where: { name: variantName, productId: parentProduct.id },
+          })
+          if (existingVariant) {
+            variantsSkipped++
+            continue
+          }
+
           // Create variant
           await db.productVariant.create({
             data: {
@@ -386,8 +408,122 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // === Process "Komposisi" sheet if it exists ===
+    let compCreated = 0
+    let compSkipped = 0
+
+    const compSheetName = workbook.SheetNames.find(
+      (n) => normalizeHeader(n).includes('komposisi')
+    )
+
+    if (compSheetName) {
+      const compSheet = workbook.Sheets[compSheetName]
+      const compRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(compSheet, { defval: '' })
+
+      console.log(`[Bulk Upload] Found composition sheet "${compSheetName}" with ${compRows.length} rows`)
+
+      // Cache products and inventory items
+      const compProductCache = new Map<string, string>() // productName → productId
+      const inventoryItemCache = new Map<string, { id: string; baseUnit: string }>()
+
+      // Pre-load all inventory items for this outlet
+      const allInventoryItems = await db.inventoryItem.findMany({
+        where: { outletId },
+        select: { id: true, name: true, baseUnit: true },
+      })
+      for (const item of allInventoryItems) {
+        inventoryItemCache.set(item.name, { id: item.id, baseUnit: item.baseUnit })
+      }
+
+      for (let i = 0; i < compRows.length; i++) {
+        try {
+          const cRow = compRows[i]
+          const rowNum = i + 2
+
+          const parentName = String(findColumn(cRow, ['NAMA PRODUK*', 'NAMA PRODUK', 'Nama Produk', 'Nama', 'NAME', 'name', 'Product Name', 'Produk']) || '').trim()
+          const variantName = String(findColumn(cRow, ['NAMA VARIAN', 'Nama Varian', 'Varian', 'Variant Name']) || '').trim()
+          const bahanName = String(findColumn(cRow, ['NAMA BAHAN*', 'NAMA BAHAN', 'Nama Bahan', 'Bahan', 'BAHAN']) || '').trim()
+          const qty = sanitizeNumber(findColumn(cRow, ['QTY*', 'QTY', 'Qty', 'qty', 'Jumlah', 'Quantity']))
+
+          if (!parentName) {
+            errors.push(`Baris ${rowNum} (Komposisi): Nama Produk wajib diisi`)
+            continue
+          }
+          if (!bahanName) {
+            errors.push(`Baris ${rowNum} (Komposisi): Nama Bahan wajib diisi (Produk: ${parentName})`)
+            continue
+          }
+          if (!qty || qty <= 0) {
+            errors.push(`Baris ${rowNum} (Komposisi): QTY harus lebih dari 0 (Produk: ${parentName}, Bahan: ${bahanName})`)
+            continue
+          }
+
+          // Find parent product
+          let productId = compProductCache.get(parentName)
+          if (!productId) {
+            const found = await db.product.findFirst({ where: { name: parentName, outletId } })
+            if (!found) {
+              errors.push(`Baris ${rowNum} (Komposisi): Produk "${parentName}" tidak ditemukan`)
+              compSkipped++
+              continue
+            }
+            productId = found.id
+            compProductCache.set(parentName, productId)
+          }
+
+          // Find inventory item
+          const invItem = inventoryItemCache.get(bahanName)
+          if (!invItem) {
+            errors.push(`Baris ${rowNum} (Komposisi): Item "${bahanName}" tidak ditemukan. Daftarkan item terlebih dahulu.`)
+            compSkipped++
+            continue
+          }
+
+          // Find variant if specified
+          let variantId: string | null = null
+          if (variantName) {
+            const foundVariant = await db.productVariant.findFirst({
+              where: { name: variantName, productId, outletId },
+            })
+            if (!foundVariant) {
+              errors.push(`Baris ${rowNum} (Komposisi): Varian "${variantName}" tidak ditemukan untuk produk "${parentName}"`)
+              compSkipped++
+              continue
+            }
+            variantId = foundVariant.id
+          }
+
+          // Skip duplicate compositions (productId + variantId + inventoryItemId) — allows safe re-upload
+          const existingComp = await db.productComposition.findFirst({
+            where: { productId, variantId: variantId || null, inventoryItemId: invItem.id },
+          })
+          if (existingComp) {
+            compSkipped++
+            continue
+          }
+
+          await db.productComposition.create({
+            data: {
+              productId,
+              variantId,
+              inventoryItemId: invItem.id,
+              qty,
+              baseUnit: invItem.baseUnit,
+            },
+          })
+          compCreated++
+        } catch (compError) {
+          const rowNum = i + 2
+          const errMessage = compError instanceof Error ? compError.message : 'Unknown error'
+          console.error(`[Bulk Upload] Composition row ${rowNum} error:`, compError)
+          errors.push(`Baris ${rowNum} (Komposisi): Gagal memproses — ${errMessage}`)
+          compSkipped++
+        }
+      }
+    }
+
     // Create audit log for bulk upload
-    if (created > 0 || variantsCreated > 0) {
+    if (created > 0 || variantsCreated > 0 || compCreated > 0) {
       await safeAuditLog({
         action: 'CREATE',
         entityType: 'PRODUCT',
@@ -397,6 +533,8 @@ export async function POST(request: NextRequest) {
           skipped,
           variantsCreated,
           variantsSkipped,
+          compCreated,
+          compSkipped,
           errors: errors.length,
           fileName: file.name,
         }),
@@ -410,6 +548,8 @@ export async function POST(request: NextRequest) {
       skipped,
       variantsCreated,
       variantsSkipped,
+      compCreated,
+      compSkipped,
       errors,
     })
   } catch (error) {

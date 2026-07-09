@@ -87,6 +87,10 @@ export async function GET(request: NextRequest) {
         const maxPrice = p.hasVariants && vList.length > 0
           ? Math.max(...vList.map((v: { price: number }) => v.price))
           : p.price
+        // Aggregate HPP: for variant products, average from variants; otherwise use product.hpp
+        const aggHpp = p.hasVariants && vList.length > 0
+          ? Math.round(vList.reduce((s: number, v: { hpp: number }) => s + v.hpp, 0) / vList.length)
+          : p.hpp
         return {
           ...p,
           _totalSold: soldMap.get(p.id) ?? 0,
@@ -97,6 +101,7 @@ export async function GET(request: NextRequest) {
           stock: aggStock,
           price: aggPrice,
           _maxPrice: maxPrice,
+          hpp: aggHpp,
         }
       })
     } else if (sort === 'low-stock' || sort === 'most-stock') {
@@ -140,6 +145,9 @@ export async function GET(request: NextRequest) {
         const maxPrice = p.hasVariants && vList.length > 0
           ? Math.max(...vList.map((v: { price: number }) => v.price))
           : p.price
+        const aggHpp = p.hasVariants && vList.length > 0
+          ? Math.round(vList.reduce((s: number, v: { hpp: number }) => s + v.hpp, 0) / vList.length)
+          : p.hpp
         return {
           ...p,
           hasVariants: !!p.hasVariants,
@@ -148,6 +156,7 @@ export async function GET(request: NextRequest) {
           stock: aggStock,
           price: aggPrice,
           _maxPrice: maxPrice,
+          hpp: aggHpp,
         }
       })
     } else {
@@ -178,6 +187,9 @@ export async function GET(request: NextRequest) {
         const maxPrice = p.hasVariants && vList.length > 0
           ? Math.max(...vList.map((v: { price: number }) => v.price))
           : p.price
+        const aggHpp = p.hasVariants && vList.length > 0
+          ? Math.round(vList.reduce((s: number, v: { hpp: number }) => s + v.hpp, 0) / vList.length)
+          : p.hpp
         return {
           ...p,
           hasVariants: !!p.hasVariants,
@@ -186,6 +198,7 @@ export async function GET(request: NextRequest) {
           stock: aggStock,
           price: aggPrice,
           _maxPrice: maxPrice,
+          hpp: aggHpp,
         }
       })
       total = count
@@ -381,18 +394,30 @@ export async function POST(request: NextRequest) {
       return newProduct
     })
 
-    // Fetch the created product with variants count
-    const productWithCount = await db.product.findUnique({
-      where: { id: product.id },
-      include: {
-        _count: { select: { variants: true } },
-      },
-    })
+    // Fetch the created product with variants
+    let productResult
+    if (variantsWithSku.length > 0) {
+      productResult = await db.product.findUnique({
+        where: { id: product.id },
+        include: {
+          _count: { select: { variants: true } },
+          variants: { select: { id: true, name: true, sku: true, price: true, hpp: true, stock: true } },
+        },
+      })
+    } else {
+      productResult = await db.product.findUnique({
+        where: { id: product.id },
+        include: {
+          _count: { select: { variants: true } },
+        },
+      })
+    }
 
     return safeJsonCreated({
       ...product,
       hasVariants: !!product.hasVariants,
-      _variantCount: productWithCount?._count?.variants ?? 0,
+      _variantCount: productResult?._count?.variants ?? 0,
+      variants: productResult?.variants ?? [],
     })
   } catch (error) {
     console.error('Products POST error:', error)

@@ -1,0 +1,361 @@
+import { NextRequest } from 'next/server'
+import { db } from '@/lib/db'
+import { getAuthUser, unauthorized } from '@/lib/api/get-auth'
+import { safeJson, safeJsonError } from '@/lib/api/safe-response'
+import { safeAuditLog } from '@/lib/safe-audit'
+
+// GET /api/inventory/items/[id] — get single inventory item with linked products & movements
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const user = await getAuthUser(request)
+    if (!user) return unauthorized()
+    const { id } = await params
+    const url = new URL(request.url)
+    const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'))
+    const limit = 20
+    const skip = (page - 1) * limit
+
+    const item = await db.inventoryItem.findFirst({
+      where: { id, outletId: user.outletId },
+      include: {
+        category: { select: { id: true, name: true, color: true } },
+        _count: { select: { compositions: true, purchaseItems: true, movements: true } },
+      },
+    })
+
+    if (!item) {
+      return safeJsonError('Inventory item not found', 404)
+    }
+
+    // Fetch linked products (products that use this inventory item in composition)
+    // Use select-only approach to avoid Prisma crash on orphaned compositions
+    // (product deleted but composition row remains due to SQLite cascade issues)
+    let linkedProducts: Array<{
+      id: string; productId: string; productName: string; productSku: string | null;
+      productImage: string | null; productPrice: number; productStock: number;
+      variantId: string | null; variantName: string | null; variantPrice: number | null;
+      qty: number; yieldPerBatch: number; baseUnit: string;
+    }> = []
+
+    try {
+      const allComps = await db.productComposition.findMany({
+        where: { inventoryItemId: id },
+        select: { id: true, productId: true, variantId: true, qty: true, yieldPerBatch: true, baseUnit: true },
+        orderBy: { createdAt: 'desc' },
+      })
+
+      // Clean up orphaned compositions (product was deleted but row remained)
+      const productIds = [...new Set(allComps.map((c) => c.productId))]
+      const variantIds = [...new Set(allComps.filter((c) => c.variantId).map((c) => c.variantId!))]
+
+      const [existingProducts, existingVariants] = await Promise.all([
+        db.product.findMany({
+          where: { id: { in: productIds } },
+          select: { id: true, name: true, sku: true, price: true, stock: true, hasVariants: true, image: true },
+        }),
+        variantIds.length > 0
+          ? db.productVariant.findMany({
+              where: { id: { in: variantIds } },
+              select: { id: true, name: true, price: true, stock: true },
+            })
+          : Promise.resolve([]),
+      ])
+
+      const productMap = new Map(existingProducts.map((p) => [p.id, p]))
+      const variantMap = new Map(existingVariants.map((v) => [v.id, v]))
+
+      // Delete orphaned composition rows (product gone)
+      const orphanIds = allComps.filter((c) => !productMap.has(c.productId)).map((c) => c.id)
+      if (orphanIds.length > 0) {
+        await db.productComposition.deleteMany({ where: { id: { in: orphanIds } } })
+        const freshItem = await db.inventoryItem.findFirst({
+          where: { id, outletId: user.outletId },
+          include: { _count: { select: { compositions: true } } },
+        })
+        if (freshItem) item._count.compositions = freshItem._count.compositions
+      }
+
+      // Map valid compositions to linked products
+      linkedProducts = allComps
+        .filter((c) => productMap.has(c.productId))
+        .map((c) => {
+          const prod = productMap.get(c.productId)!
+          const variant = c.variantId ? variantMap.get(c.variantId) : undefined
+          return {
+            id: c.id,
+            productId: prod.id,
+            productName: prod.name,
+            productSku: prod.sku,
+            productImage: prod.image,
+            productPrice: prod.price,
+            productStock: prod.stock,
+            variantId: variant?.id || null,
+            variantName: variant?.name || null,
+            variantPrice: variant?.price || null,
+            qty: c.qty,
+            yieldPerBatch: c.yieldPerBatch,
+            baseUnit: c.baseUnit,
+          }
+        })
+    } catch (compError) {
+      console.warn('[InventoryItem GET] Failed to fetch compositions:', compError)
+    }
+
+    // Fetch recent movements
+    const [movements, totalMovements] = await Promise.all([
+      db.inventoryMovement.findMany({
+        where: { inventoryItemId: id, outletId: user.outletId },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip,
+        include: {
+          user: { select: { id: true, name: true } },
+        },
+      }),
+      db.inventoryMovement.count({
+        where: { inventoryItemId: id, outletId: user.outletId },
+      }),
+    ])
+
+    const formattedMovements = movements.map((m) => ({
+      id: m.id,
+      type: m.type,
+      quantity: m.quantity,
+      previousStock: m.previousStock,
+      newStock: m.newStock,
+      referenceId: m.referenceId,
+      referenceType: m.referenceType,
+      notes: m.notes,
+      createdAt: m.createdAt.toISOString(),
+      userName: m.user?.name || null,
+    }))
+
+    return safeJson({
+      ...item,
+      linkedProducts,
+      movements: formattedMovements,
+      movementPagination: {
+        page,
+        totalPages: Math.ceil(totalMovements / limit),
+        total: totalMovements,
+      },
+    })
+  } catch (error) {
+    console.error('Inventory item GET error:', error)
+    const msg = error instanceof Error ? error.message : 'Unknown error'
+    return safeJsonError(`Failed to load inventory item: ${msg}`)
+  }
+}
+
+// PUT /api/inventory/items/[id] — update inventory item
+export async function PUT(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const user = await getAuthUser(request)
+    if (!user) return unauthorized()
+    const { id } = await params
+
+    const existing = await db.inventoryItem.findFirst({
+      where: { id, outletId: user.outletId },
+    })
+    if (!existing) {
+      return safeJsonError('Inventory item not found', 404)
+    }
+
+    const body = await request.json()
+    const { name, sku, baseUnit, lowStockAlert, categoryId } = body
+
+    // Validate categoryId if provided
+    if (categoryId) {
+      const category = await db.inventoryCategory.findFirst({
+        where: { id: categoryId, outletId: user.outletId },
+      })
+      if (!category) {
+        return safeJsonError('Category not found', 400)
+      }
+    }
+
+    const updateData: Record<string, unknown> = {}
+    if (name !== undefined) updateData.name = name.trim()
+    if (sku !== undefined) updateData.sku = sku?.trim() || null
+    if (baseUnit !== undefined) updateData.baseUnit = baseUnit.trim()
+    if (lowStockAlert !== undefined) updateData.lowStockAlert = lowStockAlert
+    if (categoryId !== undefined) updateData.categoryId = categoryId || null
+
+    const updated = await db.inventoryItem.update({
+      where: { id },
+      data: updateData,
+      include: {
+        category: { select: { id: true, name: true, color: true } },
+      },
+    })
+
+    return safeJson(updated)
+  } catch (error) {
+    console.error('Inventory item PUT error:', error)
+    return safeJsonError('Failed to update inventory item')
+  }
+}
+
+// PATCH /api/inventory/items/[id] — archive or restore inventory item
+// Body: { action: 'archive' | 'restore' }
+export async function PATCH(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const user = await getAuthUser(request)
+    if (!user) return unauthorized()
+    const userId = user.id
+    const outletId = user.outletId
+    const { id } = await params
+
+    const body = await request.json()
+    const { action } = body as { action: 'archive' | 'restore' }
+
+    if (action !== 'archive' && action !== 'restore') {
+      return safeJsonError('Action harus archive atau restore', 400)
+    }
+
+    const existing = await db.inventoryItem.findFirst({
+      where: { id, outletId },
+    })
+    if (!existing) {
+      return safeJsonError('Inventory item not found', 404)
+    }
+
+    if (action === 'archive' && existing.status === 'ARCHIVED') {
+      return safeJsonError('Item sudah tidak aktif', 400)
+    }
+    if (action === 'restore' && existing.status === 'ACTIVE') {
+      return safeJsonError('Item sudah aktif', 400)
+    }
+
+    const newStatus = action === 'archive' ? 'ARCHIVED' : 'ACTIVE'
+
+    await db.inventoryItem.update({
+      where: { id },
+      data: { status: newStatus },
+    })
+
+    // Audit log
+    await safeAuditLog({
+      action: action === 'archive' ? 'ARCHIVE' : 'RESTORE',
+      entityType: 'INVENTORY_ITEM',
+      entityId: id,
+      details: JSON.stringify({
+        itemName: existing.name,
+        sku: existing.sku,
+        previousStatus: existing.status,
+        newStatus,
+      }),
+      outletId,
+      userId,
+    })
+
+    return safeJson({ success: true, status: newStatus })
+  } catch (error) {
+    console.error('Inventory item PATCH error:', error)
+    const msg = error instanceof Error ? error.message : 'Failed to update inventory item'
+    return safeJsonError(msg, 500)
+  }
+}
+
+// DELETE /api/inventory/items/[id] — hard delete inventory item
+// BUSINESS POLICY: Only allowed if item has ZERO business history:
+//   - No TransactionConsumption (penjualan)
+//   - No InventoryMovement (stok masuk/keluar)
+//   - No PurchaseOrderItem (pembelian)
+//   - No InventoryTransferItem (transfer)
+//   - No ProductComposition (komposisi)
+// Items with history should be ARCHIVED instead (PATCH action=archive)
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const user = await getAuthUser(request)
+    if (!user) return unauthorized()
+    const userId = user.id
+    const outletId = user.outletId
+    const { id } = await params
+
+    const existing = await db.inventoryItem.findFirst({
+      where: { id, outletId },
+      include: {
+        _count: {
+          select: {
+            compositions: true,
+            purchaseItems: true,
+            movements: true,
+            inventoryTransferItems: true,
+            consumptionSnapshots: true,
+          },
+        },
+      },
+    })
+    if (!existing) {
+      return safeJsonError('Inventory item not found', 404)
+    }
+
+    const counts = existing._count
+    const totalHistory = counts.compositions + counts.purchaseItems + counts.movements
+      + counts.inventoryTransferItems + counts.consumptionSnapshots
+
+    // Business policy: reject delete if any business history exists
+    if (totalHistory > 0) {
+      // Build detailed list of what's blocking
+      const blockers: string[] = []
+      if (counts.compositions > 0) blockers.push(`${counts.compositions} komposisi produk`)
+      if (counts.purchaseItems > 0) blockers.push(`${counts.purchaseItems} riwayat pembelian`)
+      if (counts.movements > 0) blockers.push(`${counts.movements} riwayat stok`)
+      if (counts.inventoryTransferItems > 0) blockers.push(`${counts.inventoryTransferItems} riwayat transfer`)
+      if (counts.consumptionSnapshots > 0) blockers.push(`${counts.consumptionSnapshots} riwayat konsumsi`)
+
+      return safeJson({
+        blocked: true,
+        blockType: 'hasHistory',
+        message: 'Item ini memiliki histori bisnis dan tidak dapat dihapus',
+        blockers,
+        totalHistory,
+        counts,
+        suggestion: 'Gunakan "Nonaktifkan" untuk menyembunyikan item tanpa menghapus data.',
+      })
+    }
+
+    // Safe to delete — no business history whatsoever
+    await db.$transaction(async (tx) => {
+      // Audit log
+      await tx.auditLog.create({
+        data: {
+          action: 'DELETE',
+          entityType: 'INVENTORY_ITEM',
+          entityId: id,
+          details: JSON.stringify({
+            itemName: existing.name,
+            sku: existing.sku,
+            stock: existing.stock,
+            avgCost: existing.avgCost,
+            baseUnit: existing.baseUnit,
+            reason: 'NO_HISTORY',
+          }),
+          outletId,
+          userId,
+        },
+      })
+
+      await tx.inventoryItem.delete({ where: { id } })
+    }, { timeout: 10000 })
+
+    return safeJson({ success: true })
+  } catch (error) {
+    console.error('Inventory item DELETE error:', error)
+    const msg = error instanceof Error ? error.message : 'Failed to delete inventory item'
+    return safeJsonError(msg, 500)
+  }
+}

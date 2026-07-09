@@ -8,6 +8,7 @@ import { runInsightEngine } from '@/lib/insight-engine'
 import { getPlanFeatures, isUnlimited } from '@/lib/config/plan-config'
 import { safeJson, safeJsonError } from '@/lib/api/safe-response'
 import { ensureMigrated } from '@/lib/db-migrate'
+import { InventoryConsumptionService } from '@/lib/inventory-consumption-service'
 
 interface CheckoutItem {
   productId: string
@@ -106,7 +107,7 @@ export async function POST(request: NextRequest) {
           ? tx.productVariant.findMany({
               where: { id: { in: variantIds }, outletId },
             })
-          : ([] as Array<{ id: string; productId: string; stock: number; hpp: number }>),
+          : ([] as Array<{ id: string; productId: string; name: string; stock: number; hpp: number; sku: string | null }>),
       ])
 
       const productMap = new Map<string, typeof products[number]>()
@@ -114,7 +115,7 @@ export async function POST(request: NextRequest) {
       const variantMap = new Map<string, typeof variants[number]>()
       for (const v of variants) variantMap.set(v.id, v)
 
-      // 2. Validate all items
+      // 2. Validate item existence (stock validated atomically at decrement time)
       for (const item of checkoutItems) {
         const product = productMap.get(item.productId)
         if (!product) {
@@ -122,25 +123,12 @@ export async function POST(request: NextRequest) {
         }
 
         if (item.variantId) {
-          // Validate variant exists and belongs to the correct product
           const variant = variantMap.get(item.variantId)
           if (!variant) {
             throw new Error(`Variant ${item.variantName || item.variantId} not found`)
           }
           if (variant.productId !== item.productId) {
             throw new Error(`Variant ${item.variantName || item.variantId} does not belong to product ${item.productName}`)
-          }
-          if (variant.stock < item.qty) {
-            throw new Error(
-              `Insufficient stock for ${item.productName} - ${item.variantName}. Available: ${variant.stock}, Requested: ${item.qty}`
-            )
-          }
-        } else {
-          // No variant — check parent product stock
-          if (product.stock < item.qty) {
-            throw new Error(
-              `Insufficient stock for ${product.name}. Available: ${product.stock}, Requested: ${item.qty}`
-            )
           }
         }
       }
@@ -182,15 +170,35 @@ export async function POST(request: NextRequest) {
       })
 
       // 6. Batch create TransactionItems
+      //    productName & variantName: server-verified from DB (not trusted from client)
+      //    productSku & variantSku: snapshotted from DB at sale time
+      //    hpp: snapshotted from DB at sale time
+      //    price: kept from client (effective selling price at checkout, may include custom price)
       const itemData = checkoutItems.map((item) => {
         const product = productMap.get(item.productId)!
         const variant = item.variantId ? variantMap.get(item.variantId) : null
 
+        // Server-side name verification — log if client name differs from DB
+        const verifiedProductName = product.name
+        const verifiedVariantName = variant?.name || item.variantName || null
+        if (item.productName && item.productName !== product.name) {
+          console.warn(
+            `[checkout] productName mismatch: client="${item.productName}" db="${product.name}" productId=${product.id} invoice=${invoiceNumber}`
+          )
+        }
+        if (item.variantName && variant && item.variantName !== variant.name) {
+          console.warn(
+            `[checkout] variantName mismatch: client="${item.variantName}" db="${variant.name}" variantId=${variant.id} invoice=${invoiceNumber}`
+          )
+        }
+
         return {
           productId: item.productId,
-          productName: item.productName,
+          productName: verifiedProductName,
+          productSku: product.sku || null,
           variantId: item.variantId || null,
-          variantName: item.variantName || null,
+          variantName: verifiedVariantName,
+          variantSku: variant?.sku || null,
           price: item.price,
           qty: item.qty,
           subtotal: item.price * item.qty,
@@ -202,25 +210,102 @@ export async function POST(request: NextRequest) {
 
       await tx.transactionItem.createMany({ data: itemData })
 
-      // 7. Batch update stock (variant stock or parent product stock)
+      // 7. ATOMIC stock deduction — race-condition-free
+      //    Uses raw SQL: UPDATE ... SET stock = stock - qty WHERE stock >= qty
+      //    This is atomic in SQLite: the WHERE check and decrement happen together.
+      //    If affected rows = 0, another transaction consumed the last stock.
       for (const item of checkoutItems) {
+        const product = productMap.get(item.productId)!
         if (item.variantId) {
-          await tx.productVariant.update({
-            where: { id: item.variantId },
-            data: { stock: { decrement: item.qty } },
-          })
+          const affected = await tx.$executeRaw`
+            UPDATE "ProductVariant" SET stock = stock - ${item.qty}
+            WHERE id = ${item.variantId} AND stock >= ${item.qty} AND "outletId" = ${outletId}
+          `
+          if (affected === 0) {
+            throw new Error(
+              `Stok tidak cukup untuk ${product.name} - ${item.variantId}. Kemungkinan stok terakhir sudah diambil transaksi lain. Coba lagi.`
+            )
+          }
         } else {
-          await tx.product.update({
-            where: { id: item.productId },
-            data: { stock: { decrement: item.qty } },
-          })
+          const affected = await tx.$executeRaw`
+            UPDATE "Product" SET stock = stock - ${item.qty}
+            WHERE id = ${item.productId} AND stock >= ${item.qty} AND "outletId" = ${outletId}
+          `
+          if (affected === 0) {
+            throw new Error(
+              `Stok tidak cukup untuk ${product.name}. Kemungkinan stok terakhir sudah diambil transaksi lain. Coba lagi.`
+            )
+          }
         }
+      }
+
+      // 7b. Recalculate parent product stock for variant products (atomic)
+      const variantProductIds = new Set<string>()
+      for (const item of checkoutItems) {
+        if (item.variantId) variantProductIds.add(item.productId)
+      }
+      for (const productId of variantProductIds) {
+        await tx.$executeRaw`
+          UPDATE "Product" SET stock = (
+            SELECT COALESCE(SUM(stock), 0) FROM "ProductVariant"
+            WHERE "productId" = ${productId} AND "outletId" = ${outletId}
+          )
+          WHERE id = ${productId}
+        `
+      }
+
+      // 7c. Re-read updated stock for audit logs (post-atomic decrement)
+      const [updatedProducts, updatedVariants] = await Promise.all([
+        tx.product.findMany({
+          where: { id: { in: productIds }, outletId },
+          select: { id: true, stock: true },
+        }),
+        variantIds.length > 0
+          ? tx.productVariant.findMany({
+              where: { id: { in: variantIds }, outletId },
+              select: { id: true, stock: true },
+            })
+          : Promise.resolve([] as Array<{ id: string; stock: number }>),
+      ])
+      const updatedProductMap = new Map<string, number>(updatedProducts.map(p => [p.id, p.stock] as const))
+      const updatedVariantMap = new Map<string, number>(updatedVariants.map(v => [v.id, v.stock] as const))
+
+      // 7c. Deduct inventory via InventoryConsumptionService (atomic, yield-aware, validated)
+      //     Jika stok bahan tidak cukup → error → seluruh transaksi di-rollback
+      const consumptionResult = await InventoryConsumptionService.consumeForTransaction(tx, {
+        items: checkoutItems.map(item => ({
+          productId: item.productId,
+          variantId: item.variantId || null,
+          productName: item.productName,
+          variantName: item.variantName || null,
+          qty: item.qty,
+        })),
+        transactionId: transaction.id,
+        invoiceNumber,
+        outletId,
+        userId,
+      })
+
+      // 7d. Snapshot consumption data for accurate void reversal later
+      //     This ensures void restores exactly what was consumed, even if
+      //     the product recipe/composition changes months after the sale.
+      if (consumptionResult.deductions.length > 0) {
+        const snapshots = InventoryConsumptionService.buildConsumptionSnapshots(
+          consumptionResult.deductions,
+          transaction.id,
+        )
+        await tx.transactionConsumption.createMany({ data: snapshots })
       }
 
       // 8. Batch create audit logs
       const auditData = checkoutItems.map((item) => {
         const product = productMap.get(item.productId)!
         const variant = item.variantId ? variantMap.get(item.variantId) : null
+
+        const newStock = item.variantId
+          ? updatedVariantMap.get(item.variantId) ?? 0
+          : updatedProductMap.get(item.productId) ?? 0
+        const previousStock = newStock + item.qty // derive previous from new + qty (accurate because atomic)
 
         if (variant) {
           return {
@@ -234,8 +319,10 @@ export async function POST(request: NextRequest) {
               variantName: item.variantName,
               variantSku: variant?.sku || null,
               quantitySold: item.qty,
-              previousStock: variant.stock,
-              newStock: variant.stock - item.qty,
+              price: item.price,
+              subtotal: item.price * item.qty,
+              previousStock,
+              newStock,
             }),
             outletId,
             userId,
@@ -251,8 +338,10 @@ export async function POST(request: NextRequest) {
             productName: item.productName,
             productSku: product.sku || null,
             quantitySold: item.qty,
-            previousStock: product.stock,
-            newStock: product.stock - item.qty,
+            price: item.price,
+            subtotal: item.price * item.qty,
+            previousStock,
+            newStock,
           }),
           outletId,
           userId,
@@ -502,6 +591,16 @@ async function triggerInsightAfterCheckout(outletId: string): Promise<void> {
       todayBrutto: todayTxns.reduce((s, t) => s + t.subtotal, 0),
       todayDiscount: todayTxns.reduce((s, t) => s + t.discount, 0),
       todayTax: 0,
+      // New inventory/transfer/purchase fields (defaults for POS context)
+      lowInventoryCount: 0,
+      outOfInventoryCount: 0,
+      inventoryAlerts: [],
+      totalInventoryValue: 0,
+      pendingTransfers: 0,
+      pendingTransferItems: 0,
+      pendingPurchases: 0,
+      pendingPurchaseValue: 0,
+      topVariantSelling: [],
     })
 
     // Filter out non-actionable insights

@@ -91,6 +91,7 @@ import {
   FilePenLine,
   ScanBarcode,
   Printer,
+  Beaker,
 } from 'lucide-react'
 // Collapsible removed — analytics section removed in redesign
 import { ProGate } from '@/components/shared/pro-gate'
@@ -123,6 +124,7 @@ interface Product {
   category?: { id: string; name: string; color: string } | null
   unit: string
   hasVariants?: boolean
+  hasComposition?: boolean
   _variantCount?: number
   _maxPrice?: number
   variants?: Array<{
@@ -179,7 +181,7 @@ interface MovementResponse {
   totalLogs: number
 }
 
-type MovementFilterTab = 'all' | 'restock' | 'sale' | 'adjustment'
+type MovementFilterTab = 'all' | 'restock' | 'sale' | 'void' | 'adjustment' | 'transfer'
 
 const SORT_OPTIONS: { value: SortOption; label: string }[] = [
   { value: 'newest', label: 'Terbaru' },
@@ -247,7 +249,14 @@ function getStockDiff(details: Record<string, unknown>): { from: number; to: num
   return null
 }
 
+// Detect if a RESTOCK log is from a void transaction
+function isVoidRestock(details?: Record<string, unknown>): boolean {
+  return !!(details?.reason && typeof details.reason === 'string' && details.reason.includes('Void'))
+}
+
 function getActionBadge(action: string, details?: Record<string, unknown>) {
+  // Transfer detection
+  const isTransfer = action === 'ADJUSTMENT' && (details?.action === 'TRANSFER_SENT' || details?.action === 'TRANSFER_IN')
   // Show restock badge for stock-related bulk updates
   if (action === 'BULK_UPDATE' && hasStockChange(details)) {
     return <Badge className="theme-bg-very-light theme-border-light theme-text text-[10px]">Restock</Badge>
@@ -256,15 +265,21 @@ function getActionBadge(action: string, details?: Record<string, unknown>) {
     case 'CREATE':
       return <Badge className="bg-blue-500/10 border-blue-500/20 text-blue-400 text-[10px]">Create</Badge>
     case 'RESTOCK':
+      if (isVoidRestock(details)) {
+        return <Badge className="bg-red-500/10 border-red-500/20 text-red-400 text-[10px]">Void Restore</Badge>
+      }
       return <Badge className="theme-bg-very-light theme-border-light theme-text text-[10px]">Restock</Badge>
     case 'SALE':
-      return <Badge className="bg-amber-500/10 border-amber-500/20 text-amber-400 text-[10px]">Sale</Badge>
+      return <Badge className="bg-amber-500/10 border-amber-500/20 text-amber-400 text-[10px]">Penjualan</Badge>
     case 'UPDATE':
       return <Badge className="bg-violet-500/10 border-violet-500/20 text-violet-400 text-[10px]">Update</Badge>
     case 'DELETE':
-      return <Badge className="bg-red-500/10 border-red-500/20 text-red-400 text-[10px]">Delete</Badge>
+      return <Badge className="bg-red-500/10 border-red-500/20 text-red-400 text-[10px]">Hapus</Badge>
     case 'ADJUSTMENT':
-      return <Badge className="bg-orange-500/10 border-orange-500/20 text-orange-400 text-[10px]">Adjustment</Badge>
+      if (isTransfer) {
+        return <Badge className="bg-sky-500/10 border-sky-500/20 text-sky-400 text-[10px]">Transfer</Badge>
+      }
+      return <Badge className="bg-orange-500/10 border-orange-500/20 text-orange-400 text-[10px]">Penyesuaian</Badge>
     case 'BULK_UPDATE':
       return <Badge className="bg-cyan-500/10 border-cyan-500/20 text-cyan-400 text-[10px]">Bulk Update</Badge>
     default:
@@ -283,60 +298,118 @@ function getActionDescription(action: string, details: Record<string, unknown>):
       if (details.action === 'TRANSFER_IN_NEW') {
         return `Produk baru dari transfer ${details.transferNumber || ''} — Stok awal: ${formatNumber(Number(details.initialStock) || 0)}`
       }
-      return `Product created — Price: ${formatCurrency(Number(details.price) || 0)}, Stock: ${formatNumber(Number(details.stock) || 0)}`
+      return `Produk dibuat — Harga: ${formatCurrency(Number(details.price) || 0)}, Stok awal: ${formatNumber(Number(details.stock) || 0)}`
     }
     case 'RESTOCK': {
-      if (details.action === 'TRANSFER_IN') {
-        return `+${formatNumber(Number(details.quantityAdded) || 0)} dari transfer ${details.transferNumber || ''} (${details.fromOutlet || 'outlet lain'}) — Stok: ${formatNumber(Number(details.previousStock) || 0)} → ${formatNumber(Number(details.newStock) || 0)}`
+      // Void restore — show invoice, reason, and who voided
+      if (isVoidRestock(details)) {
+        const reason = (details.reason as string) || ''
+        const invoiceMatch = reason.match(/(INV-[\w-]+)/)
+        const invoiceLabel = invoiceMatch ? invoiceMatch[1] : ''
+        const qty = Number(details.quantityAdded) || 0
+        const prev = Number(details.previousStock)
+        const next = Number(details.newStock)
+        const hasStock = !isNaN(prev) && !isNaN(next)
+
+        const parts: string[] = []
+        if (invoiceLabel) parts.push(`Void ${invoiceLabel}`)
+        else parts.push('Void transaksi')
+        parts.push(`Stok dikembalikan +${formatNumber(qty)} unit`)
+        if (hasStock) parts.push(`Stok: ${formatNumber(prev)} → ${formatNumber(next)}`)
+        if (details.productName) parts.push(`(${details.productName as string})`)
+
+        return parts.join(' — ') + variantLabel
       }
-      return `+${formatNumber(Number(details.quantityAdded) || 0)} units${variantLabel} (Stock: ${formatNumber(Number(details.previousStock) || 0)} → ${formatNumber(Number(details.newStock) || 0)})`
+      if (details.action === 'TRANSFER_IN') {
+        const totalVal = Number(details.totalValue)
+        const valueInfo = totalVal > 0 ? ` — Nilai: ${formatCurrency(totalVal)}` : ''
+        return `+${formatNumber(Number(details.quantityAdded) || 0)} dari transfer ${details.transferNumber || ''} (${details.fromOutlet || 'outlet lain'}) — Stok: ${formatNumber(Number(details.previousStock) || 0)} → ${formatNumber(Number(details.newStock) || 0)}${valueInfo}`
+      }
+      const totalVal = Number(details.totalValue)
+      const valueInfo = totalVal > 0 ? ` — Nilai: ${formatCurrency(totalVal)}` : ''
+      return `Restock +${formatNumber(Number(details.quantityAdded) || 0)} unit${variantLabel} (Stok: ${formatNumber(Number(details.previousStock) || 0)} → ${formatNumber(Number(details.newStock) || 0)})${valueInfo}`
     }
-    case 'SALE':
-      return `Sold ${formatNumber(Number(details.quantitySold) || Number(details.qty) || 0)} units${variantLabel} — ${formatCurrency(Number(details.subtotal) || 0)}`
+    case 'SALE': {
+      const qty = Number(details.quantitySold) || Number(details.qty) || 0
+      const sub = Number(details.subtotal) || 0
+      const price = Number(details.price) || 0
+      const invoice = (details.invoiceNumber as string) || ''
+      const prev = Number(details.previousStock)
+      const next = Number(details.newStock)
+      const hasStock = !isNaN(prev) && !isNaN(next)
+
+      const parts: string[] = []
+      if (invoice) parts.push(invoice)
+      parts.push(`Terjual ${formatNumber(qty)} unit`)
+      if (price > 0) parts.push(`@ ${formatCurrency(price)}`)
+      if (sub > 0) parts.push(`Total ${formatCurrency(sub)}`)
+      if (hasStock) parts.push(`Stok: ${formatNumber(prev)} → ${formatNumber(next)}`)
+
+      return parts.join(' — ') + variantLabel
+    }
     case 'UPDATE':
       if (details.variantCount !== undefined) {
-        return `Product updated — ${Number(details.variantCount)} variant(s)`
+        return `Produk diperbarui — ${Number(details.variantCount)} varian`
       }
       if (details.changes && typeof details.changes === 'object') {
         const changes = details.changes as Record<string, { from: unknown; to: unknown }>
         const parts: string[] = []
         if (changes.stock) {
           const diff = Number(changes.stock.to) - Number(changes.stock.from)
-          parts.push(`Stock: ${formatNumber(Number(changes.stock.from))} → ${formatNumber(Number(changes.stock.to))} (${diff >= 0 ? '+' : ''}${formatNumber(diff)})`)
+          parts.push(`Stok: ${formatNumber(Number(changes.stock.from))} → ${formatNumber(Number(changes.stock.to))} (${diff >= 0 ? '+' : ''}${formatNumber(diff)})`)
         }
-        if (changes.price) parts.push(`Price: ${formatCurrency(Number(changes.price.from))} → ${formatCurrency(Number(changes.price.to))}`)
+        if (changes.price) parts.push(`Harga: ${formatCurrency(Number(changes.price.from))} → ${formatCurrency(Number(changes.price.to))}`)
         if (parts.length > 0) return parts.join(', ')
       }
       if (variantName) {
-        return `Variant "${variantName}" updated`
+        return `Varian "${variantName}" diperbarui`
       }
-      return 'Product details updated'
+      return 'Detail produk diperbarui'
     case 'DELETE':
-      return 'Product deleted'
+      return 'Produk dihapus'
     case 'ADJUSTMENT': {
+      if (details.action === 'TRANSFER_SENT') {
+        const qty = Number(details.quantity) || 0
+        const prev = Number(details.previousStock)
+        const next = Number(details.newStock)
+        const totalVal = Number(details.totalValue)
+        const stockInfo = !isNaN(prev) && !isNaN(next) ? ` (${formatNumber(prev)} → ${formatNumber(next)})` : ''
+        const valueInfo = totalVal > 0 ? ` — ${formatCurrency(totalVal)}` : ''
+        return `Transfer keluar ${formatNumber(qty)} unit${variantLabel} ke ${details.toOutlet || 'outlet lain'} — TRF ${details.transferNumber || ''}${stockInfo}${valueInfo}`
+      }
+      if (details.action === 'TRANSFER_IN') {
+        const added = Number(details.quantityAdded) || 0
+        const totalVal = Number(details.totalValue)
+        const valueInfo = totalVal > 0 ? ` — ${formatCurrency(totalVal)}` : ''
+        return `+${formatNumber(added)} unit${variantLabel} dari transfer ${details.transferNumber || ''} (${details.fromOutlet || 'outlet lain'})${valueInfo}`
+      }
       const prev = Number(details.previousStock)
       const next = Number(details.newStock)
       const diff = next - prev
       if (!isNaN(prev) && !isNaN(next)) {
         return `Penyesuaian stok: ${formatNumber(prev)} → ${formatNumber(next)} (${diff >= 0 ? '+' : ''}${formatNumber(diff)})${details.reason ? ` — ${details.reason}` : ''}`
       }
-      return `Stock adjusted${variantLabel} — ${details.reason || 'No reason'}`
+      return `Penyesuaian stok${variantLabel}${details.reason ? ` — ${details.reason}` : ' — Tanpa alasan'}`
     }
     case 'BULK_UPDATE': {
+      const bulkVariantName = details.variantName as string | undefined
+      const bulkVariantLabel = bulkVariantName ? ` [${bulkVariantName}]` : ''
       const stockDiff = getStockDiff(details)
       if (stockDiff) {
         const diff = stockDiff.to - stockDiff.from
-        return `Bulk stock: ${formatNumber(stockDiff.from)} → ${formatNumber(stockDiff.to)} (${diff >= 0 ? '+' : ''}${formatNumber(diff)})${parentLabel}`
+        const hpp = Number(details.hpp)
+        const hppInfo = hpp > 0 ? ` — Nilai: ${formatCurrency(diff * hpp)}` : ''
+        return `Bulk stok: ${formatNumber(stockDiff.from)} → ${formatNumber(stockDiff.to)} (${diff >= 0 ? '+' : ''}${formatNumber(diff)})${hppInfo}${bulkVariantLabel}${parentLabel}`
       }
       // Check for price changes (top-level or under changes)
       const priceObj = (details.price || (details.changes as Record<string, unknown>)?.price) as { from: number; to: number } | undefined
       if (priceObj && typeof priceObj === 'object') {
-        return `Bulk price: ${formatCurrency(priceObj.from)} → ${formatCurrency(priceObj.to)}${parentLabel}`
+        return `Bulk harga: ${formatCurrency(priceObj.from)} → ${formatCurrency(priceObj.to)}${bulkVariantLabel}${parentLabel}`
       }
-      return 'Bulk update applied'
+      return 'Bulk update diterapkan'
     }
     default:
-      return 'Action performed'
+      return 'Aksi dilakukan'
   }
 }
 
@@ -345,12 +418,19 @@ function getActionRowBg(action: string, details?: Record<string, unknown>): stri
   if (action === 'BULK_UPDATE' && hasStockChange(details)) {
     return 'theme-bg-ultra-light rounded'
   }
+  // Void restores get red-tinted background
+  if (action === 'RESTOCK' && isVoidRestock(details)) {
+    return 'bg-red-500/5 rounded'
+  }
   switch (action) {
     case 'RESTOCK':
       return 'theme-bg-ultra-light rounded'
     case 'SALE':
       return 'bg-amber-500/5 rounded'
     case 'ADJUSTMENT':
+      if (details?.action === 'TRANSFER_SENT' || details?.action === 'TRANSFER_IN') {
+        return 'bg-sky-500/5 rounded'
+      }
       return 'bg-orange-500/5 rounded'
     default:
       return ''
@@ -385,6 +465,7 @@ export default function ProductsPage() {
   const [adjustNewStock, setAdjustNewStock] = useState('')
   const [adjustReason, setAdjustReason] = useState('')
   const [adjusting, setAdjusting] = useState(false)
+  const [adjustVariantStocks, setAdjustVariantStocks] = useState<Record<string, string>>({})
 
   // Detail sheet state
   const [detailOpen, setDetailOpen] = useState(false)
@@ -419,6 +500,12 @@ export default function ProductsPage() {
 
   // Select all mode (cross-page selection)
   const [selectAllMode, setSelectAllMode] = useState(false)
+
+  // Count variant products in current selection (for bulk edit info)
+  const selectedVariantCount = useMemo(() => {
+    if (selectAllMode) return products.filter(p => p.hasVariants).length
+    return products.filter(p => selectedIds.has(p.id) && p.hasVariants).length
+  }, [products, selectedIds, selectAllMode])
 
   // Bulk upload Excel state
   const [uploadOpen, setUploadOpen] = useState(false)
@@ -536,6 +623,20 @@ export default function ProductsPage() {
       if (res.ok) {
         const data: MovementResponse = await res.json()
         setDetailData(data)
+        // Keep detailProduct in sync with fresh data from API
+        if (data.product) {
+          setDetailProduct(prev => prev ? {
+            ...prev,
+            name: data.product.name,
+            sku: data.product.sku || prev.sku,
+            stock: data.product.stock,
+            price: data.product.price,
+            hpp: data.product.hpp,
+            lowStockAlert: data.product.lowStockAlert,
+            image: data.product.image || prev.image,
+            hasVariants: data.product.hasVariants,
+          } : prev)
+        }
       } else {
         toast.error('Failed to load product details')
       }
@@ -612,17 +713,18 @@ export default function ProductsPage() {
           if (detailOpen && detailProduct?.id === restockProduct.id) {
             fetchDetail(restockProduct, detailPage)
           }
+          setRestockOpen(false)
+          setRestockQty('')
+          setRestockProduct(null)
+          setVariantRestocks([])
         } else {
-          toast.error('Failed to restock')
+          const data = await res.json().catch(() => ({}))
+          toast.error(data.error || 'Gagal restock')
         }
       } catch {
-        toast.error('Failed to restock')
+        toast.error('Gagal restock')
       } finally {
         setRestocking(false)
-        setRestockOpen(false)
-        setRestockQty('')
-        setRestockProduct(null)
-        setVariantRestocks([])
       }
     } else {
       if (!restockQty || Number(restockQty) <= 0) return
@@ -639,55 +741,95 @@ export default function ProductsPage() {
           if (detailOpen && detailProduct?.id === restockProduct.id) {
             fetchDetail({ ...restockProduct, stock: restockProduct.stock + Number(restockQty) }, detailPage)
           }
+          setRestockOpen(false)
+          setRestockQty('')
+          setRestockProduct(null)
         } else {
-          toast.error('Failed to restock')
+          const data = await res.json().catch(() => ({}))
+          toast.error(data.error || 'Gagal restock')
         }
       } catch {
-        toast.error('Failed to restock')
+        toast.error('Gagal restock')
       } finally {
         setRestocking(false)
-        setRestockOpen(false)
-        setRestockQty('')
-        setRestockProduct(null)
       }
     }
   }
 
   const handleAdjust = async () => {
-    if (!adjustProduct || adjustNewStock === '' || Number(adjustNewStock) < 0) return
+    if (!adjustProduct) return
+
     if (adjustProduct.hasVariants) {
-      toast.error('Produk dengan varian tidak bisa di-penyesuaian langsung. Gunakan edit produk.')
-      setAdjustOpen(false)
-      return
-    }
-    const newStock = Number(adjustNewStock)
-    const oldStock = adjustProduct.stock
-    setAdjusting(true)
-    try {
-      const res = await fetch(`/api/products/${adjustProduct.id}/adjust`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ newStock, reason: adjustReason || undefined }),
-      })
-      if (res.ok) {
-        const diff = newStock - oldStock
-        const diffStr = diff >= 0 ? `+${diff}` : `${diff}`
-        toast.success(`Stok disesuaikan: ${oldStock} → ${newStock} (${diffStr})`)
-        fetchProducts()
-        if (detailOpen && detailProduct?.id === adjustProduct.id) {
-          fetchDetail({ ...adjustProduct, stock: newStock }, detailPage)
-        }
-      } else {
-        toast.error('Gagal menyesuaikan stok')
+      // Variant adjustment flow
+      const variants = Object.entries(adjustVariantStocks)
+        .filter(([, val]) => val !== '' && Number(val) >= 0)
+        .map(([id, newStock]) => ({ id, newStock: Number(newStock) }))
+
+      if (variants.length === 0) {
+        toast.error('Masukkan stok baru untuk minimal satu varian')
+        return
       }
-    } catch {
-      toast.error('Gagal menyesuaikan stok')
-    } finally {
-      setAdjusting(false)
-      setAdjustOpen(false)
-      setAdjustNewStock('')
-      setAdjustReason('')
-      setAdjustProduct(null)
+
+      setAdjusting(true)
+      try {
+        const res = await fetch(`/api/products/${adjustProduct.id}/adjust`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ variants, reason: adjustReason || undefined }),
+        })
+        if (res.ok) {
+          toast.success(`Stok varian disesuaikan`)
+          fetchProducts()
+          if (detailOpen && detailProduct?.id === adjustProduct.id) {
+            fetchDetail(detailProduct, detailPage)
+          }
+        } else {
+          const data = await res.json().catch(() => ({}))
+          toast.error(data.error || 'Gagal menyesuaikan stok varian')
+        }
+      } catch {
+        toast.error('Gagal menyesuaikan stok varian')
+      } finally {
+        setAdjusting(false)
+        setAdjustOpen(false)
+        setAdjustNewStock('')
+        setAdjustReason('')
+        setAdjustVariantStocks({})
+        setAdjustProduct(null)
+      }
+    } else {
+      // Non-variant flow
+      if (adjustNewStock === '' || Number(adjustNewStock) < 0) return
+      const newStock = Number(adjustNewStock)
+      const oldStock = adjustProduct.stock
+      setAdjusting(true)
+      try {
+        const res = await fetch(`/api/products/${adjustProduct.id}/adjust`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ newStock, reason: adjustReason || undefined }),
+        })
+        if (res.ok) {
+          const diff = newStock - oldStock
+          const diffStr = diff >= 0 ? `+${diff}` : `${diff}`
+          toast.success(`Stok disesuaikan: ${oldStock} → ${newStock} (${diffStr})`)
+          fetchProducts()
+          if (detailOpen && detailProduct?.id === adjustProduct.id) {
+            fetchDetail({ ...adjustProduct, stock: newStock }, detailPage)
+          }
+        } else {
+          toast.error('Gagal menyesuaikan stok')
+        }
+      } catch {
+        toast.error('Gagal menyesuaikan stok')
+      } finally {
+        setAdjusting(false)
+        setAdjustOpen(false)
+        setAdjustNewStock('')
+        setAdjustReason('')
+        setAdjustVariantStocks({})
+        setAdjustProduct(null)
+      }
     }
   }
 
@@ -1092,12 +1234,25 @@ export default function ProductsPage() {
     return detailData.movements.filter((m) => {
       if (movementFilter === 'all') return true
       if (movementFilter === 'restock') {
-        if (m.action === 'RESTOCK') return true
+        if (m.action === 'RESTOCK' && !isVoidRestock(m.details)) return true
         if (m.action === 'BULK_UPDATE' && hasStockChange(m.details)) return true
         return false
       }
       if (movementFilter === 'sale') return m.action === 'SALE'
-      if (movementFilter === 'adjustment') return m.action === 'ADJUSTMENT'
+      if (movementFilter === 'void') {
+        // Show void RESTOCK logs
+        if (m.action === 'RESTOCK' && isVoidRestock(m.details)) return true
+        return false
+      }
+      if (movementFilter === 'adjustment') {
+        // Show only manual adjustments, not transfer-related
+        if (m.action !== 'ADJUSTMENT') return false
+        if (m.details?.action === 'TRANSFER_SENT' || m.details?.action === 'TRANSFER_IN') return false
+        return true
+      }
+      if (movementFilter === 'transfer') {
+        return m.action === 'ADJUSTMENT' && (m.details?.action === 'TRANSFER_SENT' || m.details?.action === 'TRANSFER_IN')
+      }
       return true
     })
   }, [detailData, movementFilter])
@@ -1497,6 +1652,12 @@ export default function ProductsPage() {
                                   {product._variantCount} varian
                                 </Badge>
                               )}
+                              {product.hasComposition && (
+                                <Badge className="bg-sky-500/10 border-sky-500/20 text-sky-400 text-[10px] px-1.5 py-0 ml-1.5 inline-flex items-center gap-0.5">
+                                  <Beaker className="h-2.5 w-2.5" />
+                                  Komposisi
+                                </Badge>
+                              )}
                             </span>
                           </div>
                         </div>
@@ -1719,6 +1880,12 @@ export default function ProductsPage() {
                               {product._variantCount} varian
                             </Badge>
                           )}
+                          {product.hasComposition && (
+                            <Badge className="bg-sky-500/10 border-sky-500/20 text-sky-400 text-[10px] px-1.5 py-0 ml-1.5 inline-flex items-center gap-0.5">
+                              <Beaker className="h-2.5 w-2.5" />
+                              Komposisi
+                            </Badge>
+                          )}
                         </span>
                         {isPro && (
                           <div className="flex-shrink-0">
@@ -1921,7 +2088,14 @@ export default function ProductsPage() {
         open={formOpen}
         onOpenChange={setFormOpen}
         product={editProduct}
-        onSaved={() => { fetchProducts(); fetchCategories() }}
+        onSaved={() => {
+          fetchProducts()
+          fetchCategories()
+          // Refresh detail sheet if open for the same product
+          if (detailOpen && detailProduct) {
+            fetchDetail(detailProduct, detailPage)
+          }
+        }}
       />
 
       {/* Category Create/Edit Dialog */}
@@ -2136,32 +2310,72 @@ export default function ProductsPage() {
             </ResponsiveDialogTitle>
           </ResponsiveDialogHeader>
           <div className="space-y-3 py-1">
-            <div className="text-xs text-slate-400">
-              Stok saat ini: <span className="text-slate-200 font-medium">{adjustProduct?.stock}</span>
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-slate-300 text-xs">Stok baru</Label>
-              <Input
-                type="number"
-                min="0"
-                placeholder="Masukkan stok baru"
-                value={adjustNewStock}
-                onChange={(e) => setAdjustNewStock(e.target.value)}
-                className="h-8 text-xs bg-white/[0.04] border-white/[0.04] text-white placeholder:text-slate-500"
-              />
-              {adjustNewStock !== '' && adjustProduct && (
-                <div className="text-[11px] text-slate-500">
-                  {(() => {
-                    const diff = Number(adjustNewStock) - adjustProduct.stock
-                    return diff > 0
-                      ? <span className="theme-text">+{diff} (bertambah)</span>
-                      : diff < 0
-                      ? <span className="text-red-400">{diff} (berkurang)</span>
-                      : <span className="text-slate-500">Tidak berubah</span>
-                  })()}
+            {adjustProduct?.hasVariants ? (
+              <>
+                <div className="text-xs text-slate-400">
+                  Sesuaikan stok per varian. Stok parent akan dihitung otomatis.
                 </div>
-              )}
-            </div>
+                <div className="space-y-2">
+                  {detailData?.product.variants.map((v) => (
+                    <div key={v.id} className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <Label className="text-slate-300 text-xs">{v.name}</Label>
+                        <span className="text-[11px] text-slate-500">Saat ini: {v.stock}</span>
+                      </div>
+                      <Input
+                        type="number"
+                        min="0"
+                        placeholder={`Stok baru untuk ${v.name}`}
+                        value={adjustVariantStocks[v.id] || ''}
+                        onChange={(e) => setAdjustVariantStocks((prev) => ({ ...prev, [v.id]: e.target.value }))}
+                        className="h-8 text-xs bg-white/[0.04] border-white/[0.04] text-white placeholder:text-slate-500"
+                      />
+                      {adjustVariantStocks[v.id] && (
+                        <div className="text-[11px] text-slate-500">
+                          {(() => {
+                            const diff = Number(adjustVariantStocks[v.id]) - v.stock
+                            return diff > 0
+                              ? <span className="theme-text">+{diff} (bertambah)</span>
+                              : diff < 0
+                              ? <span className="text-red-400">{diff} (berkurang)</span>
+                              : <span>Tidak berubah</span>
+                          })()}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="text-xs text-slate-400">
+                  Stok saat ini: <span className="text-slate-200 font-medium">{adjustProduct?.stock}</span>
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-slate-300 text-xs">Stok baru</Label>
+                  <Input
+                    type="number"
+                    min="0"
+                    placeholder="Masukkan stok baru"
+                    value={adjustNewStock}
+                    onChange={(e) => setAdjustNewStock(e.target.value)}
+                    className="h-8 text-xs bg-white/[0.04] border-white/[0.04] text-white placeholder:text-slate-500"
+                  />
+                  {adjustNewStock !== '' && adjustProduct && (
+                    <div className="text-[11px] text-slate-500">
+                      {(() => {
+                        const diff = Number(adjustNewStock) - adjustProduct.stock
+                        return diff > 0
+                          ? <span className="theme-text">+{diff} (bertambah)</span>
+                          : diff < 0
+                          ? <span className="text-red-400">{diff} (berkurang)</span>
+                          : <span className="text-slate-500">Tidak berubah</span>
+                      })()}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
             <div className="space-y-1.5">
               <Label className="text-slate-300 text-xs">Alasan <span className="text-slate-600">(opsional)</span></Label>
               <Input
@@ -2182,7 +2396,9 @@ export default function ProductsPage() {
             </Button>
             <Button
               onClick={handleAdjust}
-              disabled={adjusting || adjustNewStock === '' || Number(adjustNewStock) < 0}
+              disabled={adjusting || (adjustProduct?.hasVariants
+                ? Object.values(adjustVariantStocks).every((v) => v === '' || Number(v) < 0)
+                : adjustNewStock === '' || Number(adjustNewStock) < 0)}
               className="bg-orange-500 hover:bg-orange-600 text-white h-8 text-xs"
             >
               {adjusting && <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />}
@@ -2295,6 +2511,12 @@ export default function ProductsPage() {
                 }}
                 className="h-8 text-xs bg-white/[0.04] border-white/[0.04] text-white placeholder:text-slate-500"
               />
+              {selectedVariantCount > 0 && (
+                <p className="text-[10px] text-sky-400/80 flex items-center gap-1">
+                  <Layers className="h-2.5 w-2.5" />
+                  {selectedVariantCount} produk variant — semua varian akan ikut diubah harganya
+                </p>
+              )}
             </div>
           </div>
           <ResponsiveDialogFooter>
@@ -2377,6 +2599,12 @@ export default function ProductsPage() {
                 onChange={(e) => setBulkStockValue(e.target.value)}
                 className="h-8 text-xs bg-white/[0.04] border-white/[0.04] text-white placeholder:text-slate-500"
               />
+              {selectedVariantCount > 0 && (
+                <p className="text-[10px] text-sky-400/80 flex items-center gap-1">
+                  <Layers className="h-2.5 w-2.5" />
+                  {selectedVariantCount} produk variant — stok semua varian akan ikut diubah, lalu stok parent dihitung ulang
+                </p>
+              )}
             </div>
           </div>
           <ResponsiveDialogFooter>
@@ -3074,7 +3302,7 @@ export default function ProductsPage() {
                             >
                               <RefreshCw className="h-2.5 w-2.5 mr-0.5" /> Restock
                             </Button>
-                            {!detailData.product.hasVariants && (
+                            {(
                               <Button
                                 size="sm"
                                 variant="ghost"
@@ -3083,6 +3311,14 @@ export default function ProductsPage() {
                                   setAdjustProduct(detailProduct!)
                                   setAdjustNewStock('')
                                   setAdjustReason('')
+                                  // Initialize variant stock inputs from current variant stocks
+                                  const vStocks: Record<string, string> = {}
+                                  if (detailData?.product.variants) {
+                                    for (const v of detailData.product.variants) {
+                                      vStocks[v.id] = String(v.stock)
+                                    }
+                                  }
+                                  setAdjustVariantStocks(vStocks)
                                   setAdjustOpen(true)
                                 }}
                               >
@@ -3124,8 +3360,8 @@ export default function ProductsPage() {
                         </div>
                       </div>
 
-                      {/* Barcode Card */}
-                      {detailData.product.barcode && (
+                      {/* Barcode Card — Non-variant product */}
+                      {!detailData.product.hasVariants && detailData.product.barcode && (
                         <div className="rounded-lg border border-white/[0.06] bg-nebula/50 p-3 space-y-2">
                           <h3 className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                             <ScanBarcode className="h-3.5 w-3.5 theme-text" />
@@ -3140,15 +3376,36 @@ export default function ProductsPage() {
                               margin={2}
                               showPrint
                               label={detailData.product.name}
-                              priceLabel={(() => {
-                                const p = detailData.product
-                                const price = p.price || 0
-                                const maxP = p._maxPrice || 0
-                                return maxP && maxP !== price
-                                  ? `${formatCurrency(price)} ~ ${formatCurrency(maxP)}`
-                                  : formatCurrency(price)
-                              })()}
+                              priceLabel={formatCurrency(detailData.product.price || 0)}
                             />
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Barcode Card — Variant product: show each variant barcode in its own card */}
+                      {detailData.product.hasVariants && detailData.product.variants && detailData.product.variants.some((v: any) => v.barcode) && (
+                        <div className="rounded-lg border border-white/[0.06] bg-nebula/50 p-3 space-y-3">
+                          <h3 className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                            <ScanBarcode className="h-3.5 w-3.5 theme-text" />
+                            Barcode Varian
+                          </h3>
+                          <div className="space-y-3">
+                            {detailData.product.variants.filter((v: any) => v.barcode).map((v: any) => (
+                              <div key={v.id} className="bg-white rounded-lg p-3 flex flex-col items-center gap-1">
+                                <p className="text-[10px] font-semibold text-zinc-700 text-center">{v.name}</p>
+                                <BarcodeDisplay
+                                  value={v.barcode}
+                                  width={2}
+                                  height={50}
+                                  displayValue={false}
+                                  margin={2}
+                                  showPrint
+                                  label={`${detailData.product.name} — ${v.name}`}
+                                  priceLabel={formatCurrency(v.price)}
+                                />
+                                <p className="text-[10px] font-mono text-zinc-500">{v.barcode}</p>
+                              </div>
+                            ))}
                           </div>
                         </div>
                       )}
@@ -3192,22 +3449,6 @@ export default function ProductsPage() {
                                       </span>
                                     </div>
                                   </div>
-                                  {v.barcode && (
-                                    <div className="mt-1.5 pt-1.5 border-t border-white/[0.03] flex flex-col items-center">
-                                      <div className="bg-white rounded p-1.5">
-                                        <BarcodeDisplay
-                                          value={v.barcode}
-                                          width={1.5}
-                                          height={35}
-                                          fontSize={9}
-                                          margin={1}
-                                          showPrint
-                                          label={`${detailData.product.name} - ${v.name}`}
-                                          priceLabel={formatCurrency(v.price)}
-                                        />
-                                      </div>
-                                    </div>
-                                  )}
                                 </div>
                               )
                             })}
@@ -3313,6 +3554,12 @@ export default function ProductsPage() {
                             </TabsTrigger>
                             <TabsTrigger value="sale" className="text-[11px] h-5 px-2.5 data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-400 text-slate-400">
                               Penjualan
+                            </TabsTrigger>
+                            <TabsTrigger value="void" className="text-[11px] h-5 px-2.5 data-[state=active]:bg-red-500/20 data-[state=active]:text-red-400 text-slate-400">
+                              Void
+                            </TabsTrigger>
+                            <TabsTrigger value="transfer" className="text-[11px] h-5 px-2.5 data-[state=active]:bg-sky-500/20 data-[state=active]:text-sky-400 text-slate-400">
+                              Transfer
                             </TabsTrigger>
                             <TabsTrigger value="adjustment" className="text-[11px] h-5 px-2.5 data-[state=active]:bg-orange-500/20 data-[state=active]:text-orange-400 text-slate-400">
                               Penyesuaian

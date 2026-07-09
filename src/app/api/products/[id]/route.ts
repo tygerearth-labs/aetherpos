@@ -4,6 +4,7 @@ import { getAuthUser, unauthorized } from '@/lib/api/get-auth'
 import { safeAuditLog } from '@/lib/safe-audit'
 import { safeJson, safeJsonError } from '@/lib/api/safe-response'
 import { generateUniqueSKU, generateVariantSKU } from '@/lib/sku-generator'
+import { validateCompositionStock } from '@/lib/comp-stock'
 
 interface VariantPayload {
   name: string
@@ -87,6 +88,14 @@ export async function PUT(
       })
       if (nameExists) {
         return safeJsonError('Product name already exists in this outlet', 400)
+      }
+    }
+
+    // Validate composition stock capacity when stock is being changed
+    if (stock !== undefined && !existing.hasVariants) {
+      const compError = await validateCompositionStock(id, outletId, stock)
+      if (compError) {
+        return safeJsonError(compError, 400)
       }
     }
 
@@ -260,6 +269,7 @@ export async function DELETE(
       where: { id, outletId },
       include: {
         variants: { select: { id: true, name: true } },
+        _count: { select: { compositions: true } },
       },
     })
     if (!existing) {
@@ -284,10 +294,15 @@ export async function DELETE(
       userId,
     })
 
-    // Delete product — variants auto-delete via onDelete: Cascade
-    await db.product.delete({
-      where: { id },
-    })
+    // Delete product — explicitly clean up compositions & variants to avoid orphan FK refs in SQLite
+    await db.$transaction(async (tx) => {
+      // 1. Explicitly delete all compositions referencing this product
+      if (existing._count.compositions > 0) {
+        await tx.productComposition.deleteMany({ where: { productId: id } })
+      }
+      // 2. Delete product (variants auto-delete via onDelete: Cascade)
+      await tx.product.delete({ where: { id } })
+    }, { timeout: 30000 })
 
     return safeJson({ success: true })
   } catch (error) {

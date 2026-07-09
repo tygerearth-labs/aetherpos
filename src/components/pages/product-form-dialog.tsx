@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useSession } from 'next-auth/react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -24,8 +24,10 @@ import {
   AlertCircle,
   Copy,
   X,
+  Beaker,
 } from 'lucide-react'
 import { formatCurrency, formatNumber } from '@/lib/format'
+import { cn } from '@/lib/utils'
 
 interface ProductVariant {
   id?: string
@@ -34,6 +36,7 @@ interface ProductVariant {
   hpp: string
   price: string
   stock: string
+  compositions?: CompositionItem[]
 }
 
 interface Product {
@@ -56,6 +59,14 @@ interface Category {
   name: string
   color: string
   _count?: { products: number }
+}
+
+interface CompositionItem {
+  inventoryItemId: string
+  inventoryItemName: string
+  qty: string
+  baseUnit: string
+  avgCost: number
 }
 
 interface ProductFormDialogProps {
@@ -101,6 +112,15 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
   // Mass fill state for variants
   const [massFill, setMassFill] = useState({ price: '', hpp: '', stock: '' })
 
+  // Composition / Recipe state
+  const [hasComposition, setHasComposition] = useState(false)
+  const [compositions, setCompositions] = useState<CompositionItem[]>([])
+  const [inventoryItems, setInventoryItems] = useState<Array<{ id: string; name: string; baseUnit: string; avgCost: number; stock: number }>>([])
+  const initialHasComposition = useRef(false)
+
+  // Per-variant composition state (maps variant INDEX to its composition items)
+  const [variantCompositions, setVariantCompositions] = useState<Record<number, CompositionItem[]>>({})
+
   const [form, setForm] = useState({
     name: '',
     sku: '',
@@ -125,6 +145,50 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
     return { totalStock, minPrice, maxPrice, filledCount, totalHpp, priceRange: minPrice !== maxPrice }
   }, [hasVariants, variants])
 
+  // Auto-calculated HPP from composition (product-level, non-variant)
+  const autoHpp = useMemo(() => {
+    if (!hasComposition || compositions.length === 0) return 0
+    return compositions.reduce((sum, c) => sum + (Number(c.qty) || 0) * (c.avgCost || 0), 0)
+  }, [hasComposition, compositions])
+
+  // Max possible stock from composition = min(inventoryStock / compQty) across all items (product-level)
+  const maxStockFromComposition = useMemo(() => {
+    if (!hasComposition || compositions.length === 0) return Infinity
+    let maxUnits = Infinity
+    for (const c of compositions) {
+      const compQty = Number(c.qty) || 0
+      if (compQty <= 0) continue
+      // Find current inventory stock
+      const invItem = inventoryItems.find((ii) => ii.id === c.inventoryItemId)
+      const availableStock = invItem?.stock ?? 0
+      const possible = Math.floor(availableStock / compQty)
+      if (possible < maxUnits) maxUnits = possible
+    }
+    return maxUnits
+  }, [hasComposition, compositions, inventoryItems])
+
+  // Per-variant auto HPP calculation
+  const getVariantAutoHpp = (variantIndex: number): number => {
+    const comps = variantCompositions[variantIndex] || []
+    return comps.reduce((sum, c) => sum + (Number(c.qty) || 0) * (c.avgCost || 0), 0)
+  }
+
+  // Per-variant max stock calculation
+  const getVariantMaxStock = (variantIndex: number): number => {
+    const comps = variantCompositions[variantIndex] || []
+    if (comps.length === 0) return Infinity
+    let maxUnits = Infinity
+    for (const c of comps) {
+      const compQty = Number(c.qty) || 0
+      if (compQty <= 0) continue
+      const invItem = inventoryItems.find((ii) => ii.id === c.inventoryItemId)
+      const availableStock = invItem?.stock ?? 0
+      const possible = Math.floor(availableStock / compQty)
+      if (possible < maxUnits) maxUnits = possible
+    }
+    return maxUnits
+  }
+
   useEffect(() => {
     if (open) {
       fetch('/api/categories')
@@ -133,6 +197,16 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
         .catch(() => {})
     }
   }, [open])
+
+  // Load inventory items when composition is enabled
+  useEffect(() => {
+    if (open && hasComposition) {
+      fetch('/api/inventory/items')
+        .then((res) => res.json())
+        .then((data) => setInventoryItems(data.items || []))
+        .catch(() => {})
+    }
+  }, [open, hasComposition])
 
   useEffect(() => {
     if (product) {
@@ -165,6 +239,59 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
       } else {
         setVariants([])
       }
+
+      // Load composition data
+      fetch(`/api/products/${product.id}/composition`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.hasComposition && data.items && data.items.length > 0) {
+            setHasComposition(true)
+            initialHasComposition.current = true
+            setCompositions(data.items.map((item: any) => ({
+              inventoryItemId: item.inventoryItemId,
+              inventoryItemName: item.inventoryItemName,
+              qty: String(item.qty),
+              baseUnit: item.baseUnit,
+              avgCost: item.avgCost || 0,
+            })))
+          } else {
+            setHasComposition(false)
+            setCompositions([])
+            initialHasComposition.current = false
+          }
+
+          // Load per-variant compositions for variant + composition mode
+          if (data.hasComposition && data.hasVariants && data.variantCompositions) {
+            const vcMap: Record<number, CompositionItem[]> = {}
+            const currentVariants = product.variants && product.variants.length > 0
+              ? product.variants
+              : []
+            for (const vc of data.variantCompositions) {
+              // Find the variant index by matching name
+              const vIdx = currentVariants.findIndex(v => v.name === vc.variantName)
+              if (vIdx >= 0) {
+                vcMap[vIdx] = vc.compositions.map((item: any) => ({
+                  inventoryItemId: item.inventoryItemId,
+                  inventoryItemName: item.inventoryItemName,
+                  qty: String(item.qty),
+                  baseUnit: item.baseUnit,
+                  avgCost: item.avgCost || 0,
+                }))
+              }
+            }
+            setVariantCompositions(vcMap)
+            // Ensure composition is enabled if variant compositions exist
+            if (Object.keys(vcMap).length > 0) {
+              setHasComposition(true)
+              initialHasComposition.current = true
+            }
+          }
+        })
+        .catch(() => {
+          setHasComposition(false)
+          setCompositions([])
+          initialHasComposition.current = false
+        })
     } else {
       setForm({
         name: '',
@@ -181,6 +308,10 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
       setVariants([])
       setExpandedVariant(0)
       setMassFill({ price: '', hpp: '', stock: '' })
+      setHasComposition(false)
+      setCompositions([])
+      setVariantCompositions({})
+      initialHasComposition.current = false
     }
   }, [product, open])
 
@@ -217,6 +348,19 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
 
   const removeVariant = (index: number) => {
     setVariants((prev) => prev.filter((_, i) => i !== index))
+    // Shift variantCompositions keys when a variant is removed
+    setVariantCompositions((prev) => {
+      const next: Record<number, CompositionItem[]> = {}
+      const keys = Object.keys(prev)
+        .map(Number)
+        .sort((a, b) => a - b)
+      for (const key of keys) {
+        if (key === index) continue // skip removed
+        const newKey = key > index ? key - 1 : key
+        next[newKey] = prev[key]
+      }
+      return next
+    })
     if (expandedVariant >= variants.length - 1) {
       setExpandedVariant(Math.max(0, variants.length - 2))
     }
@@ -250,12 +394,61 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
       }
     }
 
+    // Validate composition stock doesn't exceed available inventory (non-variant)
+    if (hasComposition && !hasVariants && maxStockFromComposition !== Infinity) {
+      const requestedStock = Number(form.stock) || 0
+      if (requestedStock > maxStockFromComposition) {
+        toast.error(`Stok melebihi kapasitas item. Maksimal ${maxStockFromComposition} ${form.unit || 'pcs'} yang bisa dibuat dari stok inventory saat ini.`)
+        return
+      }
+    }
+
+    // Validate product-level composition (non-variant mode)
+    if (hasComposition && !hasVariants && compositions.length === 0) {
+      toast.error('Tambahkan minimal 1 item untuk komposisi')
+      return
+    }
+    if (hasComposition && !hasVariants) {
+      for (let i = 0; i < compositions.length; i++) {
+        if (!compositions[i].inventoryItemId || !Number(compositions[i].qty) || Number(compositions[i].qty) <= 0) {
+          toast.error(`Komposisi ${i + 1}: isi jumlah item`)
+          return
+        }
+      }
+    }
+
+    // Validate per-variant composition (variant + composition mode)
+    if (hasComposition && hasVariants) {
+      for (let i = 0; i < variants.length; i++) {
+        const comps = variantCompositions[i] || []
+        if (comps.length === 0) {
+          toast.error(`Varian "${variants[i].name || i + 1}": tambahkan minimal 1 item untuk komposisi`)
+          return
+        }
+        for (let j = 0; j < comps.length; j++) {
+          if (!comps[j].inventoryItemId || !Number(comps[j].qty) || Number(comps[j].qty) <= 0) {
+            toast.error(`Varian "${variants[i].name || i + 1}", item ${j + 1}: isi jumlah item`)
+            return
+          }
+        }
+        // Validate stock doesn't exceed composition capacity
+        const maxStock = getVariantMaxStock(i)
+        if (maxStock !== Infinity) {
+          const requestedStock = Number(variants[i].stock) || 0
+          if (requestedStock > maxStock) {
+            toast.error(`Stok varian "${variants[i].name || i + 1}" melebihi kapasitas item. Maksimal ${maxStock} unit.`)
+            return
+          }
+        }
+      }
+    }
+
     setSaving(true)
     try {
       const body: Record<string, any> = {
         name: form.name.trim(),
         sku: form.sku.trim() || null,
-        hpp: isOwner ? Number(form.hpp) || 0 : 0,
+        hpp: hasComposition && !hasVariants ? autoHpp : (isOwner ? Number(form.hpp) || 0 : 0),
         price: hasVariants ? 0 : Number(form.price),
         stock: hasVariants ? 0 : Number(form.stock) || 0,
         lowStockAlert: Number(form.lowStockAlert) || 10,
@@ -264,10 +457,10 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
         unit: form.unit || 'pcs',
         hasVariants,
         variants: hasVariants
-          ? variants.map((v) => ({
+          ? variants.map((v, idx) => ({
               name: v.name.trim(),
               sku: v.sku.trim() || null,
-              hpp: Number(v.hpp) || 0,
+              hpp: hasComposition ? getVariantAutoHpp(idx) : (Number(v.hpp) || 0),
               price: Number(v.price),
               stock: Number(v.stock) || 0,
             }))
@@ -283,6 +476,76 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
       })
 
       if (res.ok) {
+        const savedProduct = await res.json()
+        const productId = isEdit ? product!.id : savedProduct.id
+
+        // Sync composition state
+        const shouldSync = hasComposition || (isEdit && initialHasComposition.current)
+
+        if (shouldSync && hasComposition && hasVariants) {
+          // Per-variant composition mode
+          // Fetch saved variants to get their IDs
+          const savedVariantsRes = await fetch(`/api/products/${productId}/variants`)
+          const savedVariantsData = await savedVariantsRes.json()
+          const savedVariants = savedVariantsData.variants || []
+
+          const vcMap: Record<string, Array<{ inventoryItemId: string; qty: number; baseUnit: string }>> = {}
+
+          // Match by name since we don't have IDs in the form state
+          for (let i = 0; i < variants.length; i++) {
+            const formVariant = variants[i]
+            const savedV = savedVariants.find((sv: any) => sv.name === formVariant.name.trim())
+            if (!savedV) continue
+            const comps = variantCompositions[i] || []
+            if (comps.length > 0) {
+              vcMap[savedV.id] = comps
+                .filter((c) => c.inventoryItemId && Number(c.qty) > 0)
+                .map((c) => ({
+                  inventoryItemId: c.inventoryItemId,
+                  qty: Number(c.qty),
+                  baseUnit: c.baseUnit,
+                }))
+            }
+          }
+
+          await fetch(`/api/products/${productId}/composition`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              hasComposition: Object.keys(vcMap).length > 0,
+              variantCompositions: vcMap,
+            }),
+          })
+        } else if (shouldSync && hasComposition && !hasVariants) {
+          // Product-level composition mode (non-variant)
+          const compData = compositions
+            .filter((c) => c.inventoryItemId && Number(c.qty) > 0)
+            .map((c) => ({
+              inventoryItemId: c.inventoryItemId,
+              qty: Number(c.qty),
+              baseUnit: c.baseUnit,
+            }))
+
+          await fetch(`/api/products/${productId}/composition`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              hasComposition: compData.length > 0,
+              compositions: compData,
+            }),
+          })
+        } else if (shouldSync && !hasComposition) {
+          // Composition was toggled off, clear it
+          await fetch(`/api/products/${productId}/composition`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              hasComposition: false,
+              compositions: [],
+            }),
+          })
+        }
+
         toast.success(isEdit ? 'Produk berhasil diperbarui' : 'Produk berhasil ditambahkan')
         onOpenChange(false)
         onSaved()
@@ -310,7 +573,8 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
     const updated = variants.map((v) => ({
       ...v,
       ...(massFill.price ? { price: massFill.price } : {}),
-      ...(massFill.hpp ? { hpp: massFill.hpp } : {}),
+      // Skip HPP mass fill when composition is active (HPP is auto-calculated)
+      ...(!hasComposition && massFill.hpp ? { hpp: massFill.hpp } : {}),
       ...(massFill.stock ? { stock: massFill.stock } : {}),
     }))
     setVariants(updated)
@@ -319,6 +583,66 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
 
   const clearMassFill = () => {
     setMassFill({ price: '', hpp: '', stock: '' })
+  }
+
+  // Composition helpers (product-level)
+  const addComposition = (inventoryItemId: string) => {
+    const item = inventoryItems.find((i) => i.id === inventoryItemId)
+    if (!item) return
+    if (compositions.some((c) => c.inventoryItemId === inventoryItemId)) {
+      toast.error('Item ini sudah ditambahkan')
+      return
+    }
+    setCompositions((prev) => [...prev, {
+      inventoryItemId: item.id,
+      inventoryItemName: item.name,
+      qty: '',
+      baseUnit: item.baseUnit,
+      avgCost: item.avgCost,
+    }])
+  }
+
+  const removeComposition = (index: number) => {
+    setCompositions((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  const updateCompositionQty = (index: number, value: string) => {
+    setCompositions((prev) => prev.map((c, i) => (i === index ? { ...c, qty: value } : c)))
+  }
+
+  // Per-variant composition helpers
+  const addVariantComposition = (variantIndex: number, inventoryItemId: string) => {
+    const item = inventoryItems.find((i) => i.id === inventoryItemId)
+    if (!item) return
+    const existing = variantCompositions[variantIndex] || []
+    if (existing.some((c) => c.inventoryItemId === inventoryItemId)) {
+      toast.error('Item ini sudah ditambahkan')
+      return
+    }
+    setVariantCompositions(prev => ({
+      ...prev,
+      [variantIndex]: [...existing, {
+        inventoryItemId: item.id,
+        inventoryItemName: item.name,
+        qty: '',
+        baseUnit: item.baseUnit,
+        avgCost: item.avgCost,
+      }]
+    }))
+  }
+
+  const removeVariantComposition = (variantIndex: number, compIndex: number) => {
+    setVariantCompositions(prev => ({
+      ...prev,
+      [variantIndex]: (prev[variantIndex] || []).filter((_, i) => i !== compIndex)
+    }))
+  }
+
+  const updateVariantCompositionQty = (variantIndex: number, compIndex: number, value: string) => {
+    setVariantCompositions(prev => ({
+      ...prev,
+      [variantIndex]: (prev[variantIndex] || []).map((c, i) => i === compIndex ? { ...c, qty: value } : c)
+    }))
   }
 
   return (
@@ -484,7 +808,7 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                     </div>
                   </div>
 
-                  {isOwner && (
+                  {isOwner && !hasComposition && (
                     <div className="space-y-1.5">
                       <Label className="text-xs text-slate-400">
                         HPP <span className="text-slate-600">(Modal)</span>
@@ -509,16 +833,18 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                 {isOwner && form.price && Number(form.price) > 0 && (
                   <div className="bg-nebula/80 border border-white/[0.06] rounded-lg p-3">
                     <div className="flex items-center justify-between">
-                      <span className="text-[11px] text-slate-500">Estimasi Keuntungan</span>
+                      <span className="text-[11px] text-slate-500">
+                        {hasComposition ? 'Estimasi Keuntungan (Auto HPP)' : 'Estimasi Keuntungan'}
+                      </span>
                       <span className="text-sm font-semibold theme-text">
-                        {formatCurrency(Number(form.price) - (Number(form.hpp) || 0))}
+                        {formatCurrency(Number(form.price) - (hasComposition ? autoHpp : Number(form.hpp) || 0))}
                       </span>
                     </div>
-                    {Number(form.price) > 0 && Number(form.hpp) > 0 && (
+                    {(hasComposition ? autoHpp > 0 : Number(form.hpp) > 0) && (
                       <div className="flex items-center justify-between mt-1">
                         <span className="text-[10px] text-slate-600">Margin</span>
                         <span className="text-[11px] text-slate-400">
-                          {(((Number(form.price) - Number(form.hpp)) / Number(form.price)) * 100).toFixed(1)}%
+                          {(((Number(form.price) - (hasComposition ? autoHpp : Number(form.hpp) || 0)) / Number(form.price)) * 100).toFixed(1)}%
                         </span>
                       </div>
                     )}
@@ -537,8 +863,19 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                       onChange={(e) => updateField('stock', e.target.value)}
                       placeholder="0"
                       required
-                      className="bg-nebula border-white/[0.06] text-white placeholder:text-slate-600 h-10 text-sm rounded-lg focus-visible:theme-ring focus-visible:theme-border"
+                      className={cn(
+                        "bg-nebula border-white/[0.06] text-white placeholder:text-slate-600 h-10 text-sm rounded-lg focus-visible:theme-ring focus-visible:theme-border",
+                        hasComposition && maxStockFromComposition !== Infinity && Number(form.stock) > maxStockFromComposition && "border-amber-500/50"
+                      )}
                     />
+                    {hasComposition && maxStockFromComposition !== Infinity && (
+                      <p className={cn(
+                        "text-[10px]",
+                        Number(form.stock) > maxStockFromComposition ? "text-amber-400" : "text-slate-600"
+                      )}>
+                        Maks. {maxStockFromComposition} {form.unit || 'pcs'} (berdasarkan stok item)
+                      </p>
+                    )}
                   </div>
                   <div className="space-y-1.5">
                     <Label className="text-xs text-slate-400">
@@ -669,9 +1006,9 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                       )}
                     </div>
                     <p className="text-[10px] text-slate-600 leading-relaxed">
-                      Isi untuk menerapkan harga, HPP, dan stok yang sama ke <strong>semua varian sekaligus</strong>. Kosongkan field yang tidak ingin diubah.
+                      Isi untuk menerapkan harga{!hasComposition ? ', HPP, ' : ' dan '}stok yang sama ke <strong>semua varian sekaligus</strong>. Kosongkan field yang tidak ingin diubah.
                     </p>
-                    <div className="grid grid-cols-3 gap-2">
+                    <div className={cn("grid gap-2", hasComposition ? "grid-cols-2" : "grid-cols-3")}>
                       <div className="space-y-1">
                         <Label className="text-[10px] text-slate-500">Harga Jual</Label>
                         <div className="relative">
@@ -687,7 +1024,7 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                           />
                         </div>
                       </div>
-                      {isOwner && (
+                      {isOwner && !hasComposition && (
                         <div className="space-y-1">
                           <Label className="text-[10px] text-slate-500">HPP (Modal)</Label>
                           <div className="relative">
@@ -751,6 +1088,7 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                     const vPrice = Number(variant.price) || 0
                     const vStock = Number(variant.stock) || 0
                     const vHpp = Number(variant.hpp) || 0
+                    const effectiveHpp = hasComposition ? getVariantAutoHpp(index) : vHpp
 
                     return (
                       <div
@@ -785,9 +1123,9 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                             </div>
                           </div>
                           <div className="flex items-center gap-1 flex-shrink-0">
-                            {vPrice > 0 && vHpp > 0 && (
+                            {isOwner && vPrice > 0 && effectiveHpp > 0 && (
                               <Badge className="theme-bg-very-light theme-border-light theme-text text-[9px] px-1.5 py-0 mr-1">
-                                +{formatCurrency(vPrice - vHpp)}
+                                +{formatCurrency(vPrice - effectiveHpp)}
                               </Badge>
                             )}
                             <Button
@@ -836,22 +1174,33 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                               />
                             </div>
 
-                            <div className="grid grid-cols-3 gap-2">
-                              <div className="space-y-1.5">
-                                <Label className="text-[10px] text-slate-500">HPP (Modal)</Label>
-                                <div className="relative">
-                                  <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[10px] text-slate-600">Rp</span>
-                                  <Input
-                                    type="number"
-                                    min="0"
-                                    step="any"
-                                    value={variant.hpp}
-                                    onChange={(e) => updateVariant(index, 'hpp', e.target.value)}
-                                    placeholder="0"
-                                    className="bg-white/[0.05] border-white/[0.08] text-white placeholder:text-slate-600 h-9 text-xs rounded-lg pl-7 focus-visible:theme-ring focus-visible:theme-border"
-                                  />
+                            <div className={cn("grid gap-2", hasComposition && isOwner ? "grid-cols-2" : "grid-cols-3")}>
+                              {isOwner && !hasComposition && (
+                                <div className="space-y-1.5">
+                                  <Label className="text-[10px] text-slate-500">HPP (Modal)</Label>
+                                  <div className="relative">
+                                    <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[10px] text-slate-600">Rp</span>
+                                    <Input
+                                      type="number"
+                                      min="0"
+                                      step="any"
+                                      value={variant.hpp}
+                                      onChange={(e) => updateVariant(index, 'hpp', e.target.value)}
+                                      placeholder="0"
+                                      className="bg-white/[0.05] border-white/[0.08] text-white placeholder:text-slate-600 h-9 text-xs rounded-lg pl-7 focus-visible:theme-ring focus-visible:theme-border"
+                                    />
+                                  </div>
                                 </div>
-                              </div>
+                              )}
+                              {isOwner && hasComposition && (
+                                <div className="space-y-1.5">
+                                  <Label className="text-[10px] text-slate-500">HPP (Auto)</Label>
+                                  <div className="bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2.5 h-9 flex items-center justify-between">
+                                    <span className="text-[11px] text-slate-600">dari komposisi</span>
+                                    <span className="text-xs font-medium theme-text">{formatCurrency(getVariantAutoHpp(index))}</span>
+                                  </div>
+                                </div>
+                              )}
                               <div className="space-y-1.5">
                                 <Label className="text-[10px] text-slate-400 font-medium">
                                   Harga Jual <span className="text-red-400">*</span>
@@ -877,21 +1226,89 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                                   value={variant.stock}
                                   onChange={(e) => updateVariant(index, 'stock', e.target.value)}
                                   placeholder="0"
-                                  className="bg-white/[0.05] border-white/[0.08] text-white placeholder:text-slate-600 h-9 text-xs rounded-lg focus-visible:theme-ring focus-visible:theme-border"
+                                  className={cn(
+                                    "bg-white/[0.05] border-white/[0.08] text-white placeholder:text-slate-600 h-9 text-xs rounded-lg focus-visible:theme-ring focus-visible:theme-border",
+                                    hasComposition && getVariantMaxStock(index) !== Infinity && Number(variant.stock) > getVariantMaxStock(index) && "border-amber-500/50"
+                                  )}
                                 />
+                                {hasComposition && getVariantMaxStock(index) !== Infinity && (
+                                  <p className={cn("text-[9px]", Number(variant.stock) > getVariantMaxStock(index) ? "text-amber-400" : "text-slate-600")}>
+                                    Maks. {getVariantMaxStock(index)}
+                                  </p>
+                                )}
                               </div>
                             </div>
 
                             {/* Variant profit preview */}
-                            {isOwner && vPrice > 0 && vHpp > 0 && (
+                            {isOwner && vPrice > 0 && (hasComposition ? getVariantAutoHpp(index) > 0 : vHpp > 0) && (
                               <div className="bg-white/[0.03] rounded-lg p-2 flex items-center justify-between">
                                 <span className="text-[10px] text-slate-500">Keuntungan</span>
                                 <div className="flex items-center gap-2">
-                                  <span className="text-[11px] font-medium theme-text">{formatCurrency(vPrice - vHpp)}</span>
+                                  <span className="text-[11px] font-medium theme-text">{formatCurrency(vPrice - effectiveHpp)}</span>
                                   <span className="text-[10px] text-slate-600">
-                                    ({(((vPrice - vHpp) / vPrice) * 100).toFixed(1)}%)
+                                    ({(((vPrice - effectiveHpp) / vPrice) * 100).toFixed(1)}%)
                                   </span>
                                 </div>
+                              </div>
+                            )}
+
+                            {/* Per-variant composition section */}
+                            {hasComposition && (
+                              <div className="space-y-2 pt-2 border-t border-white/[0.04]">
+                                <div className="flex items-center gap-1.5">
+                                  <Beaker className="h-3 w-3 text-slate-500" />
+                                  <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Komposisi Varian</span>
+                                </div>
+
+                                {/* Auto HPP per variant */}
+                                <div className="bg-white/[0.03] border border-white/[0.04] rounded-lg p-2 flex items-center justify-between">
+                                  <span className="text-[10px] text-slate-600">HPP otomatis</span>
+                                  <span className="text-[11px] font-medium theme-text">{formatCurrency(getVariantAutoHpp(index))}</span>
+                                </div>
+
+                                {/* Composition items for this variant */}
+                                {(variantCompositions[index] || []).map((comp, cIdx) => (
+                                  <div key={comp.inventoryItemId} className="bg-white/[0.03] border border-white/[0.04] rounded-lg p-2 space-y-1.5">
+                                    <div className="flex items-center justify-between">
+                                      <span className="text-[10px] text-slate-300 truncate">{comp.inventoryItemName}</span>
+                                      <button type="button" onClick={() => removeVariantComposition(index, cIdx)} className="text-slate-600 hover:text-red-400">
+                                        <X className="h-3 w-3" />
+                                      </button>
+                                    </div>
+                                    <div className="flex items-center gap-1.5">
+                                      <Input type="number" min="0" step="any" value={comp.qty}
+                                        onChange={(e) => updateVariantCompositionQty(index, cIdx, e.target.value)}
+                                        placeholder="0"
+                                        className="flex-1 h-7 text-[11px] bg-white/[0.04] border-white/[0.06] text-white rounded-md px-2 focus-visible:theme-ring focus-visible:theme-border"
+                                      />
+                                      <span className="text-[10px] text-slate-500 w-10 text-right">{comp.baseUnit}</span>
+                                    </div>
+                                    {Number(comp.qty) > 0 && comp.avgCost > 0 && (
+                                      <div className="text-[9px] text-slate-600 text-right">
+                                        {Number(comp.qty)} × {formatCurrency(comp.avgCost)} = {formatCurrency(Number(comp.qty) * comp.avgCost)}
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+
+                                {/* Add ingredient dropdown for this variant */}
+                                <select value="" onChange={(e) => { if (e.target.value) { addVariantComposition(index, e.target.value); e.target.value = '' } }}
+                                  className="w-full h-8 text-[11px] bg-white/[0.04] border border-white/[0.06] text-white rounded-lg px-2 focus:outline-none focus:ring-1 focus:theme-ring appearance-none cursor-pointer">
+                                  <option value="" disabled>+ Tambah item...</option>
+                                  {inventoryItems
+                                    .filter((item) => !(variantCompositions[index] || []).some((c) => c.inventoryItemId === item.id))
+                                    .map((item) => (
+                                      <option key={item.id} value={item.id}>{item.name} (stok: {formatNumber(item.stock)} {item.baseUnit})</option>
+                                    ))
+                                  }
+                                </select>
+
+                                {/* Stock capacity warning */}
+                                {getVariantMaxStock(index) !== Infinity && (
+                                  <p className="text-[9px] text-amber-400/80">
+                                    Maks. {getVariantMaxStock(index)} unit dari stok item
+                                  </p>
+                                )}
                               </div>
                             )}
                           </div>
@@ -920,6 +1337,173 @@ export default function ProductFormDialog({ open, onOpenChange, product, onSaved
                 <Info className="h-3.5 w-3.5 text-amber-400 mt-0.5 flex-shrink-0" />
                 <div className="text-[11px] text-amber-300/80 leading-relaxed">
                   Saat varian aktif, <span className="font-medium text-amber-300">harga, HPP, dan stok diatur per varian</span>. Kolom harga & stok utama akan disembunyikan. Total stok produk adalah penjumlahan stok semua varian.
+                </div>
+              </div>
+            )}
+
+            <Separator className="bg-white/[0.04]" />
+
+            {/* ========== SECTION: Komposisi ========== */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <div className="h-1 w-1 rounded-full theme-bg-light" />
+                <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Komposisi</span>
+              </div>
+
+              <div
+                className={`rounded-xl border p-4 transition-all duration-200 cursor-pointer ${
+                  hasComposition
+                    ? 'theme-bg-ultra-light theme-border-medium ring-1 theme-ring'
+                    : 'bg-nebula/40 border-white/[0.06] hover:border-white/[0.08]'
+                }`}
+                onClick={() => {
+                  if (!hasComposition) setHasComposition(true)
+                }}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className={`h-9 w-9 rounded-lg flex items-center justify-center transition-colors ${
+                      hasComposition ? 'theme-bg-lighter' : 'bg-white/[0.04]'
+                    }`}>
+                      <Beaker className={`h-4 w-4 transition-colors ${hasComposition ? 'theme-text' : 'text-slate-500'}`} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-slate-200">
+                        {hasVariants && hasComposition ? 'Komposisi per Varian — aktif' : 'Aktifkan Komposisi'}
+                      </p>
+                      <p className="text-[11px] text-slate-500">
+                        {hasVariants && hasComposition
+                          ? 'Setiap varian memiliki komposisi item sendiri'
+                          : hasComposition
+                            ? 'HPP dihitung otomatis dari item'
+                            : 'Produk dibuat dari item inventory?'
+                        }
+                      </p>
+                    </div>
+                  </div>
+                  <Switch
+                    checked={hasComposition}
+                    onCheckedChange={(checked) => {
+                      setHasComposition(checked)
+                      if (!checked) {
+                        setCompositions([])
+                        setVariantCompositions({})
+                      }
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Composition section — variant mode (info only) */}
+            {hasComposition && hasVariants && (
+              <div className="space-y-3">
+                <div className="flex items-start gap-2.5 bg-sky-500/5 border border-sky-500/15 rounded-lg p-3">
+                  <Beaker className="h-3.5 w-3.5 text-sky-400 mt-0.5 flex-shrink-0" />
+                  <div className="text-[11px] text-sky-300/80 leading-relaxed">
+                    Komposisi diatur <span className="font-medium text-sky-300">per varian</span>. Buka setiap varian untuk mengatur itemnya. Setiap varian memiliki HPP otomatis berdasarkan item yang digunakan.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Composition section — non-variant mode (full editor) */}
+            {hasComposition && !hasVariants && (
+              <div className="space-y-3">
+                {/* Auto HPP display */}
+                <div className="bg-nebula/80 border border-white/[0.06] rounded-lg p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-slate-500">Auto HPP (dari komposisi)</span>
+                    <span className="text-sm font-semibold theme-text">{formatCurrency(autoHpp)}</span>
+                  </div>
+                  {compositions.length > 0 && (
+                    <p className="text-[10px] text-slate-600 mt-1">
+                      {compositions.length} item × qty = HPP per {form.unit || 'pcs'}
+                    </p>
+                  )}
+                </div>
+
+                {/* Composition items */}
+                <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1 custom-scrollbar">
+                  {compositions.map((comp, idx) => (
+                    <div key={comp.inventoryItemId} className="bg-nebula border border-white/[0.06] rounded-xl p-3 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <div className="h-6 w-6 rounded-md bg-emerald-500/10 flex items-center justify-center flex-shrink-0">
+                            <Beaker className="h-3 w-3 text-emerald-400" />
+                          </div>
+                          <span className="text-xs font-medium text-slate-200 truncate">{comp.inventoryItemName}</span>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => removeComposition(idx)}
+                          className="h-6 w-6 p-0 text-slate-600 hover:text-red-400 hover:bg-red-500/10"
+                        >
+                          <X className="h-3 w-3" />
+                        </Button>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1">
+                          <Input
+                            type="number"
+                            min="0"
+                            step="any"
+                            value={comp.qty}
+                            onChange={(e) => updateCompositionQty(idx, e.target.value)}
+                            placeholder="0"
+                            className="bg-white/[0.05] border-white/[0.08] text-white placeholder:text-slate-600 h-9 text-xs rounded-lg focus-visible:theme-ring focus-visible:theme-border"
+                          />
+                        </div>
+                        <span className="text-xs text-slate-400 w-12 text-right flex-shrink-0">{comp.baseUnit}</span>
+                      </div>
+                      {Number(comp.qty) > 0 && comp.avgCost > 0 && (
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] text-slate-600">
+                            {Number(comp.qty)} {comp.baseUnit} × {formatCurrency(comp.avgCost)}
+                          </span>
+                          <span className="text-[10px] font-medium text-slate-400">
+                            {formatCurrency(Number(comp.qty) * comp.avgCost)}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                {/* Add ingredient */}
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-slate-500">Tambah Item</Label>
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      if (e.target.value) addComposition(e.target.value)
+                      e.target.value = ''
+                    }}
+                    className="w-full h-10 text-sm bg-nebula border border-white/[0.06] text-white rounded-lg px-3 focus:outline-none focus:ring-1 focus:theme-ring focus:theme-border appearance-none cursor-pointer"
+                  >
+                    <option value="" disabled>Pilih item...</option>
+                    {inventoryItems
+                      .filter((item) => !compositions.some((c) => c.inventoryItemId === item.id))
+                      .map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name} (stok: {formatNumber(item.stock)} {item.baseUnit})
+                        </option>
+                      ))}
+                  </select>
+                  {inventoryItems.length === 0 && (
+                    <p className="text-[10px] text-slate-600">Belum ada item. Tambahkan di halaman Pembelian → Inventory.</p>
+                  )}
+                </div>
+
+                {/* Info note */}
+                <div className="flex items-start gap-2.5 bg-sky-500/5 border border-sky-500/15 rounded-lg p-3">
+                  <Beaker className="h-3.5 w-3.5 text-sky-400 mt-0.5 flex-shrink-0" />
+                  <div className="text-[11px] text-sky-300/80 leading-relaxed">
+                    Saat komposisi aktif, <span className="font-medium text-sky-300">HPP akan dihitung otomatis</span> dari total biaya item. Setiap penjualan akan mengurangi stok item sesuai komposisi.
+                  </div>
                 </div>
               </div>
             )}

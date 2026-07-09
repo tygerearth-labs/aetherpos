@@ -29,7 +29,10 @@ export async function POST(request: NextRequest) {
     }
 
     // Simple secret check — prevents unauthorized calls
-    const cronSecret = process.env.CRON_SECRET || 'aether-pos-cron-2024'
+    const cronSecret = process.env.CRON_SECRET
+    if (!cronSecret) {
+      return safeJsonError('CRON_SECRET not configured', 500)
+    }
     if (secret !== cronSecret) {
       return safeJsonError('Unauthorized', 401)
     }
@@ -347,6 +350,15 @@ async function generateInsightsForOutlet(outletId: string): Promise<AIInsight[]>
     todayBrutto: todayAgg.brutto,
     todayDiscount: todayAgg.discount,
     todayTax: 0,
+    lowInventoryCount: 0,
+    outOfInventoryCount: 0,
+    inventoryAlerts: [],
+    totalInventoryValue: 0,
+    pendingTransfers: 0,
+    pendingTransferItems: 0,
+    pendingPurchases: 0,
+    pendingPurchaseValue: 0,
+    topVariantSelling: [],
   })
 
   // Only return actionable insights (not 'all-good')
