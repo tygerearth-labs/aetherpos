@@ -13,7 +13,7 @@ import { HealthRing } from '@/components/dashboard/dashboard-charts'
 import { StatCards } from '@/components/dashboard/stat-cards'
 import { QuickActions } from '@/components/dashboard/quick-actions'
 import { AnalyticsTabs } from '@/components/dashboard/analytics-tabs'
-import { TopProducts, TopCustomers, LowStockSection, InsightsSection, InventoryAlertsSection, ScoreExplanationDialog } from '@/components/dashboard/dashboard-sections'
+import { SalesProductsCard, InsightsSection, InventoryAlertsSection, ScoreExplanationDialog } from '@/components/dashboard/dashboard-sections'
 import { EnterpriseBubbleChart, PendingTransfersSection, InventoryPredictionSection } from '@/components/dashboard/enterprise-sections'
 
 // ── Animation variants ──
@@ -197,51 +197,20 @@ export default function DashboardPage() {
           GROUP D — Sales & Products
           ═══════════════════════════════════════════════════ */}
       <motion.div variants={itemVariants}>
-        <SectionLabel>Penjualan & Produk</SectionLabel>
+        <SalesProductsCard
+          lowStockList={stats.lowStockList}
+          lowStockVariantList={stats.lowStockVariantList}
+          lowStockVariants={stats.lowStockVariants}
+          fallbackCustomers={stats.topCustomers}
+        />
       </motion.div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-        <motion.div variants={itemVariants}>
-          <TopProducts products={topSelling} />
-        </motion.div>
-        {isOwner && (
-          <motion.div variants={itemVariants}>
-            <TopCustomers customers={stats.topCustomers} />
-          </motion.div>
-        )}
-      </div>
-
       {/* ═══════════════════════════════════════════════════
-          GROUP E — Inventory & Alerts
+          GROUP E — Inventory Alerts
           ═══════════════════════════════════════════════════ */}
-      {stats.inventoryAlerts?.some(a => a.status !== 'ok') && (
-        <motion.div variants={itemVariants}>
-          <SectionLabel>Inventori & Stok</SectionLabel>
-        </motion.div>
-      )}
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-        <motion.div variants={itemVariants}>
-          <InventoryAlertsSection stats={stats} />
-        </motion.div>
-        <motion.div variants={itemVariants}>
-          <LowStockSection stats={stats} />
-        </motion.div>
-      </div>
-
-      {/* ═══════════════════════════════════════════════════
-          GROUP F — AI Insights
-          ═══════════════════════════════════════════════════ */}
-      {isOwner && hasAiInsights && (
-        <>
-          <motion.div variants={itemVariants}>
-            <SectionLabel>AI Insights</SectionLabel>
-          </motion.div>
-          <motion.div variants={itemVariants}>
-            <InsightsSection insightData={insightData ?? null} isLoading={insightLoading} onRefresh={() => refetchInsights()} />
-          </motion.div>
-        </>
-      )}
+      <motion.div variants={itemVariants}>
+        <InventoryAlertsSection stats={stats} />
+      </motion.div>
 
       {/* Score Explanation Dialog */}
       {isOwner && insightData && (
@@ -251,6 +220,13 @@ export default function DashboardPage() {
           score={insightData.healthScore}
           insights={insightData.insights}
         />
+      )}
+
+      {/* ═══════════════════════════════════════════════════
+          FLOATING — AI Brain Button
+          ═══════════════════════════════════════════════════ */}
+      {isOwner && hasAiInsights && (
+        <InsightsSection insightData={insightData ?? null} isLoading={insightLoading} onRefresh={() => refetchInsights()} />
       )}
     </motion.div>
   )
