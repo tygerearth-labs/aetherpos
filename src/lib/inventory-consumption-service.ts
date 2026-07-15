@@ -319,6 +319,29 @@ export class InventoryConsumptionService {
       })
     }
 
+    // ── 8. FEFO: Record batch consumption (batch-aware deduction) ──
+    try {
+      const { FEFOEngine } = await import('@/lib/fefo-engine')
+      for (const deduction of resultDeductions) {
+        await FEFOEngine.recordBatchConsumption(tx, {
+          inventoryItemId: deduction.inventoryItemId,
+          quantityNeeded: deduction.totalDeducted,
+          transactionId,
+          invoiceNumber,
+          outletId,
+          userId,
+          sourceDetails: JSON.stringify(deduction.sources),
+        })
+      }
+    } catch (batchError) {
+      // INV-HC-05 FIX: FEFO batch recording is now FATAL.
+      // If batch stock is inconsistent with InventoryItem.stock, the entire
+      // transaction must rollback to prevent data corruption.
+      // Previously this was non-fatal, which could cause remainingQty != stock.
+      const msg = batchError instanceof Error ? batchError.message : String(batchError)
+      throw new Error(`[InvConsumption] FEFO batch recording failed (FATAL): ${msg}`)
+    }
+
     return {
       success: true,
       deductions: resultDeductions,

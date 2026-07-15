@@ -1,40 +1,35 @@
 import Dexie, { type Table } from 'dexie'
 
-// ==================== TYPES ====================
-
-export interface ProductVariant {
-  id: string
-  name: string
-  sku: string | null
-  price: number
-  hpp: number
-  stock: number
-}
+// ── Types ──
 
 export interface CachedProduct {
   id: string
   name: string
   sku: string | null
   barcode: string | null
-  hpp: number
   price: number
-  bruto: number
-  netto: number
   stock: number
-  lowStockAlert: number
+  hpp: number
   image: string | null
   categoryId: string | null
   hasVariants: boolean
   _variantCount: number
-  variants: ProductVariant[]
-  updatedAt: string
+  unit: string
+  variants?: Array<{
+    id: string
+    name: string
+    sku: string | null
+    price: number
+    hpp: number
+    stock: number
+  }>
+  updatedAt?: string
 }
 
 export interface CachedCategory {
   id: string
   name: string
   color: string
-  updatedAt: string
 }
 
 export interface CachedCustomer {
@@ -43,7 +38,6 @@ export interface CachedCustomer {
   whatsapp: string
   totalSpend: number
   points: number
-  updatedAt: string
 }
 
 export interface CachedPromo {
@@ -51,20 +45,19 @@ export interface CachedPromo {
   name: string
   type: string
   value: number
-  minPurchase: number | null
-  maxDiscount: number | null
   active: boolean
-  updatedAt: string
+  categoryId: string | null
 }
 
 export interface OfflineTransaction {
   id?: number
   payload: Record<string, unknown>
-  isSynced: number
+  isSynced: 0 | 1
   createdAt: number
   retryCount: number
-  syncedAt?: number
   invoiceNumber?: string
+  localId?: number
+  syncedAt?: number
   serverTransactionId?: string
   lastError?: string
 }
@@ -72,10 +65,10 @@ export interface OfflineTransaction {
 export interface PendingTransaction {
   id?: number
   items: Array<{
-    product: CachedProduct
-    variant: ProductVariant | null
+    product: Record<string, unknown>
+    variant?: Record<string, unknown>
     qty: number
-    customPrice?: number | null
+    customPrice?: number
   }>
   customerId: string | null
   customerName: string | null
@@ -86,36 +79,38 @@ export interface PendingTransaction {
   userName: string
 }
 
-export interface SyncMeta {
+interface SyncMeta {
   key: string
   value: number
 }
 
-export interface CachedSetting {
+interface Setting {
   key: string
-  data: Record<string, unknown>
-  updatedAt: string
+  value?: unknown
+  data?: unknown
+  updatedAt?: string
 }
 
-// ==================== DATABASE ====================
+// ── Dexie Database ──
 
-class LocalDatabase extends Dexie {
-  products!: Table<CachedProduct, string>
-  categories!: Table<CachedCategory, string>
-  customers!: Table<CachedCustomer, string>
-  promos!: Table<CachedPromo, string>
-  transactions!: Table<OfflineTransaction, number>
-  pendingTransactions!: Table<PendingTransaction, number>
-  syncMeta!: Table<SyncMeta, string>
-  settings!: Table<CachedSetting, string>
+class AetherDB extends Dexie {
+  products!: Table<CachedProduct>
+  categories!: Table<CachedCategory>
+  customers!: Table<CachedCustomer>
+  promos!: Table<CachedPromo>
+  transactions!: Table<OfflineTransaction>
+  pendingTransactions!: Table<PendingTransaction>
+  syncMeta!: Table<SyncMeta>
+  settings!: Table<Setting>
 
   constructor() {
-    super('pos-offline-db')
+    super('aether-pos-local')
+
     this.version(1).stores({
-      products: 'id, name, sku, barcode, categoryId, updatedAt',
+      products: 'id, sku, barcode, categoryId, name',
       categories: 'id, name',
       customers: 'id, name, whatsapp',
-      promos: 'id, name, active',
+      promos: 'id, name',
       transactions: '++id, isSynced, createdAt',
       pendingTransactions: '++id, createdAt',
       syncMeta: 'key',
@@ -124,4 +119,4 @@ class LocalDatabase extends Dexie {
   }
 }
 
-export const localDB = new LocalDatabase()
+export const localDB = new AetherDB()

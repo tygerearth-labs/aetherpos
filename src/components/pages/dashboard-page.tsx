@@ -1,8 +1,9 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { useSession } from 'next-auth/react'
 import { usePlan } from '@/hooks/use-plan'
+import { usePageStore } from '@/hooks/use-page-store'
 import { useDashboard, useInsights, useForecast } from '@/hooks/use-dashboard'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -13,8 +14,9 @@ import { HealthRing } from '@/components/dashboard/dashboard-charts'
 import { StatCards } from '@/components/dashboard/stat-cards'
 import { QuickActions } from '@/components/dashboard/quick-actions'
 import { AnalyticsTabs } from '@/components/dashboard/analytics-tabs'
-import { SalesProductsCard, InsightsSection, InventoryAlertsSection, ScoreExplanationDialog } from '@/components/dashboard/dashboard-sections'
+import { SalesProductsCard, InsightsSection, InventoryAlertsSection, ScoreExplanationDialog, InventoryFreshnessWidget, ExpiryHeatmapWidget, ExpiryAlertBanner } from '@/components/dashboard/dashboard-sections'
 import { EnterpriseBubbleChart, PendingTransfersSection, InventoryPredictionSection } from '@/components/dashboard/enterprise-sections'
+import { MigrationBanner } from '@/components/migration/migration-banner'
 
 // ── Animation variants ──
 const containerVariants = {
@@ -60,6 +62,7 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 // ════════════════════════════════════════════════════════════
 export default function DashboardPage() {
   const { data: session } = useSession()
+  const { setCurrentPage } = usePageStore()
   const { plan, features, isLoading: planLoading } = usePlan()
   const isOwner = session?.user?.role === 'OWNER'
   const isPro = plan?.type === 'pro' || plan?.type === 'enterprise'
@@ -74,8 +77,15 @@ export default function DashboardPage() {
   const { data: insightData, isLoading: insightLoading, refetch: refetchInsights } = useInsights(!!isOwner && !!hasAiInsights)
   const { data: forecastData, isLoading: forecastLoading } = useForecast(!!isOwner && !!hasForecasting)
   const [scoreDialogOpen, setScoreDialogOpen] = useState(false)
+  const expiryHeatmapRef = useRef<HTMLDivElement>(null)
 
   const topSelling = insightData?.metrics.topSelling ?? []
+
+  // ── Migration Banner: show only for OWNER when 0 products ──
+  // IMPORTANT: Always render <MigrationBanner /> so its internal dialog state
+  // survives dashboard refetches (refetchInterval / refetchOnWindowFocus).
+  // The component itself decides when to show the banner card vs dialogs.
+  const showMigrationBanner = isOwner && (stats?.totalProducts ?? 0) === 0
 
   // ── Loading Skeleton ──
   if (isLoading || !stats) {
@@ -124,6 +134,13 @@ export default function DashboardPage() {
       </motion.div>
 
       {/* ═══════════════════════════════════════════════════
+          ROW 1.5 — Migration Banner (New User: 0 Products)
+          ═══════════════════════════════════════════════════ */}
+      <motion.div variants={itemVariants}>
+        <MigrationBanner showBanner={showMigrationBanner} />
+      </motion.div>
+
+      {/* ═══════════════════════════════════════════════════
           ROW 2 — Upgrade Banner (FREE only)
           ═══════════════════════════════════════════════════ */}
       {!planLoading && plan?.type === 'free' && (
@@ -135,7 +152,7 @@ export default function DashboardPage() {
                 Buka fitur <span className="font-medium text-slate-200">Forecasting & Prediksi</span> — upgrade ke Pro atau Enterprise
               </p>
             </div>
-            <Button size="sm" className="shrink-0 theme-bg hover:theme-hover-light text-white text-xs font-medium h-7 px-3 rounded-lg gap-1.5">
+            <Button size="sm" className="shrink-0 theme-bg hover:theme-hover-light text-white text-xs font-medium h-7 px-3 rounded-lg gap-1.5" onClick={() => setCurrentPage('plan')}>
               <Crown className="h-3 w-3" />Upgrade
             </Button>
           </div>
@@ -211,6 +228,25 @@ export default function DashboardPage() {
       <motion.div variants={itemVariants}>
         <InventoryAlertsSection stats={stats} />
       </motion.div>
+
+      {/* ═══════════════════════════════════════════════════
+          GROUP F — Inventory Intelligence
+          ═══════════════════════════════════════════════════ */}
+      <motion.div variants={itemVariants}>
+        <ExpiryAlertBanner
+          onShowDetail={() => {
+            expiryHeatmapRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+          }}
+        />
+      </motion.div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <motion.div variants={itemVariants}>
+          <InventoryFreshnessWidget />
+        </motion.div>
+        <motion.div variants={itemVariants} ref={expiryHeatmapRef}>
+          <ExpiryHeatmapWidget />
+        </motion.div>
+      </div>
 
       {/* Score Explanation Dialog */}
       {isOwner && insightData && (

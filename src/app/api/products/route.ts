@@ -36,6 +36,11 @@ export async function GET(request: NextRequest) {
         { name: { contains: search } },
         { sku: { contains: search } },
         { barcode: { contains: search } },
+        { unit: { contains: search } },
+        { category: { name: { contains: search } } },
+        { variants: { some: { name: { contains: search } } } },
+        { variants: { some: { sku: { contains: search } } } },
+        { variants: { some: { barcode: { contains: search } } } },
       ]
     }
     if (categoryId) {
@@ -237,11 +242,19 @@ export async function GET(request: NextRequest) {
       return sum + (price * aggStock)
     }, 0)
 
+    const totalQty = statsProducts.reduce((sum, p) => {
+      const aggStock = p.hasVariants && p.variants.length > 0
+        ? p.variants.reduce((s, v) => s + v.stock, 0)
+        : p.stock
+      return sum + aggStock
+    }, 0)
+
     return safeJson({
       products,
       totalPages: Math.ceil(total / limit),
       stats: {
         total: totalCount,
+        totalQty,
         categories: categoryCount,
         lowStock: lowStockCount,
         inventoryValue: totalInventoryValue,

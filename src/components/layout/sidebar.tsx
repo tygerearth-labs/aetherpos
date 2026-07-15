@@ -180,7 +180,7 @@ function SidebarContent({ collapsed = false, onNavigate, onToggleCollapse, isMob
   const navItemAccess = useMemo(() => {
     const map = new Map<string, boolean>()
     for (const item of navItems) {
-      const hasAccess = isOwner || !allowedPages || allowedPages.includes(item.page)
+      const hasAccess = isOwner || (!allowedPages || allowedPages.includes(item.page))
       const multiOutletOk = !item.groupOnly || (hasOutletGroup && (features?.multiOutlet ?? false))
       map.set(item.page, hasAccess && multiOutletOk)
     }

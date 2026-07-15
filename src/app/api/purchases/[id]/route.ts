@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { getAuthUser, unauthorized } from '@/lib/api/get-auth'
 import { safeJson, safeJsonError } from '@/lib/api/safe-response'
+import { FEFOEngine } from '@/lib/fefo-engine'
 
 // Helper: recalculate HPP for all products affected by the given inventory item IDs
 async function recalculateHppForAffectedProducts(
@@ -121,6 +122,8 @@ export async function GET(
         baseUnit: item.baseUnit,
         unitCost: item.unitCost,
         totalCost: item.totalCost,
+        batch: item.batch,
+        expiredDate: item.expiredDate?.toISOString() ?? null,
         inventoryItem: item.inventoryItem ? { ...item.inventoryItem } : null,
       })),
     }
@@ -156,6 +159,8 @@ export async function PUT(
         baseUnit: string
         unitCost: number
         totalCost: number
+        batch?: string | null
+        expiredDate?: string | null
       }>
     }
 
@@ -265,6 +270,8 @@ export async function PUT(
                 newStock,
                 previousAvgCost: existingAvgCost,
                 newAvgCost,
+                batch: oldItem.batch,
+                expiredDate: oldItem.expiredDate?.toISOString() ?? null,
               }),
               outletId,
               userId,
@@ -304,6 +311,8 @@ export async function PUT(
                 newStock,
                 previousAvgCost: existingAvgCost,
                 newAvgCost,
+                batch: oldItem.batch,
+                expiredDate: oldItem.expiredDate?.toISOString() ?? null,
               }),
               outletId,
               userId,
@@ -333,6 +342,8 @@ export async function PUT(
             baseUnit: item.baseUnit,
             unitCost: item.unitCost,
             totalCost: item.totalCost || (item.baseQty * item.unitCost),
+            batch: item.batch?.trim() || null,
+            expiredDate: item.expiredDate ? new Date(item.expiredDate) : null,
             outletId,
           }
         }),
@@ -382,6 +393,8 @@ export async function PUT(
               newStock,
               previousAvgCost: existingAvgCost,
               newAvgCost,
+              batch: item.batch?.trim() || null,
+              expiredDate: item.expiredDate || null,
             }),
             outletId,
             userId,
@@ -398,7 +411,7 @@ export async function PUT(
             newStock,
             referenceId: id,
             referenceType: 'PURCHASE_ORDER',
-            notes: `Edit pembelian: ${invItem.name} (${order.orderNumber})`,
+            notes: `Edit pembelian: ${invItem.name} (${order.orderNumber})${item.batch?.trim() ? ` [Batch: ${item.batch.trim()}]` : ''}${item.expiredDate ? ` [Exp: ${item.expiredDate.split('T')[0]}]` : ''}`,
             outletId,
             userId,
           },
@@ -414,6 +427,28 @@ export async function PUT(
           totalCost,
           notes: notes?.trim() || null,
         },
+      })
+
+      // ── STEP 5.5: Create new InventoryBatch records for FEFO tracking ──
+      // Old batch records were kept as-is (not deleted) — the inventory reversal above handled stock.
+      // Create new batch records to reflect the edited items.
+      const orderSupplier = await tx.purchaseOrder.findFirst({
+        where: { id, outletId },
+        select: { supplier: { select: { id: true, name: true } } },
+      })
+      await FEFOEngine.createBatchesFromPurchase(tx, {
+        purchaseOrderId: id,
+        items: items.map(item => ({
+          inventoryItemId: item.inventoryItemId,
+          name: inventoryItems.find(ii => ii.id === item.inventoryItemId)!.name,
+          baseQty: item.baseQty,
+          unitCost: item.unitCost,
+          batch: item.batch?.trim() || null,
+          expiredDate: item.expiredDate ? new Date(item.expiredDate) : null,
+        })),
+        outletId,
+        supplierId: orderSupplier?.supplier?.id || null,
+        supplierName: orderSupplier?.supplier?.name || null,
       })
 
       // ── STEP 6: Recalculate HPP ──
@@ -448,7 +483,7 @@ export async function PUT(
       updatedAt: result.updatedAt?.toISOString() ?? null,
       supplier: result.supplier ? { ...result.supplier } : null,
       createdBy: result.createdBy ? { ...result.createdBy } : null,
-      items: (result.items || []).map((item: { id: string; inventoryItemId: string; name: string; purchaseQty: number; purchaseUnit: string; baseQty: number; baseUnit: string; unitCost: number; totalCost: number; inventoryItem?: { id: string; name: string; sku: string | null; baseUnit: string } | null }) => ({
+      items: (result.items || []).map((item: { id: string; inventoryItemId: string; name: string; purchaseQty: number; purchaseUnit: string; baseQty: number; baseUnit: string; unitCost: number; totalCost: number; batch?: string | null; expiredDate?: Date | null; inventoryItem?: { id: string; name: string; sku: string | null; baseUnit: string } | null }) => ({
         id: item.id,
         inventoryItemId: item.inventoryItemId,
         name: item.name,
@@ -458,6 +493,8 @@ export async function PUT(
         baseUnit: item.baseUnit,
         unitCost: item.unitCost,
         totalCost: item.totalCost,
+        batch: item.batch,
+        expiredDate: item.expiredDate?.toISOString() ?? null,
         inventoryItem: item.inventoryItem ? { ...item.inventoryItem } : null,
       })),
     } : null
@@ -485,26 +522,54 @@ export async function DELETE(
     const outletId = user.outletId
     const { id } = await params
 
-    const order = await db.purchaseOrder.findFirst({
+    // Fetch the PO with basic info first
+    const poWithSupplier = await db.purchaseOrder.findFirst({
       where: { id, outletId },
-      include: {
-        items: {
-          include: {
-            inventoryItem: {
-              select: { id: true, name: true, stock: true, avgCost: true },
-            },
-          },
-        },
+      select: { 
+        id: true, 
+        orderNumber: true,
+        totalCost: true,
+        createdAt: true,
         supplier: { select: { id: true, name: true } },
       },
     })
 
-    if (!order) {
+    if (!poWithSupplier) {
       return safeJsonError('Purchase order not found', 404)
+    }
+
+    // Fetch items separately to handle orphaned inventory items gracefully
+    // This avoids Prisma error when inventoryItem is null (deleted)
+    const items = await db.purchaseOrderItem.findMany({
+      where: { purchaseOrderId: id },
+      orderBy: { id: 'asc' },
+    })
+
+    // Fetch inventory items that still exist (exclude deleted/orphaned ones)
+    const itemInvIds = items.map(i => i.inventoryItemId).filter(Boolean)
+    const existingInvItems = itemInvIds.length > 0 
+      ? await db.inventoryItem.findMany({
+          where: { id: { in: itemInvIds }, outletId },
+          select: { id: true, name: true, stock: true, avgCost: true },
+        })
+      : []
+    
+    const invItemMap = new Map(existingInvItems.map(inv => [inv.id, inv]))
+
+    // Build order object with items (handling orphaned items as null)
+    const order = {
+      ...poWithSupplier,
+      items: items.map(item => ({
+        ...item,
+        inventoryItem: invItemMap.get(item.inventoryItemId) || null,
+      })),
     }
 
     await db.$transaction(async (tx) => {
       const affectedInventoryItemIds: string[] = []
+
+      // Delete InventoryBatch records for this PO (before inventory reversal)
+      await FEFOEngine.deleteBatchesForPurchase(tx, { purchaseOrderId: id, outletId })
 
       // Reverse inventory for each item
       for (const item of order.items) {
@@ -513,11 +578,7 @@ export async function DELETE(
 
         // Skip stock reversal if inventory item was already deleted (orphaned PO item)
         if (!invItem) {
-          // Clean up orphaned PO item reference
-          await tx.purchaseOrderItem.updateMany({
-            where: { id: item.id },
-            data: { inventoryItemId: '' },
-          })
+          console.warn(`[PO DELETE] Skipping orphaned PO item "${item.name}" (inventoryItemId=${item.inventoryItemId} no longer exists)`)
           continue
         }
 
@@ -560,6 +621,8 @@ export async function DELETE(
               newStock,
               previousAvgCost: existingAvgCost,
               newAvgCost,
+              batch: item.batch,
+              expiredDate: item.expiredDate?.toISOString() ?? null,
             }),
             outletId,
             userId,
@@ -580,6 +643,9 @@ export async function DELETE(
             totalCost: order.totalCost,
             itemCount: order.items.length,
             itemNames: order.items.map((i) => i.name),
+            batchInfo: order.items
+              .filter((i) => i.batch || i.expiredDate)
+              .map((i) => ({ name: i.name, batch: i.batch, expiredDate: i.expiredDate?.toISOString() ?? null })),
             supplierName: order.supplier?.name || null,
             createdAt: order.createdAt.toISOString(),
           }),
@@ -600,9 +666,20 @@ export async function DELETE(
     return safeJson({ success: true })
   } catch (error) {
     console.error('Purchase order DELETE error:', error)
-    if (error instanceof Error && (error.message.includes('tidak mencukupi') || error.message.includes('stok'))) {
-      return safeJsonError(error.message, 400)
+    if (error instanceof Error) {
+      if (error.message.includes('tidak mencukupi') || error.message.includes('stok')) {
+        // Add more context about why deletion failed
+        const enhancedMessage = error.message + 
+          '\n\nItem dalam pembelian ini sudah terpakai/dijual. ' +
+          'Hapus pembelian yang sudah memiliki riwayat penggunaan tidak diperbolehkan untuk menjaga integritas data.'
+        return safeJsonError(enhancedMessage, 400)
+      }
+      if (error.message.includes('sudah terpakai')) {
+        return safeJsonError(error.message, 400)
+      }
+      // Return actual error detail for debugging
+      return safeJsonError(`Gagal menghapus pembelian: ${error.message}`)
     }
-    return safeJsonError('Failed to delete purchase order')
+    return safeJsonError('Gagal menghapus pembelian. Coba lagi beberapa saat.')
   }
 }

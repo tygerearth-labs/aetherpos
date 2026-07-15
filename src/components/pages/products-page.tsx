@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useSession } from 'next-auth/react'
 import { toast } from 'sonner'
+import { cn } from '@/lib/utils'
 import { formatCurrency, formatNumber, formatDate } from '@/lib/format'
 import { usePlan } from '@/hooks/use-plan'
 import { Button } from '@/components/ui/button'
@@ -44,6 +45,18 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu'
+import {
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+} from '@/components/ui/popover'
 import { Pagination } from '@/components/shared/pagination'
 import {
   Table,
@@ -92,9 +105,15 @@ import {
   ScanBarcode,
   Printer,
   Beaker,
+  Info,
+  Boxes,
+  HelpCircle,
+  Lightbulb,
 } from 'lucide-react'
 // Collapsible removed — analytics section removed in redesign
 import { ProGate } from '@/components/shared/pro-gate'
+import { LockedDropdownItem } from '@/components/shared/locked-dropdown-item'
+
 import ProductFormDialog from './product-form-dialog'
 import dynamic from 'next/dynamic'
 
@@ -140,6 +159,7 @@ interface Product {
 
 interface ProductStats {
   total: number
+  totalQty: number
   categories: number
   lowStock: number
   inventoryValue: number
@@ -325,6 +345,11 @@ function getActionDescription(action: string, details: Record<string, unknown>):
         const valueInfo = totalVal > 0 ? ` — Nilai: ${formatCurrency(totalVal)}` : ''
         return `+${formatNumber(Number(details.quantityAdded) || 0)} dari transfer ${details.transferNumber || ''} (${details.fromOutlet || 'outlet lain'}) — Stok: ${formatNumber(Number(details.previousStock) || 0)} → ${formatNumber(Number(details.newStock) || 0)}${valueInfo}`
       }
+      // Migration opening stock
+      if (details.reason === 'Stok awal migrasi') {
+        const initStock = Number(details.initialStock) || 0
+        return `Stok awal migrasi: ${formatNumber(initStock)} unit${variantLabel}`
+      }
       const totalVal = Number(details.totalValue)
       const valueInfo = totalVal > 0 ? ` — Nilai: ${formatCurrency(totalVal)}` : ''
       return `Restock +${formatNumber(Number(details.quantityAdded) || 0)} unit${variantLabel} (Stok: ${formatNumber(Number(details.previousStock) || 0)} → ${formatNumber(Number(details.newStock) || 0)})${valueInfo}`
@@ -478,6 +503,7 @@ export default function ProductsPage() {
   // Bulk edit state
   const [bulkMode, setBulkMode] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [refreshKey, setRefreshKey] = useState(0) // Force refresh counter for table
   const [bulkPriceOpen, setBulkPriceOpen] = useState(false)
   const [bulkPriceType, setBulkPriceType] = useState<'percent' | 'fixed'>('percent')
   const [bulkPriceValue, setBulkPriceValue] = useState('')
@@ -525,6 +551,8 @@ export default function ProductsPage() {
   // Export Excel state
   const [exporting, setExporting] = useState(false)
 
+
+
   // Edit Excel state
   const [editExcelOpen, setEditExcelOpen] = useState(false)
   const [editExcelFile, setEditExcelFile] = useState<File | null>(null)
@@ -545,7 +573,39 @@ export default function ProductsPage() {
   // Category management state
   const [categories, setCategories] = useState<Category[]>([])
   const [categoriesLoading, setCategoriesLoading] = useState(true)
-  const [categorySectionOpen, setCategorySectionOpen] = useState(true)
+  const [categorySectionOpen, setCategorySectionOpen] = useState(false)
+  const categoryScrollRef = useRef<HTMLDivElement>(null)
+  const isDragging = useRef(false)
+  const startX = useRef(0)
+  const scrollLeft = useRef(0)
+
+  // Drag-to-scroll for category chips
+  const handleCategoryMouseDown = useCallback((e: React.MouseEvent) => {
+    if (!categoryScrollRef.current) return
+    isDragging.current = true
+    startX.current = e.pageX - categoryScrollRef.current.offsetLeft
+    scrollLeft.current = categoryScrollRef.current.scrollLeft
+  }, [])
+  const handleCategoryMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!isDragging.current || !categoryScrollRef.current) return
+    e.preventDefault()
+    const x = e.pageX - categoryScrollRef.current.offsetLeft
+    const walk = (x - startX.current) * 1.5
+    categoryScrollRef.current.scrollLeft = scrollLeft.current - walk
+  }, [])
+  const handleCategoryMouseUp = useCallback(() => { isDragging.current = false }, [])
+  const handleCategoryTouchStart = useCallback((e: React.TouchEvent) => {
+    if (!categoryScrollRef.current) return
+    startX.current = e.touches[0].pageX - categoryScrollRef.current.offsetLeft
+    scrollLeft.current = categoryScrollRef.current.scrollLeft
+  }, [])
+  const handleCategoryTouchMove = useCallback((e: React.TouchEvent) => {
+    if (!categoryScrollRef.current) return
+    const x = e.touches[0].pageX - categoryScrollRef.current.offsetLeft
+    const walk = (x - startX.current) * 1.5
+    categoryScrollRef.current.scrollLeft = scrollLeft.current - walk
+  }, [])
+  const [featureHelpOpen, setFeatureHelpOpen] = useState(false)
   const [activeCategoryId, setActiveCategoryId] = useState<string | null>(null)
   const [categoryDialogOpen, setCategoryDialogOpen] = useState(false)
   const [editCategory, setEditCategory] = useState<Category | null>(null)
@@ -557,7 +617,7 @@ export default function ProductsPage() {
   const [categoryDeleting, setCategoryDeleting] = useState(false)
 
   // Analytics stats from API (all products, not just current page)
-  const [stats, setStats] = useState<ProductStats>({ total: 0, categories: 0, lowStock: 0, inventoryValue: 0 })
+  const [stats, setStats] = useState<ProductStats>({ total: 0, totalQty: 0, categories: 0, lowStock: 0, inventoryValue: 0 })
 
   const fetchCategories = useCallback(async () => {
     try {
@@ -678,13 +738,14 @@ export default function ProductsPage() {
     try {
       const res = await fetch(`/api/products/${deleteId}`, { method: 'DELETE' })
       if (res.ok) {
-        toast.success('Product deleted')
+        toast.success('Produk berhasil dihapus')
         fetchProducts()
       } else {
-        toast.error('Failed to delete product')
+        const data = await res.json().catch(() => ({}))
+        toast.error(data.error || 'Gagal menghapus produk')
       }
     } catch {
-      toast.error('Failed to delete product')
+      toast.error('Gagal menghapus produk')
     } finally {
       setDeleting(false)
       setDeleteId(null)
@@ -867,6 +928,10 @@ export default function ProductsPage() {
           productIds: Array.from(selectedIds),
           priceAdjustment: { type: bulkPriceType, value },
           selectAllMode,
+          filter: {
+            search: search || undefined,
+            categoryId: activeCategoryId || undefined,
+          },
         }),
       })
       if (res.ok) {
@@ -878,7 +943,7 @@ export default function ProductsPage() {
         setSelectedIds(new Set())
         setBulkMode(false)
         setSelectAllMode(false)
-        fetchProducts()
+        await forceRefresh()
       } else {
         toast.error('Failed to update prices')
       }
@@ -905,6 +970,10 @@ export default function ProductsPage() {
           productIds: Array.from(selectedIds),
           stockAdjustment: { type: bulkStockType, value },
           selectAllMode,
+          filter: {
+            search: search || undefined,
+            categoryId: activeCategoryId || undefined,
+          },
         }),
       })
       if (res.ok) {
@@ -915,7 +984,7 @@ export default function ProductsPage() {
         setSelectedIds(new Set())
         setBulkMode(false)
         setSelectAllMode(false)
-        fetchProducts()
+        await forceRefresh()
       } else {
         toast.error('Failed to update stock')
       }
@@ -937,6 +1006,10 @@ export default function ProductsPage() {
           productIds: Array.from(selectedIds),
           categoryId: bulkCategoryId,
           selectAllMode,
+          filter: {
+            search: search || undefined,
+            categoryId: activeCategoryId || undefined,
+          },
         }),
       })
       if (res.ok) {
@@ -947,7 +1020,7 @@ export default function ProductsPage() {
         setSelectedIds(new Set())
         setBulkMode(false)
         setSelectAllMode(false)
-        fetchProducts()
+        await forceRefresh()
         fetchCategories()
       } else {
         toast.error('Gagal mengubah kategori')
@@ -958,6 +1031,12 @@ export default function ProductsPage() {
       setBulkCategorySubmitting(false)
     }
   }
+
+  // Force refresh helper - increments refreshKey and fetches products
+  const forceRefresh = useCallback(async () => {
+    setRefreshKey((prev) => prev + 1)
+    await fetchProducts()
+  }, [fetchProducts])
 
   // Select all products across all pages (for current filter)
   const handleSelectAll = async () => {
@@ -1021,12 +1100,13 @@ export default function ProductsPage() {
         // Small delay to show 100% before switching to result
         await new Promise((r) => setTimeout(r, 400))
         setUploadResult(data)
-        fetchProducts()
+        await forceRefresh()
         const total = data.created + (data.variantsCreated || 0)
         toast.success(`${total} produk berhasil ditambahkan`)
       } else {
         const data = await res.json()
-        toast.error(data.error || 'Gagal upload file')
+        // Fix Bug #11: Show details message for better debugging
+        toast.error(data.details || data.error || 'Gagal upload file')
       }
     } catch {
       toast.error('Gagal upload file')
@@ -1110,13 +1190,14 @@ export default function ProductsPage() {
         setEditExcelPhase('Selesai!')
         await new Promise((r) => setTimeout(r, 400))
         setEditExcelResult(data)
-        fetchProducts()
+        await forceRefresh()
         fetchCategories()
         const total = data.updated + (data.variantsUpdated || 0)
         toast.success(`${total} produk berhasil diperbarui`)
       } else {
         const data = await res.json()
-        toast.error(data.error || 'Gagal update file')
+        // Fix Bug #11: Show details message for better debugging
+        toast.error(data.details || data.error || 'Gagal update file')
       }
     } catch {
       toast.error('Gagal update file')
@@ -1141,6 +1222,11 @@ export default function ProductsPage() {
         body: JSON.stringify({
           productIds: Array.from(selectedIds),
           selectAllMode,
+          // Send current filter params so the API deletes only matching products
+          filter: {
+            search: search || undefined,
+            categoryId: activeCategoryId || undefined,
+          },
         }),
       })
       if (res.ok) {
@@ -1150,7 +1236,7 @@ export default function ProductsPage() {
         setSelectedIds(new Set())
         setBulkMode(false)
         setSelectAllMode(false)
-        fetchProducts()
+        await forceRefresh()
         fetchCategories()
       } else {
         const data = await res.json()
@@ -1213,7 +1299,8 @@ export default function ProductsPage() {
         fetchCategories()
         fetchProducts()
       } else {
-        toast.error('Gagal menghapus kategori')
+        const data = await res.json().catch(() => ({}))
+        toast.error(data.error || 'Gagal menghapus kategori')
       }
     } catch {
       toast.error('Gagal menghapus kategori')
@@ -1296,13 +1383,7 @@ export default function ProductsPage() {
               {bulkMode ? 'Edit Massal Aktif' : 'Edit Massal'}
             </Button>
           )}
-          <Button onClick={handleExportExcel} disabled={exporting}
-              className="bg-white/[0.04] border-white/[0.04] text-slate-300 hover:text-white hover:bg-white/[0.04] h-9 text-xs font-medium disabled:opacity-50 shrink-0"
-            >
-              {exporting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Download className="mr-1.5 h-3.5 w-3.5" />}
-              Export Excel
-            </Button>
-            <Button
+          <Button
               variant="outline"
               onClick={() => setBatchBarcodeOpen(true)}
               className="bg-white/[0.04] border-white/[0.04] text-slate-300 hover:text-white hover:bg-white/[0.04] h-9 text-xs font-medium shrink-0"
@@ -1310,36 +1391,55 @@ export default function ProductsPage() {
               <Printer className="mr-1.5 h-3.5 w-3.5" />
               Cetak Barcode
             </Button>
-          <ProGate feature="bulkUpload" label="Upload Excel" description="Upload produk massal via file Excel" variant="inline">
-            <Button
-              variant="outline"
-              onClick={() => {
-                setUploadOpen(true)
-                setUploadFile(null)
-                setUploadResult(null)
-              }}
-              className="bg-white/[0.04] border-white/[0.04] text-slate-300 hover:text-white hover:bg-white/[0.04] h-9 text-xs font-medium shrink-0"
-            >
-              <Upload className="mr-1.5 h-3.5 w-3.5" />
-              Upload Excel
-            </Button>
-          </ProGate>
-          <ProGate feature="bulkUpload" label="Edit Excel" description="Update produk massal via file Excel" variant="inline">
-            <Button
-              variant="outline"
-              onClick={() => {
-                setEditExcelOpen(true)
-                setEditExcelFile(null)
-                setEditExcelResult(null)
-                setEditExcelProgress(0)
-                setEditExcelPhase('')
-              }}
-              className="bg-white/[0.04] border-white/[0.04] text-slate-300 hover:text-white hover:bg-white/[0.04] h-9 text-xs font-medium shrink-0"
-            >
-              <FilePenLine className="mr-1.5 h-3.5 w-3.5" />
-              Edit Excel
-            </Button>
-          </ProGate>
+          {/* Excel Actions Dropdown */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="outline"
+                className="bg-emerald-500/[0.08] border-emerald-500/20 text-emerald-300 hover:text-emerald-200 hover:bg-emerald-500/[0.12] hover:border-emerald-500/30 h-9 text-xs font-medium gap-1.5 transition-all"
+              >
+                <FileSpreadsheet className="h-3.5 w-3.5" />
+                Excel
+                <ChevronDown className="h-3 w-3 opacity-60" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-[240px] rounded-xl border-white/[0.08] bg-nebula p-1.5 shadow-2xl shadow-black/60">
+              <div className="px-2.5 py-1.5 mb-0.5">
+                <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Aksi Excel</p>
+              </div>
+              <DropdownMenuItem
+                onClick={handleExportExcel}
+                disabled={exporting}
+                className="flex items-center gap-3 px-2.5 py-2.5 text-xs text-slate-300 hover:bg-white/[0.05] hover:text-white rounded-lg cursor-pointer focus:bg-white/[0.05] focus:text-white group"
+              >
+                {exporting ? <Loader2 className="h-4 w-4 animate-spin text-slate-400" /> : <Download className="h-4 w-4 text-slate-500 group-hover:text-emerald-400 transition-colors" />}
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium">Export Excel</p>
+                  <p className="text-[10px] text-slate-500 group-hover:text-slate-400 transition-colors">Download semua data produk</p>
+                </div>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator className="bg-white/[0.06] my-1" />
+              <LockedDropdownItem
+                feature="bulkUpload"
+                icon={<Upload className="h-4 w-4" />}
+                iconColor="text-slate-500"
+                iconHoverColor="group-hover:text-amber-400"
+                title="Upload Excel"
+                subtitle="Tambah produk baru massal"
+                onClick={() => { setUploadOpen(true); setUploadFile(null); setUploadResult(null) }}
+              />
+              <DropdownMenuSeparator className="bg-white/[0.06] my-1" />
+              <LockedDropdownItem
+                feature="bulkUpload"
+                icon={<FilePenLine className="h-4 w-4" />}
+                iconColor="text-slate-500"
+                iconHoverColor="group-hover:text-cyan-400"
+                title="Edit Excel"
+                subtitle="Update produk yang sudah ada"
+                onClick={() => { setEditExcelOpen(true); setEditExcelFile(null); setEditExcelResult(null); setEditExcelProgress(0); setEditExcelPhase('') }}
+              />
+            </DropdownMenuContent>
+          </DropdownMenu>
           <Button onClick={handleAdd} className="theme-bg theme-hover text-white h-9 text-xs font-medium shadow-lg theme-shadow shrink-0">
             <Plus className="mr-1.5 h-3.5 w-3.5" />
             Tambah Produk
@@ -1349,84 +1449,172 @@ export default function ProductsPage() {
 
       {/* Stats Cards */}
       {!loading && stats.total > 0 && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-          {/* Total Products */}
-          <div className="relative rounded-xl border border-white/[0.06] bg-nebula p-4 space-y-3 overflow-hidden group">
-            <div className="absolute top-0 left-0 right-0 h-0.5 theme-gradient" />
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-slate-400">Total Produk</span>
-              <div className="h-8 w-8 rounded-lg theme-bg-very-light flex items-center justify-center">
-                <Package className="h-4 w-4 theme-text" />
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-4 gap-3">
+          {/* Total Produk & Qty — merged */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <div className="relative rounded-xl border border-white/[0.06] bg-nebula p-4 space-y-3 overflow-hidden group cursor-pointer hover:border-white/[0.1] transition-colors">
+                <div className="absolute top-0 left-0 right-0 h-0.5 bg-gradient-to-r from-cyan-500 via-emerald-500 to-cyan-500/40" />
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-medium text-slate-400">Produk & Stok</span>
+                  <div className="h-8 w-8 rounded-lg bg-emerald-500/10 flex items-center justify-center">
+                    <Package className="h-4 w-4 text-emerald-400" />
+                  </div>
+                </div>
+                <div className="flex items-end gap-3">
+                  <div>
+                    <p className="text-[10px] text-slate-500 leading-none">SKU</p>
+                    <p className="text-2xl font-bold text-white tracking-tight mt-0.5">{formatNumber(stats.total)}</p>
+                  </div>
+                  <div className="w-px h-8 bg-white/[0.06] mb-0.5" />
+                  <div>
+                    <p className="text-[10px] text-slate-500 leading-none">Qty</p>
+                    <p className="text-2xl font-bold text-emerald-400 tracking-tight mt-0.5">{formatNumber(stats.totalQty)}</p>
+                  </div>
+                </div>
+                <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <Info className="h-3 w-3 text-slate-500" />
+                </div>
               </div>
-            </div>
-            <p className="text-2xl font-bold text-white tracking-tight">{formatNumber(stats.total)}</p>
-          </div>
+            </PopoverTrigger>
+            <PopoverContent side="bottom" align="center" className="w-64 rounded-xl border-white/[0.08] bg-nebula p-3.5 shadow-2xl shadow-black/60">
+              <div className="space-y-2.5">
+                <div className="flex items-center gap-2">
+                  <div className="h-6 w-6 rounded-md bg-emerald-500/10 flex items-center justify-center">
+                    <Package className="h-3 w-3 text-emerald-400" />
+                  </div>
+                  <span className="text-xs font-semibold text-white">Produk & Stok</span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed"><strong className="text-slate-200">SKU ({formatNumber(stats.total)})</strong> — jumlah produk unik yang terdaftar, termasuk produk dengan varian.</p>
+                <p className="text-[11px] text-slate-400 leading-relaxed"><strong className="text-emerald-400">Qty ({formatNumber(stats.totalQty)})</strong> — total kuantitas stok dari semua produk. Varian dijumlahkan.</p>
+              </div>
+            </PopoverContent>
+          </Popover>
 
           {/* Total Categories */}
-          <div className="relative rounded-xl border border-white/[0.06] bg-nebula p-4 space-y-3 overflow-hidden group">
-            <div className="absolute top-0 left-0 right-0 h-0.5 bg-gradient-to-r from-violet-500 to-violet-500/40" />
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-slate-400">Kategori</span>
-              <div className="h-8 w-8 rounded-lg bg-violet-500/10 flex items-center justify-center">
-                <Tags className="h-4 w-4 text-violet-400" />
+          <Popover>
+            <PopoverTrigger asChild>
+              <div className="relative rounded-xl border border-white/[0.06] bg-nebula p-4 space-y-3 overflow-hidden group cursor-pointer hover:border-white/[0.1] transition-colors">
+                <div className="absolute top-0 left-0 right-0 h-0.5 bg-gradient-to-r from-violet-500 to-violet-500/40" />
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-medium text-slate-400">Kategori</span>
+                  <div className="h-8 w-8 rounded-lg bg-violet-500/10 flex items-center justify-center">
+                    <Tags className="h-4 w-4 text-violet-400" />
+                  </div>
+                </div>
+                <p className="text-2xl font-bold text-white tracking-tight">{formatNumber(stats.categories)}</p>
+                <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <Info className="h-3 w-3 text-slate-500" />
+                </div>
               </div>
-            </div>
-            <p className="text-2xl font-bold text-white tracking-tight">{formatNumber(stats.categories)}</p>
-          </div>
+            </PopoverTrigger>
+            <PopoverContent side="bottom" align="center" className="w-64 rounded-xl border-white/[0.08] bg-nebula p-3.5 shadow-2xl shadow-black/60">
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <div className="h-6 w-6 rounded-md bg-violet-500/10 flex items-center justify-center">
+                    <Tags className="h-3 w-3 text-violet-400" />
+                  </div>
+                  <span className="text-xs font-semibold text-white">Kategori</span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">Jumlah <strong className="text-slate-200">grup kategori</strong> aktif. Gunakan kategori untuk mengelompokkan dan memfilter produk di POS.</p>
+              </div>
+            </PopoverContent>
+          </Popover>
 
           {/* Low Stock Items */}
-          <div className="relative rounded-xl border border-white/[0.06] bg-nebula p-4 space-y-3 overflow-hidden group">
-            <div className={`absolute top-0 left-0 right-0 h-0.5 ${stats.lowStock > 0 ? 'bg-gradient-to-r from-amber-500 to-amber-500/40' : 'theme-gradient'}`} />
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-slate-400">Stok Rendah</span>
-              <div className={`h-8 w-8 rounded-lg flex items-center justify-center ${stats.lowStock > 0 ? 'bg-amber-500/10' : 'theme-bg-very-light'}`}>
-                <AlertTriangle className={`h-4 w-4 ${stats.lowStock > 0 ? 'text-amber-400' : 'theme-text'}`} />
+          <Popover>
+            <PopoverTrigger asChild>
+              <div className="relative rounded-xl border border-white/[0.06] bg-nebula p-4 space-y-3 overflow-hidden group cursor-pointer hover:border-white/[0.1] transition-colors">
+                <div className={`absolute top-0 left-0 right-0 h-0.5 ${stats.lowStock > 0 ? 'bg-gradient-to-r from-amber-500 to-amber-500/40' : 'theme-gradient'}`} />
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-medium text-slate-400">Stok Rendah</span>
+                  <div className={`h-8 w-8 rounded-lg flex items-center justify-center ${stats.lowStock > 0 ? 'bg-amber-500/10' : 'theme-bg-very-light'}`}>
+                    <AlertTriangle className={`h-4 w-4 ${stats.lowStock > 0 ? 'text-amber-400' : 'theme-text'}`} />
+                  </div>
+                </div>
+                <p className={`text-2xl font-bold tracking-tight ${stats.lowStock > 0 ? 'text-amber-400' : 'text-white'}`}>
+                  {formatNumber(stats.lowStock)}
+                </p>
+                <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <Info className="h-3 w-3 text-slate-500" />
+                </div>
               </div>
-            </div>
-            <p className={`text-2xl font-bold tracking-tight ${stats.lowStock > 0 ? 'text-amber-400' : 'text-white'}`}>
-              {formatNumber(stats.lowStock)}
-            </p>
-          </div>
+            </PopoverTrigger>
+            <PopoverContent side="bottom" align="center" className="w-64 rounded-xl border-white/[0.08] bg-nebula p-3.5 shadow-2xl shadow-black/60">
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <div className="h-6 w-6 rounded-md bg-amber-500/10 flex items-center justify-center">
+                    <AlertTriangle className="h-3 w-3 text-amber-400" />
+                  </div>
+                  <span className="text-xs font-semibold text-white">Stok Rendah</span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">Produk dengan stok <strong className="text-slate-200">di bawah atau sama dengan</strong> batas peringatan (low stock alert) yang ditentukan per produk.</p>
+              </div>
+            </PopoverContent>
+          </Popover>
 
           {/* Total Inventory Value */}
-          <div className="relative rounded-xl border border-white/[0.06] bg-nebula p-4 space-y-3 overflow-hidden group">
-            <div className="absolute top-0 left-0 right-0 h-0.5 bg-gradient-to-r from-sky-500 to-sky-500/40" />
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-slate-400">Nilai Inventori</span>
-              <div className="h-8 w-8 rounded-lg bg-sky-500/10 flex items-center justify-center">
-                <DollarSign className="h-4 w-4 text-sky-400" />
+          <Popover>
+            <PopoverTrigger asChild>
+              <div className="relative rounded-xl border border-white/[0.06] bg-nebula p-4 space-y-3 overflow-hidden group cursor-pointer hover:border-white/[0.1] transition-colors">
+                <div className="absolute top-0 left-0 right-0 h-0.5 bg-gradient-to-r from-sky-500 to-sky-500/40" />
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-medium text-slate-400">Value Produk</span>
+                  <div className="h-8 w-8 rounded-lg bg-sky-500/10 flex items-center justify-center">
+                    <DollarSign className="h-4 w-4 text-sky-400" />
+                  </div>
+                </div>
+                <p className="text-2xl font-bold text-white tracking-tight">{formatCurrency(stats.inventoryValue)}</p>
+                <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <Info className="h-3 w-3 text-slate-500" />
+                </div>
               </div>
-            </div>
-            <p className="text-2xl font-bold text-white tracking-tight">{formatCurrency(stats.inventoryValue)}</p>
-          </div>
+            </PopoverTrigger>
+            <PopoverContent side="bottom" align="center" className="w-64 rounded-xl border-white/[0.08] bg-nebula p-3.5 shadow-2xl shadow-black/60">
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <div className="h-6 w-6 rounded-md bg-sky-500/10 flex items-center justify-center">
+                    <DollarSign className="h-3 w-3 text-sky-400" />
+                  </div>
+                  <span className="text-xs font-semibold text-white">Value Produk</span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">Estimasi <strong className="text-slate-200">nilai inventori</strong> berdasarkan harga jual × stok. Ini bukan HPP — gunakan untuk gambaran nilai jual potensial.</p>
+              </div>
+            </PopoverContent>
+          </Popover>
         </div>
       )}
 
-      {/* Category Management Section */}
+      {/* Category Section */}
       <div className="rounded-xl border border-white/[0.06] bg-nebula/60 overflow-hidden">
         <button
           onClick={() => setCategorySectionOpen(!categorySectionOpen)}
           className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/[0.03] transition-colors"
         >
           <div className="flex items-center gap-2.5">
-            <div className="h-6 w-6 rounded-md bg-violet-500/10 flex items-center justify-center">
-              <Tags className="h-3 w-3 text-violet-400" />
+            <div className="h-7 w-7 rounded-lg bg-violet-500/10 flex items-center justify-center">
+              <Tags className="h-3.5 w-3.5 text-violet-400" />
             </div>
-            <span className="text-xs font-semibold text-slate-200">Kategori</span>
-            {!categoriesLoading && categories.length > 0 && (
-              <span className="text-[11px] text-slate-500">({categories.length})</span>
-            )}
-            {activeCategoryId && (
-              <Badge className="theme-bg-very-light theme-border-light theme-text text-[10px] px-1.5 py-0 ml-1">
-                Filter aktif
-                <button
-                  onClick={(e) => { e.stopPropagation(); setActiveCategoryId(null) }}
-                  className="ml-1 hover:theme-text"
-                >
-                  <X className="h-2.5 w-2.5 inline" />
-                </button>
-              </Badge>
-            )}
+            <div className="text-left">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold text-slate-200">Kategori</span>
+                {!categoriesLoading && categories.length > 0 && (
+                  <Badge variant="secondary" className="bg-white/[0.06] text-slate-500 border-0 text-[10px] px-1.5 py-0 h-4">{categories.length}</Badge>
+                )}
+                {activeCategoryId && (
+                  <Badge className="theme-bg-very-light theme-border-light theme-text text-[10px] px-1.5 py-0 h-4">
+                    Filter aktif
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setActiveCategoryId(null) }}
+                      className="ml-1 hover:theme-text"
+                    >
+                      <X className="h-2.5 w-2.5 inline" />
+                    </button>
+                  </Badge>
+                )}
+              </div>
+              <p className="text-[10px] text-slate-500 mt-0.5">Kelompokkan produk untuk filter cepat di POS</p>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -1456,7 +1644,16 @@ export default function ProductsPage() {
             ) : categories.length === 0 ? (
               <p className="text-[11px] text-slate-500 py-2">Belum ada kategori. Klik "Tambah" untuk membuat kategori baru.</p>
             ) : (
-              <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-thin">
+              <div
+                ref={categoryScrollRef}
+                className="flex gap-2 overflow-x-auto pb-1 scrollbar-hide cursor-grab active:cursor-grabbing select-none"
+                onMouseDown={handleCategoryMouseDown}
+                onMouseMove={handleCategoryMouseMove}
+                onMouseUp={handleCategoryMouseUp}
+                onMouseLeave={handleCategoryMouseUp}
+                onTouchStart={handleCategoryTouchStart}
+                onTouchMove={handleCategoryTouchMove}
+              >
                 {categories.map((cat) => {
                   const colors = getColorClasses(cat.color)
                   const isActive = activeCategoryId === cat.id
@@ -1498,16 +1695,58 @@ export default function ProductsPage() {
         )}
       </div>
 
+      {/* Feature Instructions */}
+      <div className="rounded-xl border border-white/[0.04] bg-white/[0.02] overflow-hidden">
+        <button
+          onClick={() => setFeatureHelpOpen(prev => !prev)}
+          className="w-full flex items-center gap-2.5 px-4 py-2.5 hover:bg-white/[0.03] transition-colors text-left"
+        >
+          <div className="h-6 w-6 rounded-md bg-amber-500/10 flex items-center justify-center shrink-0">
+            <Lightbulb className="h-3 w-3 text-amber-400" />
+          </div>
+          <span className="text-[11px] font-medium text-slate-300">Panduan Fitur Produk</span>
+          <ChevronDown className={cn('h-3 w-3 text-slate-500 ml-auto transition-transform', featureHelpOpen && 'rotate-180')} />
+        </button>
+        {featureHelpOpen && (
+          <div className="px-4 pb-3.5 pt-1 space-y-2.5 border-t border-white/[0.04]">
+            {[
+              { icon: <FileSpreadsheet className="h-3 w-3" />, label: 'Excel Dropdown', desc: 'Kumpulan aksi Excel dalam satu menu: Export untuk download, Upload untuk tambah produk baru massal, dan Edit untuk update produk yang sudah ada. Format file tersedia di masing-masing dialog.' },
+              { icon: <ListChecks className="h-3 w-3" />, label: 'Edit Massal', desc: 'Centang beberapa produk di tabel, lalu ubah harga, stok, atau kategori secara bersamaan. Tersedia untuk akun Pro & Owner.' },
+              { icon: <Printer className="h-3 w-3" />, label: 'Cetak Barcode', desc: 'Pilih produk (satu atau banyak) lalu cetak barcode dalam format yang siap tempel ke label produk.' },
+              { icon: <ScanBarcode className="h-3 w-3" />, label: 'Barcode & SKU', desc: 'Setiap produk bisa punya SKU manual dan/atau barcode. Di POS, scan barcode langsung menambahkan produk ke keranjang.' },
+              { icon: <Tags className="h-3 w-3" />, label: 'Kategori', desc: 'Klik kategori di atas untuk filter. Di POS, kategori muncul sebagai tab filter untuk mempercepat pencarian.' },
+              { icon: <AlertTriangle className="h-3 w-3" />, label: 'Stok Rendah', desc: 'Atur "Peringatan Stok Rendah" di form produk. Jika stok ≤ batas, produk ditandai kuning di tabel dan POS.' },
+            ].map((item) => (
+              <div key={item.label} className="flex gap-2.5">
+                <div className="mt-0.5 text-slate-500 shrink-0">{item.icon}</div>
+                <div>
+                  <p className="text-[11px] font-medium text-slate-300">{item.label}</p>
+                  <p className="text-[10px] text-slate-500 leading-relaxed mt-0.5">{item.desc}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       {/* Search & Sort */}
       <div className="flex flex-col sm:flex-row gap-2.5">
         <div className="relative flex-1 max-w-sm">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-500" />
           <Input
-            placeholder="Cari produk..."
+            placeholder="Cari nama, SKU, barcode, kategori, varian..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="pl-9 h-9 text-xs bg-white/[0.04] border-white/[0.04] text-white placeholder:text-slate-500 rounded-lg focus-visible:ring-white/[0.06]"
+            className="pl-9 pr-8 h-9 text-xs bg-white/[0.04] border-white/[0.04] text-white placeholder:text-slate-500 rounded-lg focus-visible:ring-white/[0.06]"
           />
+          {search && (
+            <button
+              onClick={() => setSearch('')}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white transition-colors"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
         <Select value={sort} onValueChange={(val) => setSort(val as SortOption)}>
           <SelectTrigger className="w-full sm:w-[180px] h-9 text-xs bg-white/[0.04] border-white/[0.04] text-white rounded-lg">
@@ -1542,7 +1781,7 @@ export default function ProductsPage() {
             <p className="text-sm text-slate-500">Tidak ada produk ditemukan</p>
           </div>
         ) : (
-          <div className="rounded-xl border border-white/[0.06] overflow-hidden">
+          <div key={`table-${refreshKey}`} className="rounded-xl border border-white/[0.06] overflow-hidden">
             <Table>
               <TableHeader>
                 <TableRow className="border-white/[0.06] hover:bg-transparent bg-nebula/80">
@@ -1768,11 +2007,16 @@ export default function ProductsPage() {
         {/* Mobile bulk select-all bar */}
         {bulkMode && !loading && products.length > 0 && (
           <div className="flex items-center gap-2 mb-3 px-1">
-            <Checkbox
-              checked={selectAllMode || (selectedIds.size === products.length && products.length > 0)}
-              onCheckedChange={selectAllMode ? () => { setSelectAllMode(false); setSelectedIds(new Set()) } : toggleSelectAll}
-              className="border-white/[0.06] data-[state=checked]:theme-bg data-[state=checked]:theme-border"
-            />
+            <button
+              type="button"
+              onClick={selectAllMode ? () => { setSelectAllMode(false); setSelectedIds(new Set()) } : toggleSelectAll}
+              className="flex items-center justify-center min-h-[44px] min-w-[44px] -ml-2"
+            >
+              <Checkbox
+                checked={selectAllMode || (selectedIds.size === products.length && products.length > 0)}
+                className="border-white/[0.06] data-[state=checked]:theme-bg data-[state=checked]:theme-border pointer-events-none"
+              />
+            </button>
             <span className="text-[11px] text-slate-400">
               {selectAllMode
                 ? <><span className="theme-text font-medium">Semua {stats.total}</span> produk dipilih</>
@@ -1815,7 +2059,7 @@ export default function ProductsPage() {
             <p className="text-sm text-slate-500">Tidak ada produk ditemukan</p>
           </div>
         ) : (
-          <div className="space-y-2.5">
+          <div key={`cards-${refreshKey}`} className="space-y-2.5">
             {products.map((product) => {
               const isOutOfStock = product.stock === 0
               const isLowStock = product.stock > 0 && product.stock <= product.lowStockAlert
@@ -1842,11 +2086,14 @@ export default function ProductsPage() {
                     {/* Thumbnail */}
                     <div className="flex-shrink-0">
                       {bulkMode ? (
-                        <div className="flex flex-col items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => toggleSelect(product.id)}
+                          className="flex flex-col items-center gap-1.5 min-h-[44px] min-w-[44px] justify-center -ml-1"
+                        >
                           <Checkbox
                             checked={selectedIds.has(product.id)}
-                            onCheckedChange={() => toggleSelect(product.id)}
-                            className="border-white/[0.06] data-[state=checked]:theme-bg data-[state=checked]:theme-border"
+                            className="border-white/[0.06] data-[state=checked]:theme-bg data-[state=checked]:theme-border pointer-events-none"
                           />
                           {product.image ? (
                             <div className="h-10 w-10 rounded-lg bg-white/[0.04] overflow-hidden">
@@ -1857,7 +2104,7 @@ export default function ProductsPage() {
                               <Package className="h-4 w-4 text-slate-600" />
                             </div>
                           )}
-                        </div>
+                        </button>
                       ) : product.image ? (
                         <div className="h-11 w-11 rounded-lg bg-white/[0.04] overflow-hidden">
                           <img src={product.image} alt={product.name} className="h-full w-full object-cover" />
@@ -2200,14 +2447,14 @@ export default function ProductsPage() {
       <AlertDialog open={!!deleteId} onOpenChange={(open) => !open && setDeleteId(null)}>
         <AlertDialogContent className="bg-nebula border-white/[0.06]">
           <AlertDialogHeader>
-            <AlertDialogTitle className="text-white text-sm font-semibold">Delete Product</AlertDialogTitle>
+            <AlertDialogTitle className="text-white text-sm font-semibold">Hapus Produk?</AlertDialogTitle>
             <AlertDialogDescription className="text-slate-400 text-xs">
-              Are you sure? This action cannot be undone.
+              Produk yang dihapus tidak dapat dikembalikan. Semua data produk (termasuk varian & stok) akan hilang.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel className="bg-white/[0.04] border-white/[0.04] text-slate-300 hover:bg-white/[0.04] h-8 text-xs">
-              Cancel
+              Batal
             </AlertDialogCancel>
             <AlertDialogAction
               onClick={handleDelete}
@@ -2215,7 +2462,7 @@ export default function ProductsPage() {
               className="bg-red-500 hover:bg-red-600 text-white h-8 text-xs"
             >
               {deleting && <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />}
-              Delete
+              Hapus
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

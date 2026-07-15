@@ -10,7 +10,6 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Checkbox } from '@/components/ui/checkbox'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { ProGate } from '@/components/shared/pro-gate'
 import {
@@ -39,6 +38,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import {
   Plus,
   Pencil,
@@ -50,8 +56,22 @@ import {
   Eye,
   EyeOff,
   Shield,
+  ShieldCheck,
   Search,
   Users,
+  RefreshCw,
+  CheckCircle2,
+  LayoutDashboard,
+  Package,
+  ShoppingCart,
+  Receipt,
+  Truck,
+  FileText,
+  Settings,
+  UserCircle,
+  Layers,
+  UserPlus,
+  Sparkles,
 } from 'lucide-react'
 
 // ==================== TYPES ====================
@@ -88,13 +108,16 @@ const DEFAULT_FORM: CrewFormData = {
 }
 
 const AVAILABLE_PAGES = [
-  { key: 'dashboard', label: 'Dashboard' },
-  { key: 'products', label: 'Produk' },
-  { key: 'customers', label: 'Pelanggan' },
-  { key: 'pos', label: 'POS' },
-  { key: 'transactions', label: 'Transaksi' },
-  { key: 'audit-log', label: 'Audit Log' },
-  { key: 'settings', label: 'Pengaturan' },
+  { key: 'dashboard', label: 'Dashboard', section: 'Utama' },
+  { key: 'products', label: 'Produk', section: 'Utama' },
+  { key: 'customers', label: 'Pelanggan', section: 'Utama' },
+  { key: 'pos', label: 'POS', section: 'Operasional' },
+  { key: 'transactions', label: 'Transaksi', section: 'Operasional' },
+  { key: 'purchase', label: 'Pembelian', section: 'Operasional' },
+  { key: 'transfer', label: 'Kirim Barang', section: 'Operasional' },
+  { key: 'audit-log', label: 'Audit Log', section: 'Manajemen' },
+  { key: 'settings', label: 'Pengaturan', section: 'Manajemen' },
+  { key: 'crew', label: 'Kelola Crew', section: 'Manajemen' },
 ]
 
 // ==================== MAIN COMPONENT ====================
@@ -350,130 +373,193 @@ function CrewManagement() {
 
           {/* Content */}
           {loading ? (
-            <Card className="bg-nebula border-white/[0.06]">
-              <CardContent className="p-4 space-y-2">
-                {Array.from({ length: 3 }).map((_, i) => (
-                  <Skeleton key={i} className="h-14 bg-white/[0.04] rounded-lg" />
-                ))}
-              </CardContent>
-            </Card>
+            <div className="space-y-3">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <Skeleton key={i} className="h-[180px] bg-white/[0.03] rounded-xl" />
+              ))}
+            </div>
           ) : filteredCrew.length === 0 ? (
-            <Card className="bg-nebula border-white/[0.06]">
-              <CardContent className="p-8 text-center">
-                <Users className="h-10 w-10 text-zinc-700 mx-auto mb-2" />
-                <p className="text-sm text-slate-400">
-                  {search ? 'Tidak ada crew yang cocok dengan pencarian' : 'Belum ada crew'}
-                </p>
-                <p className="text-[11px] text-slate-600 mt-0.5">
-                  {search
-                    ? 'Coba kata kunci lain'
-                    : 'Tambahkan crew untuk membantu mengelola kasir outlet'
-                  }
-                </p>
-              </CardContent>
-            </Card>
-          ) : (
-            <Card className="bg-nebula border-white/[0.06]">
-              <CardContent className="p-4">
-                <div className="rounded-lg border border-white/[0.06] overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow className="border-white/[0.06] hover:bg-transparent">
-                        <TableHead className="text-slate-500 text-[11px] font-medium">Crew</TableHead>
-                        <TableHead className="text-slate-500 text-[11px] font-medium hidden sm:table-cell">Email</TableHead>
-                        <TableHead className="text-slate-500 text-[11px] font-medium text-center">Role</TableHead>
-                        <TableHead className="text-slate-500 text-[11px] font-medium text-center">Halaman Akses</TableHead>
-                        <TableHead className="text-slate-500 text-[11px] font-medium hidden lg:table-cell">Bergabung</TableHead>
-                        <TableHead className="text-slate-500 text-[11px] font-medium text-right">Aksi</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {filteredCrew.map((member) => {
-                        const pages = member.crewPermission?.pages?.split(',').filter(Boolean) || []
-                        return (
-                          <TableRow key={member.id} className="border-white/[0.06] hover:bg-white/[0.03]">
-                            <TableCell className="py-2.5 px-3">
-                              <div className="flex items-center gap-2.5">
-                                <div className="w-8 h-8 rounded-lg bg-white/[0.04] flex items-center justify-center shrink-0">
-                                  <UserCog className="h-4 w-4 text-slate-400" />
-                                </div>
-                                <div className="min-w-0">
-                                  <p className="text-sm font-medium text-slate-200 truncate">{member.name}</p>
-                                </div>
-                              </div>
-                            </TableCell>
-                            <TableCell className="py-2.5 px-3 hidden sm:table-cell">
-                              <div className="flex items-center gap-1.5">
-                                <Mail className="h-3 w-3 text-slate-500 shrink-0" />
-                                <span className="text-xs text-slate-400 truncate">{member.email}</span>
-                              </div>
-                            </TableCell>
-                            <TableCell className="text-center py-2.5 px-3">
-                              <Badge
-                                variant="outline"
-                                className="text-[10px] bg-white/[0.04] border-white/[0.08] text-slate-400"
-                              >
-                                {member.role}
-                              </Badge>
-                            </TableCell>
-                            <TableCell className="text-center py-2.5 px-3">
-                              <div className="flex flex-wrap justify-center gap-1">
-                                {pages.length > 0 ? (
-                                  pages.map((p) => (
-                                    <Badge
-                                      key={p}
-                                      className="text-[10px] theme-bg-very-light theme-border-light theme-text px-1.5 py-0"
-                                    >
-                                      {p}
-                                    </Badge>
-                                  ))
-                                ) : (
-                                  <span className="text-[10px] text-slate-600">Default (POS)</span>
-                                )}
-                              </div>
-                            </TableCell>
-                            <TableCell className="py-2.5 px-3 hidden lg:table-cell">
-                              <div className="flex items-center gap-1.5">
-                                <Calendar className="h-3 w-3 text-slate-500" />
-                                <span className="text-xs text-slate-400">{formatDate(member.createdAt)}</span>
-                              </div>
-                            </TableCell>
-                            <TableCell className="text-right py-2.5 px-3">
-                              <div className="flex items-center justify-end gap-0.5">
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-7 w-7 text-slate-400 hover:text-white hover:bg-white/[0.04]"
-                                  onClick={() => openEdit(member)}
-                                >
-                                  <Pencil className="h-3.5 w-3.5" />
-                                </Button>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-7 w-7 text-slate-400 hover:text-red-400 hover:bg-red-500/10"
-                                  onClick={() => setDeleteId(member.id)}
-                                >
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                </Button>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                        )
-                      })}
-                    </TableBody>
-                  </Table>
+            <div className="rounded-xl border border-dashed border-white/[0.08] bg-white/[0.02] py-16 px-6 flex flex-col items-center justify-center text-center">
+              {/* Illustration */}
+              <div className="relative mb-5">
+                <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500/[0.08] to-purple-500/[0.05] border border-violet-500/[0.1] flex items-center justify-center">
+                  <Users className="h-9 w-9 text-violet-500/40" />
                 </div>
+                <div className="absolute -bottom-1 -right-1 w-7 h-7 rounded-lg bg-gradient-to-br from-emerald-500/20 to-emerald-500/10 border border-emerald-500/20 flex items-center justify-center">
+                  <UserPlus className="h-3.5 w-3.5 text-emerald-400/70" />
+                </div>
+              </div>
 
-                {/* Crew count */}
-                <div className="mt-3 flex items-center justify-between">
-                  <p className="text-[11px] text-slate-500">
-                    {filteredCrew.length} crew ditampilkan
-                    {search && ` dari ${crew.length} total`}
+              {search ? (
+                <>
+                  <p className="text-sm font-medium text-slate-300">Tidak ada crew yang cocok</p>
+                  <p className="text-xs text-slate-500 mt-1.5 max-w-[260px] leading-relaxed">
+                    Coba kata kunci lain untuk menemukan crew yang kamu cari
                   </p>
-                </div>
-              </CardContent>
-            </Card>
+                </>
+              ) : (
+                <>
+                  <p className="text-sm font-medium text-slate-300">Belum ada crew</p>
+                  <p className="text-xs text-slate-500 mt-1.5 max-w-[260px] leading-relaxed">
+                    Tambahkan crew untuk membantu mengelola kasir dan operasional outlet
+                  </p>
+                  <div className="flex items-center gap-1.5 mt-1 mb-4">
+                    <Sparkles className="h-3 w-3 text-violet-400/60" />
+                    <span className="text-[10px] text-violet-400/60 font-medium">Atur hak akses per halaman untuk setiap crew</span>
+                  </div>
+                  <Button
+                    onClick={() => { setFormData(DEFAULT_FORM); setAddOpen(true) }}
+                    className="h-8 text-xs font-medium gap-1.5 rounded-lg theme-bg theme-hover text-white shadow-lg theme-shadow"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Tambah Crew
+                  </Button>
+                </>
+              )}
+            </div>
+          ) : (
+            <>
+              {/* Desktop: Table View */}
+              <div className="hidden md:block rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="border-white/[0.06] hover:bg-transparent bg-nebula/80">
+                      <TableHead className="text-slate-500 text-[11px] font-medium">Crew</TableHead>
+                      <TableHead className="text-slate-500 text-[11px] font-medium">Email</TableHead>
+                      <TableHead className="text-slate-500 text-[11px] font-medium text-center">Role</TableHead>
+                      <TableHead className="text-slate-500 text-[11px] font-medium text-center">Halaman Akses</TableHead>
+                      <TableHead className="text-slate-500 text-[11px] font-medium">Bergabung</TableHead>
+                      <TableHead className="text-slate-500 text-[11px] font-medium text-right">Aksi</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {filteredCrew.map((member, idx) => {
+                      const pages = member.crewPermission?.pages?.split(',').filter(Boolean) || []
+                      const avatarColor = AVATAR_COLORS[idx % AVATAR_COLORS.length]
+                      return (
+                        <TableRow key={member.id} className="border-white/[0.06] hover:bg-white/[0.03]">
+                          <TableCell className="py-3 px-4">
+                            <div className="flex items-center gap-3">
+                              <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 text-xs font-bold ${avatarColor}`}>
+                                {getInitials(member.name)}
+                              </div>
+                              <p className="text-sm font-medium text-slate-200">{member.name}</p>
+                            </div>
+                          </TableCell>
+                          <TableCell className="py-3 px-4">
+                            <div className="flex items-center gap-1.5">
+                              <Mail className="h-3.5 w-3.5 text-slate-500 shrink-0" />
+                              <span className="text-xs text-slate-400">{member.email}</span>
+                            </div>
+                          </TableCell>
+                          <TableCell className="text-center py-3 px-4">
+                            <Badge variant="outline" className="text-[10px] font-medium bg-white/[0.04] border-white/[0.08] text-slate-400">
+                              {member.role}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="py-3 px-4">
+                            <div className="flex flex-wrap justify-center gap-1">
+                              {pages.length > 0 ? (
+                                pages.map((p) => {
+                                  const pageLabel = AVAILABLE_PAGES.find((ap) => ap.key === p)?.label || p
+                                  return (
+                                    <Badge key={p} className="text-[10px] theme-bg-very-light theme-border-light theme-text px-1.5 py-0">
+                                      {pageLabel}
+                                    </Badge>
+                                  )
+                                })
+                              ) : (
+                                <span className="text-[10px] text-slate-600">Default (POS)</span>
+                              )}
+                            </div>
+                          </TableCell>
+                          <TableCell className="py-3 px-4">
+                            <div className="flex items-center gap-1.5">
+                              <Calendar className="h-3.5 w-3.5 text-slate-500" />
+                              <span className="text-xs text-slate-400">{formatDate(member.createdAt)}</span>
+                            </div>
+                          </TableCell>
+                          <TableCell className="text-right py-3 px-4">
+                            <div className="flex items-center justify-end gap-0.5">
+                              <Button variant="ghost" size="icon" className="h-8 w-8 text-slate-400 hover:text-white hover:bg-white/[0.04] rounded-lg" onClick={() => openEdit(member)}>
+                                <Pencil className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button variant="ghost" size="icon" className="h-8 w-8 text-slate-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg" onClick={() => setDeleteId(member.id)}>
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+
+              {/* Mobile: Card View */}
+              <div className="md:hidden space-y-3">
+                {filteredCrew.map((member, idx) => {
+                  const pages = member.crewPermission?.pages?.split(',').filter(Boolean) || []
+                  const avatarColor = AVATAR_COLORS[idx % AVATAR_COLORS.length]
+                  return (
+                    <div key={member.id} className="rounded-xl border border-white/[0.06] bg-white/[0.03] overflow-hidden">
+                      <div className="px-4 py-3.5 flex items-center gap-3 border-b border-white/[0.04]">
+                        <div className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 text-sm font-bold ${avatarColor}`}>
+                          {getInitials(member.name)}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-slate-200 truncate">{member.name}</p>
+                          <div className="flex items-center gap-1.5 mt-0.5">
+                            <Mail className="h-3 w-3 text-slate-500" />
+                            <span className="text-[11px] text-slate-500 truncate">{member.email}</span>
+                          </div>
+                        </div>
+                        <Badge variant="outline" className="text-[10px] font-medium bg-white/[0.04] border-white/[0.08] text-slate-400">
+                          {member.role}
+                        </Badge>
+                      </div>
+                      <div className="px-4 py-3 space-y-3">
+                        <div>
+                          <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wider mb-1.5">Halaman Akses</p>
+                          {pages.length > 0 ? (
+                            <div className="flex flex-wrap gap-1.5">
+                              {pages.map((p) => {
+                                const pageLabel = AVAILABLE_PAGES.find((ap) => ap.key === p)?.label || p
+                                return (
+                                  <Badge key={p} className="text-[10px] theme-bg-very-light theme-border-light theme-text px-1.5 py-0.5">
+                                    {pageLabel}
+                                  </Badge>
+                                )
+                              })}
+                            </div>
+                          ) : (
+                            <p className="text-[11px] text-slate-500">Default (POS)</p>
+                          )}
+                        </div>
+                        <div className="flex items-center justify-between pt-1">
+                          <div className="flex items-center gap-1.5">
+                            <Calendar className="h-3 w-3 text-slate-500" />
+                            <span className="text-[11px] text-slate-500">{formatDate(member.createdAt)}</span>
+                          </div>
+                          <div className="flex items-center gap-0.5">
+                            <button type="button" onClick={() => openEdit(member)} className="flex items-center justify-center h-9 w-9 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.04] transition-colors">
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button type="button" onClick={() => setDeleteId(member.id)} className="flex items-center justify-center h-9 w-9 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition-colors">
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              <p className="text-[10px] text-slate-600 text-center pb-1">
+                {filteredCrew.length} crew ditampilkan{search && ` dari ${crew.length} total`}
+              </p>
+            </>
           )}
         </TabsContent>
 
@@ -699,10 +785,49 @@ function CrewManagement() {
 
 // ==================== CREW ACCESS TAB (moved from Settings) ====================
 
+const SECTION_META: Record<string, { color: string; bg: string; border: string; icon: React.ReactNode }> = {
+  Utama: { color: 'text-emerald-400', bg: 'bg-emerald-500/10', border: 'border-emerald-500/20', icon: <LayoutDashboard className="h-3.5 w-3.5" /> },
+  Operasional: { color: 'text-amber-400', bg: 'bg-amber-500/10', border: 'border-amber-500/20', icon: <ShoppingCart className="h-3.5 w-3.5" /> },
+  Manajemen: { color: 'text-violet-400', bg: 'bg-violet-500/10', border: 'border-violet-500/20', icon: <Shield className="h-3.5 w-3.5" /> },
+}
+
+const PAGE_ICONS: Record<string, React.ReactNode> = {
+  dashboard: <LayoutDashboard className="h-3.5 w-3.5" />,
+  products: <Package className="h-3.5 w-3.5" />,
+  customers: <UserCircle className="h-3.5 w-3.5" />,
+  pos: <Receipt className="h-3.5 w-3.5" />,
+  transactions: <FileText className="h-3.5 w-3.5" />,
+  purchase: <Truck className="h-3.5 w-3.5" />,
+  transfer: <Layers className="h-3.5 w-3.5" />,
+  'audit-log': <FileText className="h-3.5 w-3.5" />,
+  settings: <Settings className="h-3.5 w-3.5" />,
+  crew: <Users className="h-3.5 w-3.5" />,
+}
+
+const AVATAR_COLORS = [
+  'bg-cyan-500/20 text-cyan-300',
+  'bg-rose-500/20 text-rose-300',
+  'bg-amber-500/20 text-amber-300',
+  'bg-emerald-500/20 text-emerald-300',
+  'bg-violet-500/20 text-violet-300',
+  'bg-pink-500/20 text-pink-300',
+]
+
+function getInitials(name: string) {
+  return name
+    .split(' ')
+    .filter(Boolean)
+    .map((w) => w[0].toUpperCase())
+    .slice(0, 2)
+    .join('')
+}
+
 function CrewAccessTab() {
   const [permissions, setPermissions] = useState<CrewPermission[]>([])
   const [loading, setLoading] = useState(true)
   const [savingId, setSavingId] = useState<string | null>(null)
+
+  const sections = ['Utama', 'Operasional', 'Manajemen'] as const
 
   const fetchPermissions = useCallback(async () => {
     setLoading(true)
@@ -722,7 +847,6 @@ function CrewAccessTab() {
   }, [])
 
   useEffect(() => {
-     
     void fetchPermissions()
   }, [fetchPermissions])
 
@@ -757,7 +881,6 @@ function CrewAccessTab() {
       if (res.ok) {
         toast.success(`Hak akses ${crew.userName} berhasil diperbarui`)
       } else {
-        // Revert on failure
         setPermissions((prev) =>
           prev.map((p) =>
             p.userId === userId ? { ...p, pages: crew.pages } : p
@@ -777,78 +900,411 @@ function CrewAccessTab() {
     }
   }
 
+  const handleToggleSection = async (userId: string, sectionName: string) => {
+    const crew = permissions.find((p) => p.userId === userId)
+    if (!crew) return
+
+    const pagesList = crew.pages.split(',').filter(Boolean)
+    const sectionKeys = AVAILABLE_PAGES.filter((p) => p.section === sectionName).map((p) => p.key)
+    const allGranted = sectionKeys.every((k) => pagesList.includes(k))
+    const updated = allGranted
+      ? pagesList.filter((p) => !sectionKeys.includes(p))
+      : [...new Set([...pagesList, ...sectionKeys])]
+
+    if (updated.length === 0) {
+      toast.error('Minimal satu halaman harus diaktifkan')
+      return
+    }
+
+    const prevPages = crew.pages
+    setPermissions((prev) =>
+      prev.map((p) =>
+        p.userId === userId ? { ...p, pages: updated.join(',') } : p
+      )
+    )
+
+    setSavingId(userId)
+    try {
+      const res = await fetch(`/api/settings/permissions/${userId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pages: updated.join(',') }),
+      })
+      if (res.ok) {
+        toast.success(`Akses ${sectionName} untuk ${crew.userName} ${allGranted ? 'dicabut' : 'diberikan'}`)
+      } else {
+        setPermissions((prev) =>
+          prev.map((p) =>
+            p.userId === userId ? { ...p, pages: prevPages } : p
+          )
+        )
+        toast.error('Gagal memperbarui hak akses')
+      }
+    } catch {
+      setPermissions((prev) =>
+        prev.map((p) =>
+          p.userId === userId ? { ...p, pages: prevPages } : p
+        )
+      )
+      toast.error('Gagal memperbarui hak akses')
+    } finally {
+      setSavingId(null)
+    }
+  }
+
+  // ---- Loading State ----
   if (loading) {
     return (
-      <Card className="bg-nebula border-white/[0.06]">
-        <CardContent className="p-4 space-y-3">
-          <Skeleton className="h-5 w-36 bg-white/[0.04]" />
-          {Array.from({ length: 2 }).map((_, i) => (
-            <Skeleton key={i} className="h-12 bg-white/[0.04] rounded-lg" />
+      <div className="space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="space-y-1.5">
+            <Skeleton className="h-5 w-40 bg-white/[0.04]" />
+            <Skeleton className="h-3.5 w-60 bg-white/[0.04]" />
+          </div>
+          <Skeleton className="h-8 w-8 rounded-lg bg-white/[0.04]" />
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-20 bg-white/[0.04] rounded-xl" />
           ))}
-        </CardContent>
-      </Card>
+        </div>
+        <Skeleton className="h-64 bg-white/[0.04] rounded-xl" />
+      </div>
     )
   }
 
+  // ---- Empty State ----
+  if (permissions.length === 0) {
+    return (
+      <div className="space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 theme-text" />
+              Hak Akses Crew
+            </h2>
+            <p className="text-xs text-slate-400 mt-0.5">Kelola halaman yang dapat diakses oleh setiap crew</p>
+          </div>
+        </div>
+        <div className="rounded-xl border border-dashed border-white/[0.08] bg-white/[0.02] py-16 px-6 flex flex-col items-center justify-center text-center">
+          {/* Illustration */}
+          <div className="relative mb-5">
+            <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500/[0.08] to-purple-500/[0.05] border border-violet-500/[0.1] flex items-center justify-center">
+              <Users className="h-9 w-9 text-violet-500/40" />
+            </div>
+            <div className="absolute -bottom-1 -right-1 w-7 h-7 rounded-lg bg-gradient-to-br from-emerald-500/20 to-emerald-500/10 border border-emerald-500/20 flex items-center justify-center">
+              <ShieldCheck className="h-3.5 w-3.5 text-emerald-400/70" />
+            </div>
+          </div>
+          <p className="text-sm font-medium text-slate-300">Belum ada crew</p>
+          <p className="text-xs text-slate-500 mt-1.5 max-w-[260px] leading-relaxed">
+            Tambahkan crew di tab <span className="text-slate-300 font-medium">Daftar Crew</span> terlebih dahulu, lalu atur hak aksesnya di sini.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  // ---- Main Content ----
+  const totalCrew = permissions.length
+  const avgPages = Math.round(permissions.reduce((sum, p) => sum + p.pages.split(',').filter(Boolean).length, 0) / totalCrew)
+  const allPagesGranted = AVAILABLE_PAGES.length * totalCrew
+  const grantedCount = permissions.reduce((sum, p) => sum + p.pages.split(',').filter(Boolean).length, 0)
+  const coveragePct = Math.round((grantedCount / allPagesGranted) * 100)
+
   return (
-    <Card className="bg-nebula border-white/[0.06]">
-      <CardContent className="p-4 space-y-4">
-        <div>
-          <h2 className="text-sm font-semibold text-white">Hak Akses Crew</h2>
-          <p className="text-xs text-slate-400 mt-0.5">Kelola halaman yang dapat diakses oleh setiap crew</p>
+    <TooltipProvider delayDuration={300}>
+      <div className="space-y-4">
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 theme-text" />
+              Hak Akses Crew
+            </h2>
+            <p className="text-xs text-slate-400 mt-0.5">Kelola halaman yang dapat diakses oleh setiap crew</p>
+          </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => void fetchPermissions()}
+            className="h-8 w-8 rounded-lg bg-white/[0.04] border border-white/[0.06] hover:bg-white/[0.06] text-slate-400 hover:text-slate-200"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+          </Button>
         </div>
 
-        {permissions.length === 0 ? (
-          <div className="py-8 text-center">
-            <Users className="h-10 w-10 text-zinc-700 mx-auto mb-2" />
-            <p className="text-sm text-slate-500">Belum ada crew</p>
-            <p className="text-[11px] text-slate-600 mt-0.5">Crew akan muncul setelah terdaftar di outlet</p>
+        {/* Stats Row */}
+        <div className="grid grid-cols-3 gap-3">
+          <div className="rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 py-3">
+            <div className="flex items-center gap-2 mb-1.5">
+              <div className="w-6 h-6 rounded-md bg-theme-ultra-light flex items-center justify-center">
+                <Users className="h-3.5 w-3.5 theme-text" />
+              </div>
+              <span className="text-[11px] text-slate-500 font-medium">Total Crew</span>
+            </div>
+            <p className="text-xl font-bold text-white leading-none">{totalCrew}</p>
           </div>
-        ) : (
-          <div className="space-y-3 max-h-[500px] overflow-y-auto">
-            {permissions.map((crew) => {
-              const crewPages = crew.pages.split(',').filter(Boolean)
-              return (
-                <div
-                  key={crew.userId}
-                  className="rounded-lg border border-white/[0.06] bg-white/[0.03] p-3 space-y-2"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="w-8 h-8 rounded-lg bg-white/[0.04] flex items-center justify-center">
-                      <Users className="h-4 w-4 text-slate-400" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold text-slate-200">{crew.userName}</p>
-                      <p className="text-[11px] text-slate-500">{crew.userEmail}</p>
-                    </div>
-                    {savingId === crew.userId && (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin theme-text" />
-                    )}
-                  </div>
-                  <div className="flex flex-wrap gap-2.5">
-                    {AVAILABLE_PAGES.map((page) => {
-                      const isChecked = crewPages.includes(page.key)
-                      return (
-                        <label
-                          key={page.key}
-                          className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer hover:text-slate-200 transition-colors"
+          <div className="rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 py-3">
+            <div className="flex items-center gap-2 mb-1.5">
+              <div className="w-6 h-6 rounded-md bg-emerald-500/10 flex items-center justify-center">
+                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+              </div>
+              <span className="text-[11px] text-slate-500 font-medium">Rata-rata Akses</span>
+            </div>
+            <p className="text-xl font-bold text-white leading-none">{avgPages}<span className="text-xs font-normal text-slate-500 ml-1">/ {AVAILABLE_PAGES.length}</span></p>
+          </div>
+          <div className="rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 py-3">
+            <div className="flex items-center gap-2 mb-1.5">
+              <div className="w-6 h-6 rounded-md bg-amber-500/10 flex items-center justify-center">
+                <Shield className="h-3.5 w-3.5 text-amber-400" />
+              </div>
+              <span className="text-[11px] text-slate-500 font-medium">Cakupan</span>
+            </div>
+            <p className="text-xl font-bold text-white leading-none">{coveragePct}<span className="text-xs font-normal text-slate-500 ml-0.5">%</span></p>
+          </div>
+        </div>
+
+        {/* Permission Matrix - Desktop */}
+        <div className="hidden md:block rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
+          <ScrollArea className="w-full">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-white/[0.06]">
+                  <th className="sticky left-0 z-10 bg-[#0F172A] text-left px-4 py-3 w-[220px] min-w-[220px]">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Crew</span>
+                  </th>
+                  {sections.map((section) => {
+                    const meta = SECTION_META[section]
+                    const colSpan = AVAILABLE_PAGES.filter((p) => p.section === section).length
+                    return (
+                      <th
+                        key={section}
+                        colSpan={colSpan}
+                        className={`${meta.bg} border-x border-white/[0.06] px-3 py-2.5`}
+                      >
+                        <div className={`flex items-center gap-1.5 ${meta.color}`}>
+                          {meta.icon}
+                          <span className="text-[11px] font-semibold uppercase tracking-wider">{section}</span>
+                        </div>
+                      </th>
+                    )
+                  })}
+                  <th className="px-3 py-2.5 w-[60px]">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Total</span>
+                  </th>
+                </tr>
+                <tr className="border-b border-white/[0.06]">
+                  <th className="sticky left-0 z-10 bg-[#0F172A] px-4 py-2">
+                    <span className="text-[10px] text-slate-600">Halaman</span>
+                  </th>
+                  {sections.map((section) => {
+                    const sectionPages = AVAILABLE_PAGES.filter((p) => p.section === section)
+                    return sectionPages.map((page) => (
+                      <th
+                        key={page.key}
+                        className="px-2 py-2 text-center"
+                      >
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="text-[10px] text-slate-500 leading-tight block">{page.label}</span>
+                          </TooltipTrigger>
+                          <TooltipContent side="top" className="bg-slate-800 border-white/[0.08] text-xs">
+                            <span className="flex items-center gap-1.5">
+                              <span className={SECTION_META[section].color}>{PAGE_ICONS[page.key]}</span>
+                              {page.label}
+                            </span>
+                          </TooltipContent>
+                        </Tooltip>
+                      </th>
+                    ))
+                  })}
+                  <th className="px-3 py-2">
+                    <span className="text-[10px] text-slate-600">%</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {permissions.map((crew, idx) => {
+                  const crewPages = crew.pages.split(',').filter(Boolean)
+                  const avatarColor = AVATAR_COLORS[idx % AVATAR_COLORS.length]
+                  const pct = Math.round((crewPages.length / AVAILABLE_PAGES.length) * 100)
+                  const isSaving = savingId === crew.userId
+
+                  return (
+                    <tr
+                      key={crew.userId}
+                      className={`border-b border-white/[0.04] last:border-0 transition-colors ${isSaving ? 'bg-theme-ultra-light' : 'hover:bg-white/[0.02]'}`}
+                    >
+                      <td className="sticky left-0 z-10 bg-[#0F172A] px-4 py-3">
+                        <div className="flex items-center gap-2.5">
+                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 text-xs font-bold ${avatarColor}`}>
+                            {getInitials(crew.userName)}
+                          </div>
+                          <div className="min-w-0">
+                            <p className="text-xs font-semibold text-slate-200 truncate max-w-[120px]">{crew.userName}</p>
+                            <p className="text-[10px] text-slate-500 truncate max-w-[120px]">{crew.userEmail}</p>
+                          </div>
+                          {isSaving && <Loader2 className="h-3 w-3 animate-spin theme-text shrink-0" />}
+                        </div>
+                      </td>
+                      {sections.map((section) => {
+                        const sectionPages = AVAILABLE_PAGES.filter((p) => p.section === section)
+                        return sectionPages.map((page) => {
+                          const isChecked = crewPages.includes(page.key)
+                          return (
+                            <td key={page.key} className="px-2 py-2.5 text-center">
+                              <button
+                                type="button"
+                                onClick={() => handleTogglePage(crew.userId, page.key, isChecked)}
+                                disabled={!!savingId}
+                                className={`w-7 h-7 rounded-md border transition-all inline-flex items-center justify-center ${
+                                  isChecked
+                                    ? 'bg-theme-subtle border-theme/30 text-theme hover:bg-theme-medium'
+                                    : 'bg-transparent border-white/[0.06] text-transparent hover:border-white/[0.12] hover:text-slate-600'
+                                } ${savingId ? 'pointer-events-none' : 'cursor-pointer'}`}
+                              >
+                                {isChecked && <CheckCircle2 className="h-3.5 w-3.5" />}
+                              </button>
+                            </td>
+                          )
+                        })
+                      })}
+                      <td className="px-3 py-3">
+                        <Badge
+                          variant="outline"
+                          className={`text-[10px] font-semibold px-1.5 py-0 h-5 rounded-md ${
+                            pct === 100
+                              ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
+                              : pct >= 50
+                              ? 'bg-amber-500/10 border-amber-500/20 text-amber-400'
+                              : 'bg-white/[0.04] border-white/[0.08] text-slate-400'
+                          }`}
                         >
-                          <Checkbox
-                            checked={isChecked}
-                            onCheckedChange={() => handleTogglePage(crew.userId, page.key, isChecked)}
-                            className="data-[state=checked]:theme-bg data-[state=checked]:theme-border"
-                          />
-                          {page.label}
-                        </label>
-                      )
-                    })}
+                          {pct}%
+                        </Badge>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </ScrollArea>
+        </div>
+
+        {/* Permission Matrix - Mobile (Card per crew) */}
+        <div className="md:hidden space-y-3">
+          {permissions.map((crew, idx) => {
+            const crewPages = crew.pages.split(',').filter(Boolean)
+            const avatarColor = AVATAR_COLORS[idx % AVATAR_COLORS.length]
+            const pct = Math.round((crewPages.length / AVAILABLE_PAGES.length) * 100)
+            const isSaving = savingId === crew.userId
+
+            return (
+              <div
+                key={crew.userId}
+                className={`rounded-xl border border-white/[0.06] bg-white/[0.03] overflow-hidden transition-colors ${isSaving ? 'ring-1 ring-theme/20' : ''}`}
+              >
+                {/* Crew Header */}
+                <div className="px-4 py-3 flex items-center gap-3 border-b border-white/[0.04]">
+                  <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 text-xs font-bold ${avatarColor}`}>
+                    {getInitials(crew.userName)}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-slate-200 truncate">{crew.userName}</p>
+                    <p className="text-[11px] text-slate-500 truncate">{crew.userEmail}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {isSaving && <Loader2 className="h-3.5 w-3.5 animate-spin theme-text" />}
+                    <Badge
+                      variant="outline"
+                      className={`text-[10px] font-semibold px-1.5 py-0 h-5 rounded-md ${
+                        pct === 100
+                          ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
+                          : pct >= 50
+                          ? 'bg-amber-500/10 border-amber-500/20 text-amber-400'
+                          : 'bg-white/[0.04] border-white/[0.08] text-slate-400'
+                      }`}
+                    >
+                      {crewPages.length}/{AVAILABLE_PAGES.length}
+                    </Badge>
                   </div>
                 </div>
-              )
-            })}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+
+                {/* Section Groups */}
+                <div className="p-3 space-y-3">
+                  {sections.map((section) => {
+                    const meta = SECTION_META[section]
+                    const sectionPages = AVAILABLE_PAGES.filter((p) => p.section === section)
+                    const sectionKeys = sectionPages.map((p) => p.key)
+                    const allGranted = sectionKeys.every((k) => crewPages.includes(k))
+                    const someGranted = sectionKeys.some((k) => crewPages.includes(k))
+
+                    return (
+                      <div key={section} className="space-y-2">
+                        {/* Section Header with toggle */}
+                        <div className="flex items-center justify-between">
+                          <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-md ${meta.bg}`}>
+                            <span className={meta.color}>{meta.icon}</span>
+                            <span className={`text-[11px] font-semibold uppercase tracking-wider ${meta.color}`}>{section}</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleToggleSection(crew.userId, section)}
+                            disabled={!!savingId}
+                            className={`text-[10px] font-medium px-2 py-1 rounded-md transition-colors ${
+                              allGranted
+                                ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
+                                : someGranted
+                                ? 'bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
+                                : 'bg-white/[0.04] text-slate-500 hover:bg-white/[0.06]'
+                            } ${savingId ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}
+                          >
+                            {allGranted ? 'Semua Aktif' : someGranted ? 'Sebagian' : 'Tidak Ada'}
+                          </button>
+                        </div>
+                        {/* Page checkboxes */}
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {sectionPages.map((page) => {
+                            const isChecked = crewPages.includes(page.key)
+                            return (
+                              <button
+                                key={page.key}
+                                type="button"
+                                onClick={() => handleTogglePage(crew.userId, page.key, isChecked)}
+                                disabled={!!savingId}
+                                className={`flex items-center gap-2 px-2.5 py-2 rounded-lg border text-left transition-all ${
+                                  isChecked
+                                    ? 'bg-theme-ultra-light border-theme/20 text-slate-200'
+                                    : 'bg-transparent border-white/[0.04] text-slate-500 hover:bg-white/[0.03] hover:text-slate-400'
+                                } ${savingId ? 'pointer-events-none' : 'cursor-pointer'}`}
+                              >
+                                <div className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-all ${
+                                  isChecked
+                                    ? 'bg-theme border-theme'
+                                    : 'border-white/[0.12]'
+                                }`}>
+                                  {isChecked && <CheckCircle2 className="h-3 w-3 text-white" />}
+                                </div>
+                                <span className="text-[11px] font-medium truncate">{page.label}</span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+
+        {/* Footer hint */}
+        <p className="text-[10px] text-slate-600 text-center pb-1">
+          Klik tombol akses untuk mengaktifkan/menonaktifkan halaman. Perubahan disimpan otomatis.
+        </p>
+      </div>
+    </TooltipProvider>
   )
 }
