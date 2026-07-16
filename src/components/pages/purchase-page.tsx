@@ -68,6 +68,11 @@ import {
   Package,
   PackagePlus,
   PackageOpen,
+  BookOpen,
+  Calculator,
+  ChefHat,
+  ShoppingBag,
+  StickyNote,
   X,
   Tags,
   AlertTriangle,
@@ -103,7 +108,20 @@ import {
   Hash,
   TrendingDown,
   AlertCircle,
+  XCircle,
   FolderInput,
+  Ban,
+  Lock,
+  Lightbulb,
+  Coins,
+  Tag,
+  ShieldCheck,
+  ShieldAlert,
+  ArrowRightLeft,
+  Receipt,
+  Check,
+  Palette,
+  FolderOpen,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import SupplierSearchInput from '@/components/purchase/supplier-search-input'
@@ -149,8 +167,14 @@ interface PurchaseOrder {
   updatedAt?: string
   supplierName?: string | null
   createdByName?: string
+  // Legacy flags for backward compatibility
   hasLinkedItems?: boolean
   hasUsageHistory?: boolean
+  // New granular flags for precise edit/delete control
+  hasProductLinks?: boolean      // Only linked to products (no transfers/sales)
+  hasTransferLinks?: boolean     // Has inter-outlet transfers
+  hasTransactionLinks?: boolean  // Has sales transactions
+  hasRealBusinessHistory?: boolean // Combined: transfers OR sales (blocks edit)
   supplier?: { id: string; name: string; phone: string | null; address: string | null } | null
   createdBy?: { id: string; name: string; email: string } | null
   _batchSummary?: {
@@ -196,7 +220,22 @@ interface InventoryItem {
   lowStockAlert: number
   status?: string // ACTIVE, ARCHIVED
   updatedAt?: string
-  _count?: { compositions: number; purchaseItems: number }
+  _count?: {
+    compositions: number
+    purchaseItems: number
+    movements: number
+    inventoryTransferItems: number
+    consumptionSnapshots: number
+  }
+}
+
+// Delete Safety Status for inventory items
+interface DeleteSafetyStatus {
+  canDelete: boolean
+  riskLevel: 'safe' | 'warning' | 'blocked'
+  label: string
+  description: string
+  blockers: Array<{ type: string; label: string; icon: string }>
 }
 
 interface InventoryStats {
@@ -363,6 +402,203 @@ function getCategoryColorClasses(color: string) {
   return map[color] || map['zinc']
 }
 
+/**
+ * Delete Safety Status Checker
+ * 
+ * Determines if an inventory item can be safely deleted based on its relations.
+ * 
+ * SAFE (can delete):
+ * - No history at all
+ * - Only MIGRATION data (initial stock upload)
+ * 
+ * WARNING (can delete with cleanup):
+ * - Has auto-generated composition links (from product_stock mode)
+ * 
+ * BLOCKED (cannot delete, must archive):
+ * - Has real purchase history
+ * - Has transfer history between outlets
+ * - Has sales/consumption transactions
+ * - Has manual BOM/composition recipes
+ */
+/**
+ * Delete Safety Status Checker
+ * 
+ * Determines if an inventory item can be safely deleted based on its relations.
+ * LOGIC ALIGNED WITH BACKEND API (/api/inventory/items/[id] DELETE & /api/inventory/items/bulk-delete)
+ * 
+ * SAFE (can delete):
+ * - No history at all (totalRelations === 0)
+ * 
+ * WARNING (can delete with cleanup):
+ * - Only MIGRATION data (initial stock upload via movements)
+ * - Only auto-generated composition links (from product_stock mode, qty=1)
+ * - Combination of migration movements + auto compositions
+ * 
+ * BLOCKED (cannot delete, must archive):
+ * - Has real purchase history (purchaseItems > 0)
+ * - Has transfer history between outlets (inventoryTransferItems > 0)
+ * - Has sales/consumption transactions (consumptionSnapshots > 0)
+ * 
+ * NOTE: Compositions alone do NOT block deletion because backend distinguishes:
+ * - Auto 1:1 links (qty=1, from product_stock mode) → cleaned up on delete
+ * - Manual BOM recipes (custom qty) → would block, but frontend can't distinguish
+ *   → We treat compositions as "warning" to be consistent with backend behavior
+ */
+function getDeleteSafetyStatus(item: InventoryItem): DeleteSafetyStatus {
+  const c = item._count || {}
+  const compositions = c.compositions || 0
+  const purchaseItems = c.purchaseItems || 0
+  const movements = c.movements || 0
+  const transferItems = c.inventoryTransferItems || 0
+  const consumptionSnapshots = c.consumptionSnapshots || 0
+  
+  const blockers: Array<{ type: string; label: string; icon: string }> = []
+  const warnings: Array<{ type: string; label: string; icon: string }> = []
+  
+  // ── DEFINITE BLOCKERS (real business history) ──
+  if (purchaseItems > 0) {
+    blockers.push({
+      type: 'purchaseItems',
+      label: `${purchaseItems} pembelian`,
+      icon: 'ShoppingCart',
+    })
+  }
+  
+  if (transferItems > 0) {
+    blockers.push({
+      type: 'transferItems',
+      label: `${transferItems} transfer`,
+      icon: 'ArrowRightLeft',
+    })
+  }
+  
+  if (consumptionSnapshots > 0) {
+    blockers.push({
+      type: 'consumptionSnapshots',
+      label: `${consumptionSnapshots} transaksi`,
+      icon: 'Receipt',
+    })
+  }
+  
+  // ── SOFT WARNERS (data that will be cleaned up on delete) ──
+  // Movements: Could be migration data (MIGRATION type) or real adjustments
+  // Backend checks the referenceType, but frontend treats as warning
+  if (movements > 0) {
+    warnings.push({
+      type: 'movements',
+      label: `${movements} catatan stok`,
+      icon: 'Activity',
+    })
+  }
+  
+  // Compositions: Could be auto 1:1 links (safe) or manual BOM (should block)
+  // Since frontend can't distinguish, we treat as warning (consistent with backend
+  // which allows deletion and cleans up auto-links)
+  if (compositions > 0) {
+    warnings.push({
+      type: 'compositions',
+      label: `${compositions} link produk`,
+      icon: 'Package',
+    })
+  }
+  
+  // Determine status based on DEFIMATE BLOCKERS first
+  const hasBlockers = blockers.length > 0
+  const hasWarnings = warnings.length > 0
+  const totalRelations = compositions + purchaseItems + movements + transferItems + consumptionSnapshots
+  
+  // ── CASE 1: No relations at all → SAFE ──
+  if (totalRelations === 0) {
+    return {
+      canDelete: true,
+      riskLevel: 'safe',
+      label: 'Bisa Dihapus',
+      description: 'Item tidak memiliki histori, aman untuk dihapus',
+      blockers: [],
+    }
+  }
+  
+  // ── CASE 2: Has definite blockers (real business history) → BLOCKED ──
+  if (hasBlockers) {
+    return {
+      canDelete: false,
+      riskLevel: 'blocked',
+      label: 'Tidak Bisa Dihapus',
+      description: `Item memiliki histori bisnis: ${blockers.map(b => b.label).join(', ')}`,
+      blockers,
+    }
+  }
+  
+  // ── CASE 3: Only soft warnings (migration data / auto links) → WARNING ──
+  // This means only movements and/or compositions, no real business history
+  // Backend WILL allow deletion and clean up this data
+  if (hasWarnings) {
+    return {
+      canDelete: true,
+      riskLevel: 'warning',
+      label: 'Hapus + Bersihkan',
+      description: `Item hanya memiliki data sistem (${warnings.map(w => w.label).join(', ')}) yang akan dibersihkan otomatis`,
+      blockers: [],
+    }
+  }
+  
+  // Fallback (shouldn't reach here, but just in case)
+  return {
+    canDelete: true,
+    riskLevel: 'safe',
+    label: 'Bisa Dihapus',
+    description: 'Item dapat dihapus',
+    blockers: [],
+  }
+}
+
+// Edit Block Status - determines if editing should be disabled for inventory items
+interface EditBlockStatus {
+  isBlocked: boolean
+  reason: string | null
+  blockType: 'archived' | 'hasSales' | 'hasTransfers' | null
+}
+
+function getEditBlockStatus(item: InventoryItem): EditBlockStatus {
+  // Condition 1: Item is non-active (archived)
+  if (item.status === 'ARCHIVED') {
+    return {
+      isBlocked: true,
+      reason: 'Item non-aktif. Aktifkan kembali untuk mengedit.',
+      blockType: 'archived',
+    }
+  }
+  
+  const c = item._count || {}
+  const consumptionSnapshots = c.consumptionSnapshots || 0
+  const transferItems = c.inventoryTransferItems || 0
+  
+  // Condition 2: Has sales transactions
+  if (consumptionSnapshots > 0) {
+    return {
+      isBlocked: true,
+      reason: `Item memiliki ${consumptionSnapshots} riwayat penjualan. Tidak bisa diedit.`,
+      blockType: 'hasSales',
+    }
+  }
+  
+  // Condition 3: Has inter-outlet transfers
+  if (transferItems > 0) {
+    return {
+      isBlocked: true,
+      reason: `Item memiliki ${transferItems} riwayat transfer antar outlet. Tidak bisa diedit.`,
+      blockType: 'hasTransfers',
+    }
+  }
+  
+  // Editing is allowed
+  return {
+    isBlocked: false,
+    reason: null,
+    blockType: null,
+  }
+}
+
 // Animation variants
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -407,6 +643,8 @@ export default function PurchasePage() {
   const [poDetailLoading, setPoDetailLoading] = useState(false)
   const [poDetailHasLinked, setPoDetailHasLinked] = useState(false)
   const [poDetailHasUsageHistory, setPoDetailHasUsageHistory] = useState(false)
+  // Track real business history for consistent edit/disable logic with table
+  const [poDetailHasRealBusinessHistory, setPoDetailHasRealBusinessHistory] = useState(false)
 
   // Purchase create dialog
   const [poCreateOpen, setPoCreateOpen] = useState(false)
@@ -581,8 +819,9 @@ export default function PurchasePage() {
   const [invEditExcelOpen, setInvEditExcelOpen] = useState(false)
   const [invEditExcelFile, setInvEditExcelFile] = useState<File | null>(null)
   const [invEditExcelUploading, setInvEditExcelUploading] = useState(false)
+  const [invEditExcelProgress, setInvEditExcelProgress] = useState<string>('') // Progress message
   const [invEditExcelResult, setInvEditExcelResult] = useState<{
-    updated: number; notFound: number; errors: string[]
+    updated: number; notFound: number; errors: string[]; warnings: string[]
   } | null>(null)
   const [invEditExcelDragOver, setInvEditExcelDragOver] = useState(false)
 
@@ -594,6 +833,11 @@ export default function PurchasePage() {
   const [catFormLoading, setCatFormLoading] = useState(false)
   const [deleteCatId, setDeleteCatId] = useState<string | null>(null)
   const [deletingCat, setDeletingCat] = useState(false)
+  // Category edit & bulk delete states
+  const [editingCatId, setEditingCatId] = useState<string | null>(null)
+  const [selectedCatIds, setSelectedCatIds] = useState<Set<string>>(new Set())
+  const [bulkDeleteCatsOpen, setBulkDeleteCatsOpen] = useState(false)
+  const [bulkDeletingCats, setBulkDeletingCats] = useState(false)
 
   // Purchase summary (ratio)
   const [purchaseSummary, setPurchaseSummary] = useState<PurchaseSummary | null>(null)
@@ -602,6 +846,7 @@ export default function PurchasePage() {
 
   // Post as Product feature
   const [selectedInvIds, setSelectedInvIds] = useState<Set<string>>(new Set())
+  const [allInvIds, setAllInvIds] = useState<string[]>([]) // All item IDs across pages for select-all
   const [postProductOpen, setPostProductOpen] = useState(false)
   const [postMode, setPostMode] = useState<'select'|'composition'|'retail'>('select')
   const [postStep, setPostStep] = useState<1|2|3>(1)
@@ -693,6 +938,8 @@ export default function PurchasePage() {
         const pageItems = sorted.slice(start, start + invPerPage)
         setInvList(pageItems)
         setInvTotalPages(totalPages)
+        // Store all IDs for select-all functionality
+        setAllInvIds(sorted.map(i => i.id))
         // Client-side stats
         const totalValue = allItems.reduce((sum, i) => sum + i.stock * i.avgCost, 0)
         const lowStockCount = allItems.filter(i => i.stock <= i.lowStockAlert).length
@@ -841,6 +1088,8 @@ export default function PurchasePage() {
     setPoDetailLoading(true)
     setPoDetailHasLinked(!!po.hasLinkedItems)
     setPoDetailHasUsageHistory(!!po.hasUsageHistory)
+    // Sync with table logic - use same hasRealBusinessHistory flag
+    setPoDetailHasRealBusinessHistory(!!po.hasRealBusinessHistory)
     try {
       const res = await fetch(`/api/purchases/${po.id}`)
       if (res.ok) {
@@ -1862,6 +2111,18 @@ export default function PurchasePage() {
   }
 
   // Pre-fetch inventory item details when opening delete dialog
+  // LOGIC FULLY ALIGNED WITH BACKEND API (/api/inventory/items/[id] DELETE & /api/inventory/items/bulk-delete POST)
+  //
+  // DEFINITE BLOCKERS (CANNOT delete - must use Archive):
+  // - purchaseItems: Real purchase history from supplier
+  // - inventoryTransferItems: Inter-outlet transfer history  
+  // - consumptionSnapshots: Sales/consumption transactions
+  // - realCompositions: Manual BOM recipes (qty != 1)
+  // - realMovements: Non-migration stock adjustments
+  //
+  // SOFT WARNERS (CAN delete - backend will clean up):
+  // - autoCompositions: Auto 1:1 product links (qty=1) - will be cascade deleted
+  // - migrationMovements: Initial stock from migration - will be deleted
   const openDeleteInvDialog = async (id: string) => {
     setDeleteInvId(id)
     setInvDeleteBlocked(null)
@@ -1870,25 +2131,45 @@ export default function PurchasePage() {
       const res = await fetch(`/api/inventory/items/${id}`)
       if (res.ok) {
         const data = await res.json()
-        // Check ALL business history types (not just linked products)
         const counts = data._count || {}
-        const totalHistory = (counts.compositions || 0) + (counts.purchaseItems || 0) + (counts.movements || 0) + (counts.inventoryTransferItems || 0) + (counts.consumptionSnapshots || 0)
-        const hasLinkedProducts = data.linkedProducts && data.linkedProducts.length > 0
-        if (totalHistory > 0 || hasLinkedProducts) {
+        
+        // DEFINITE BLOCKERS - Real business history that CANNOT be deleted
+        const hasPurchaseItems = (counts.purchaseItems || 0) > 0
+        const hasTransfers = (counts.inventoryTransferItems || 0) > 0
+        const hasConsumption = (counts.consumptionSnapshots || 0) > 0
+        
+        // For compositions & movements, we need detailed analysis (like backend does)
+        // But for pre-fetch optimization, we use simple heuristic:
+        // - If ONLY has compositions (no other blockers) → let backend decide
+        // - If has movements → let backend decide (could be migration)
+        const hasCompositions = (counts.compositions || 0) > 0
+        const hasMovements = (counts.movements || 0) > 0
+        
+        // Only block if DEFINITE BLOCKERS exist
+        // Compositions and movements are handled by backend smart-delete logic
+        const shouldBlock = hasPurchaseItems || hasTransfers || hasConsumption
+        
+        if (shouldBlock) {
           const blockers: string[] = []
-          if (counts.compositions > 0) blockers.push(`${counts.compositions} komposisi produk`)
-          if (counts.purchaseItems > 0) blockers.push(`${counts.purchaseItems} riwayat pembelian`)
-          if (counts.movements > 0) blockers.push(`${counts.movements} riwayat stok`)
-          if (counts.inventoryTransferItems > 0) blockers.push(`${counts.inventoryTransferItems} riwayat transfer`)
-          if (counts.consumptionSnapshots > 0) blockers.push(`${counts.consumptionSnapshots} riwayat konsumsi`)
+          if (hasPurchaseItems) blockers.push(`${counts.purchaseItems} riwayat pembelian`)
+          if (hasCompositions) blockers.push(`${counts.compositions} komposisi produk`)
+          if (hasTransfers) blockers.push(`${counts.inventoryTransferItems} riwayat transfer`)
+          if (hasConsumption) blockers.push(`${counts.consumptionSnapshots} riwayat konsumsi`)
+          
           setInvDeleteBlocked({
-            blockType: 'hasHistory',
-            message: 'Item ini memiliki histori bisnis dan tidak dapat dihapus',
+            blockType: hasPurchaseItems ? 'hasPurchases' : 'hasHistory',
+            message: hasPurchaseItems 
+              ? 'Item ini sudah memiliki riwayat pembelian dan tidak dapat dihapus' 
+              : 'Item ini memiliki histori bisnis dan tidak dapat dihapus',
             blockers,
-            suggestion: 'Gunakan "Nonaktifkan" untuk menyembunyikan item tanpa menghapus data.',
-            linkedProducts: hasLinkedProducts ? data.linkedProducts : [],
+            suggestion: hasPurchaseItems
+              ? 'Gunakan "Nonaktifkan" untuk menyembunyikan item tanpa kehilangan data pembelian.'
+              : 'Gunakan "Nonaktifkan" untuk menyembunyikan item tanpa menghapus data.',
+            linkedProducts: [], // No longer blocking on linked products
           })
         }
+        // Jika hanya ada compositions/movements (auto-links/migration) → IZINKAN hapus
+        // Backend smart-delete logic akan membersihkan data otomatis
       }
     } catch {
       // Non-critical — dialog will still work, just without pre-fetched data
@@ -1904,10 +2185,19 @@ export default function PurchasePage() {
     const preFetchedLinked = invDeleteBlocked?.linkedProducts || []
     setInvDeleteBlocked(null)
     try {
+      console.log('[Delete Item] Deleting inventory item:', deleteInvId)
       const res = await fetch(`/api/inventory/items/${deleteInvId}`, { method: 'DELETE' })
+      console.log('[Delete Item] Response status:', res.status, res.statusText)
+      
       if (res.ok) {
-        const data = await res.json().catch(() => ({}))
+        const data = await res.json().catch((err) => {
+          console.error('[Delete Item] Failed to parse response:', err)
+          return {}
+        })
+        console.log('[Delete Item] Response data:', data)
+        
         if (data.blocked) {
+          console.log('[Delete Item] Item blocked:', data.blockers)
           setInvDeleteBlocked({
             blockType: data.blockType || 'hasHistory',
             message: data.message,
@@ -1922,13 +2212,18 @@ export default function PurchasePage() {
           void fetchInventoryItems()
         }
       } else {
-        const data = await res.json().catch(() => ({}))
-        toast.error(data.error || 'Gagal menghapus item')
+        const data = await res.json().catch((err) => {
+          console.error('[Delete Item] Failed to parse error response:', err)
+          return {}
+        })
+        console.error('[Delete Item] Error response:', data)
+        toast.error(data.error || `Gagal menghapus item (HTTP ${res.status})`)
         setDeleteInvId(null)
         setInvDeleteBlocked(null)
       }
-    } catch {
-      toast.error('Gagal menghapus item')
+    } catch (err) {
+      console.error('[Delete Item] Exception:', err)
+      toast.error('Gagal menghapus item - koneksi gagal')
       setDeleteInvId(null)
       setInvDeleteBlocked(null)
     } finally {
@@ -1963,30 +2258,95 @@ export default function PurchasePage() {
   }
 
   const handleInvBulkDelete = async () => {
-    if (selectedInvIds.size === 0) return
+    if (selectedInvIds.size === 0) {
+      console.warn('[Bulk Delete] No items selected!')
+      toast.error('Tidak ada item yang dipilih')
+      return
+    }
     setInvBulkDeleting(true)
     try {
+      const idsArray = Array.from(selectedInvIds)
+      console.log('[Bulk Delete] Attempting to delete', idsArray.length, 'items:', idsArray)
+      
       const res = await fetch('/api/inventory/items/bulk-delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: Array.from(selectedInvIds) }),
+        body: JSON.stringify({ ids: idsArray }),
       })
+      
+      // Log status first for debugging - DETAILED LOGGING
+      console.log('[Bulk Delete] HTTP Status:', res.status, res.statusText)
+      console.log('[Bulk Delete] Response Headers:', Object.fromEntries(res.headers.entries()))
+      
+      const data = await res.json().catch((e) => {
+        console.error('[Bulk Delete] Failed to parse response:', e)
+        return { error: 'Gagal membaca response server' }
+      })
+      
+      // DETAILED LOG - show full response
+      console.log('[Bulk Delete] Full Response:', JSON.stringify({ 
+        status: res.ok, 
+        httpStatus: res.status,
+        data: data 
+      }, null, 2))
+      
       if (res.ok) {
-        const data = await res.json()
-        if (data.blockedCount > 0) {
-          toast.warning(`${data.deletedCount} item dihapus, ${data.blockedCount} dilewati (punya histori)`)
+        if (data.blockedCount > 0 && data.deletedCount > 0) {
+          // Partial success - some deleted, some blocked
+          const blockedList = data.blockedItems?.slice(0, 3).join('; ') || ''
+          const moreMsg = data.blockedCount > 3 ? ` +${data.blockedCount - 3} lainnya` : ''
+          toast.warning(
+            <div className="space-y-1">
+              <p className="font-semibold">{data.deletedCount} dihapus, {data.blockedCount} dilewati</p>
+              <p className="text-[11px] opacity-80">{blockedList}{moreMsg}</p>
+            </div>,
+            { duration: 5000 }
+          )
+        } else if (data.blockedCount > 0 && data.deletedCount === 0) {
+          // All blocked
+          toast.error(
+            <div className="space-y-1">
+              <p className="font-semibold">Semua item tidak dapat dihapus</p>
+              <p className="text-[11px] opacity-80">Item memiliki histori bisnis (pembelian/transaksi). Gunakan Nonaktifkan.</p>
+            </div>,
+            { duration: 5000 }
+          )
+        } else if (data.deletedCount === 0 && data.blockedCount === 0) {
+          // Nothing happened?
+          toast.error('Tidak ada item yang dihapus. Coba refresh halaman.')
         } else {
-          toast.success(`${data.deletedCount} item berhasil dihapus`)
+          // All deleted successfully
+          const msg = data.message || `${data.deletedCount} item berhasil dihapus`
+          const hasMigrationCleaned = msg.includes('migrasi') || msg.includes('dibersihkan')
+          toast.success(
+            <div className="space-y-1">
+              <p className="font-semibold">{data.deletedCount} item berhasil dihapus</p>
+              {hasMigrationCleaned && <p className="text-[11px] opacity-80">Data stok awal & link otomatis dibersihkan</p>}
+            </div>
+          )
         }
         setInvBulkDeleteOpen(false)
         setSelectedInvIds(new Set())
         void fetchInventoryItems()
       } else {
-        const data = await res.json().catch(() => ({}))
-        toast.error(data.error || 'Gagal menghapus item')
+        // HTTP error - show detailed error with HTTP status
+        const errorMsg = data.error || data.details || data.message || `HTTP ${res.status}: Gagal menghapus`
+        console.error('[Bulk Delete] Error:', { httpStatus: res.status, errorMsg, fullResponse: data })
+        
+        toast.error(
+          <div className="space-y-1">
+            <p className="font-semibold">Gagal menghapus item (HTTP {res.status})</p>
+            <p className="text-[11px] opacity-80 break-all">{errorMsg}</p>
+            <p className="text-[9px] opacity-60 mt-1">Detail: {JSON.stringify(data).slice(0, 200)}</p>
+          </div>,
+          { duration: 8000 }
+        )
+        
+        // Keep dialog open so user can see error and retry
       }
-    } catch {
-      toast.error('Gagal menghapus item')
+    } catch (err) {
+      console.error('[Bulk Delete] Exception:', err)
+      toast.error('Gagal menghapus item. Periksa koneksi internet dan coba lagi.')
     } finally {
       setInvBulkDeleting(false)
     }
@@ -2023,24 +2383,127 @@ export default function PurchasePage() {
   const handleInvEditExcelUpload = async () => {
     if (!invEditExcelFile) return
     setInvEditExcelUploading(true)
+    setInvEditExcelProgress('Mengupload & memvalidasi file...')
     setInvEditExcelResult(null)
+    
+    // Set timeout controller (90 seconds max - increased for large files)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 90000)
+    
     try {
       const formData = new FormData()
       formData.append('file', invEditExcelFile)
+      
+      // Progressive status updates based on typical timing
+      const progressSteps = [
+        { delay: 1000, msg: 'Membaca file Excel...' },
+        { delay: 3000, msg: 'Memvalidasi data (ID, stok, HPP)...' },
+        { delay: 6000, msg: 'Mengupdate database (bulk mode)...' },
+        { delay: 15000, msg: 'Masih memproses banyak item...' },
+        { delay: 30000, msg: 'Hampir selesai...' },
+      ]
+      
+      const timers = progressSteps.map(({ delay, msg }) => 
+        setTimeout(() => {
+          if (invEditExcelUploading) setInvEditExcelProgress(msg)
+        }, delay)
+      )
+      
       const res = await fetch('/api/inventory/items/bulk-update-excel', {
         method: 'POST',
         body: formData,
+        signal: controller.signal,
       })
+      
+      // Clear all pending timers
+      clearTimeout(timeoutId)
+      timers.forEach(t => clearTimeout(t))
+      
       const data = await res.json()
+      
       if (res.ok) {
-        setInvEditExcelResult({ updated: data.updated || 0, notFound: data.notFound || 0, errors: data.errors || [] })
+        setInvEditExcelProgress('Selesai!')
+        
+        // Show processing time if available
+        const timeInfo = data.processingTimeMs && data.processingTimeMs > 1000 
+          ? ` (${(data.processingTimeMs / 1000).toFixed(1)}s)` 
+          : ''
+        
+        const warnings = data.warnings || []
+        
+        setInvEditExcelResult({ 
+          updated: data.updated || 0, 
+          notFound: data.notFound || 0, 
+          errors: data.errors || [],
+          warnings: warnings,
+        })
+        
+        // Show toast with result summary
+        if (data.updated > 0 && warnings.length > 0) {
+          // Partial success - some updates, some read-only fields ignored
+          toast.success(
+            <div className="space-y-1.5">
+              <p className="font-semibold">{data.updated} item berhasil diupdate{timeInfo}</p>
+              <p className="text-[11px] text-amber-300/80">
+                ⚠️ {warnings.length} kolom read-only diabaikan (Stok/HPP)
+              </p>
+            </div>,
+            { duration: 6000 }
+          )
+        } else if (data.updated > 0) {
+          toast.success(
+            <div className="space-y-1">
+              <p className="font-semibold">{data.updated} item berhasil diupdate{timeInfo}</p>
+              {data.message && <p className="text-[11px] opacity-80">{data.message}</p>}
+            </div>,
+            { duration: 5000 }
+          )
+        } else if (warnings.length > 0 && data.errors.length === 0) {
+          // Only read-only fields were changed
+          toast.warning(
+            <div className="space-y-1">
+              <p className="font-semibold">Tidak ada perubahan tersimpan</p>
+              <p className="text-[11px]">Kolom Stok & HPP bersifat read-only</p>
+              <p className="text-[10px] opacity-70">Gunakan Stok Opname untuk ubah stok</p>
+            </div>,
+            { duration: 5000 }
+          )
+        } else if (data.errors.length > 0) {
+          toast.error(`${data.errors.length} error ditemukan`)
+        } else {
+          toast.info(data.message || 'Tidak ada perubahan yang dilakukan')
+        }
+        
         void fetchInventoryItems()
       } else {
-        // Fix Bug #11: Show details message for better debugging
-        toast.error(data.details || data.error || 'Gagal mengupdate inventory')
+        // Handle specific error messages
+        const errorMsg = typeof data === 'object' ? (data.details || data.error || data.message || '') : ''
+        
+        if (res.status === 403) {
+          toast.error('Fitur ini hanya tersedia untuk akun Pro ke atas')
+        } else if (res.status === 400) {
+          toast.error(`Error file: ${errorMsg}`)
+        } else if (res.status === 408) {
+          toast.error(errorMsg || 'Timeout: Proses terlalu lama')
+        } else if (res.status === 503) {
+          toast.error('Database sibuk, silakan coba lagi dalam beberapa detik')
+        } else {
+          toast.error(errorMsg || 'Gagal mengupdate inventory')
+        }
+        
+        setInvEditExcelProgress('')
       }
-    } catch {
-      toast.error('Gagal mengupdate inventory')
+    } catch (err) {
+      clearTimeout(timeoutId)
+      console.error('Upload error:', err)
+      
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        toast.error('Timeout: Proses melebihi batas waktu. Coba dengan file lebih keil (maks 200 baris).')
+      } else {
+        toast.error('Gagal mengupload file. Periksa koneksi internet dan coba lagi.')
+      }
+      
+      setInvEditExcelProgress('')
     } finally {
       setInvEditExcelUploading(false)
     }
@@ -2232,6 +2695,109 @@ export default function PurchasePage() {
       setDeletingCat(false)
     }
   }
+
+  // Start editing a category
+  const startEditCategory = (cat: InventoryCategory) => {
+    setEditingCatId(cat.id)
+    setCatFormName(cat.name)
+    setCatFormColor(cat.color)
+  }
+
+  // Cancel editing
+  const cancelEditCategory = () => {
+    setEditingCatId(null)
+    setCatFormName('')
+    setCatFormColor('emerald')
+  }
+
+  // Save edited category
+  const handleEditCategorySave = async () => {
+    if (!editingCatId || !catFormName.trim()) {
+      toast.error('Nama kategori wajib diisi')
+      return
+    }
+    setCatFormLoading(true)
+    try {
+      const res = await fetch(`/api/inventory/categories/${editingCatId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: catFormName, color: catFormColor }),
+      })
+      if (res.ok) {
+        toast.success('Kategori berhasil diperbarui')
+        cancelEditCategory()
+        void fetchCategories()
+      } else {
+        const data = await res.json()
+        toast.error(data.error || 'Gagal memperbarui kategori')
+      }
+    } catch {
+      toast.error('Gagal memperbarui kategori')
+    } finally {
+      setCatFormLoading(false)
+    }
+  }
+
+  // Toggle category selection for bulk delete
+  const toggleCatSelection = (catId: string) => {
+    setSelectedCatIds(prev => {
+      const next = new Set(prev)
+      if (next.has(catId)) {
+        next.delete(catId)
+      } else {
+        next.add(catId)
+      }
+      return next
+    })
+  }
+
+  // Select/deselect all categories
+  const toggleSelectAllCats = () => {
+    if (selectedCatIds.size === categories.length) {
+      setSelectedCatIds(new Set())
+    } else {
+      setSelectedCatIds(new Set(categories.map(c => c.id)))
+    }
+  }
+
+  // Bulk delete categories
+  const handleBulkDeleteCategories = async () => {
+    if (selectedCatIds.size === 0) return
+    setBulkDeletingCats(true)
+    try {
+      const deletePromises = Array.from(selectedCatIds).map(id =>
+        fetch(`/api/inventory/categories/${id}`, { method: 'DELETE' })
+      )
+      const results = await Promise.all(deletePromises)
+      const allOk = results.every(r => r.ok)
+      if (allOk) {
+        const deletedIds = Array.from(selectedCatIds)
+        toast.success(`${selectedCatIds.size} kategori berhasil dihapus`)
+        setSelectedCatIds(new Set())
+        setBulkDeleteCatsOpen(false)
+        if (deletedIds.some(id => id === invCategoryFilter)) {
+          setInvCategoryFilter('all')
+        }
+        void fetchCategories()
+      } else {
+        toast.error('Beberapa kategori gagal dihapus')
+      }
+    } catch {
+      toast.error('Gagal menghapus kategori')
+    } finally {
+      setBulkDeletingCats(false)
+    }
+  }
+
+  // Reset category dialog state when opened/closed
+  useEffect(() => {
+    if (!categoryDialogOpen) {
+      setEditingCatId(null)
+      setSelectedCatIds(new Set())
+      setCatFormName('')
+      setCatFormColor('emerald')
+    }
+  }, [categoryDialogOpen])
 
   // ══════════════════════════════════════════════════════════
   // Post as Product: handlers
@@ -2467,10 +3033,13 @@ export default function PurchasePage() {
   }
 
   const toggleSelectAllInv = () => {
-    if (invList.every(i => selectedInvIds.has(i.id))) {
+    // Check if ALL items (across all pages) are selected
+    if (allInvIds.length > 0 && allInvIds.every(id => selectedInvIds.has(id))) {
+      // Deselect all
       setSelectedInvIds(new Set())
     } else {
-      setSelectedInvIds(new Set(invList.map(i => i.id)))
+      // Select all items across all pages
+      setSelectedInvIds(new Set(allInvIds))
     }
   }
 
@@ -2539,7 +3108,7 @@ export default function PurchasePage() {
               className="text-xs font-medium h-7 rounded-md data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-slate-400 px-3 gap-1.5"
             >
               <ShoppingCart className="h-3 w-3" />
-              Pembelian
+              Pembelian & Inventori
             </TabsTrigger>
             <TabsTrigger
               value="inventory"
@@ -2642,127 +3211,120 @@ export default function PurchasePage() {
               </div>
             )}
 
-            {/* Panduan Alur Pembelian - dengan Pulse Highlight */}
+            {/* Panduan Alur Pembelian — Linear / Stripe / Mercury Style */}
             <div className={cn(
-              "rounded-xl border overflow-hidden transition-all duration-300",
-              showPurchaseGuide 
-                ? "bg-white/[0.02] border-white/[0.06]" 
-                : "bg-gradient-to-r from-amber-500/[0.08] via-orange-500/[0.05] to-yellow-500/[0.08] border-amber-500/30 shadow-lg shadow-amber-500/5"
+              "rounded-lg border transition-all duration-200",
+              showPurchaseGuide
+                ? "bg-white/[0.03] border-white/[0.08]"
+                : "bg-white/[0.02] border-white/[0.06] hover:border-white/[0.1]"
             )}>
               <button
-                className="w-full flex items-center justify-between gap-2 p-3 text-left hover:bg-white/[0.03] transition-colors relative"
+                className="w-full flex items-center justify-between px-4 py-3 text-left group"
                 onClick={() => setShowPurchaseGuide(prev => !prev)}
               >
-                {/* Pulse indicator when closed */}
-                {!showPurchaseGuide && (
-                  <span className="absolute top-2 right-2 flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
-                  </span>
-                )}
-                <div className="flex items-center gap-2">
-                  <div className={cn(
-                    "flex items-center justify-center w-6 h-6 rounded-md transition-colors",
-                    showPurchaseGuide ? "bg-emerald-500/10" : "bg-amber-500/15 animate-pulse"
-                  )}>
-                    <Info className={cn(
-                      "h-3.5 w-3.5 shrink-0 transition-colors",
-                      showPurchaseGuide ? "text-emerald-400" : "text-amber-400"
-                    )} />
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center justify-center w-7 h-7 rounded-md bg-white/[0.04]">
+                    <BookOpen className="h-3.5 w-3.5 text-slate-400 group-hover:text-slate-200 transition-colors" />
                   </div>
-                  <span className={cn(
-                    "text-[11px] font-medium transition-colors",
-                    showPurchaseGuide ? "text-slate-300" : "text-amber-300"
-                  )}>Panduan Pembelian & Inventory</span>
-                  {!showPurchaseGuide && (
-                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-medium animate-pulse">
-                      NEW
-                    </span>
-                  )}
+                  <div>
+                    <span className="text-xs font-medium text-slate-200 group-hover:text-white transition-colors">Panduan Pembelian</span>
+                    <p className="text-[11px] text-slate-500 mt-px">4 langkah untuk mencatat pembelian</p>
+                  </div>
                 </div>
-                <ChevronDown className={cn('h-3.5 w-3.5 text-slate-500 transition-transform duration-200', showPurchaseGuide && 'rotate-180')} />
+                <ChevronDown className={cn(
+                  'h-4 w-4 text-slate-500 transition-transform duration-200',
+                  showPurchaseGuide ? 'rotate-180 text-slate-300' : ''
+                )} />
               </button>
+
               {showPurchaseGuide && (
-                <div className="px-3 pb-3 space-y-3 border-t border-white/[0.04] pt-3">
+                <div className="px-4 pb-4 space-y-0">
+                  <div className="h-px bg-white/[0.06] -mx-4 mb-4" />
+
                   {/* Step 1 */}
-                  <div className="flex gap-2.5">
-                    <div className="w-4 h-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">1</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium mb-0.5">Tambah Item ke Pembelian</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed">
-                        Klik <span className="text-white bg-white/[0.06] px-1 py-0.5 rounded text-[9px] font-mono">Buat Pembelian</span> lalu gunakan input bar untuk mencari item. Ketik nama item, scan barcode, atau pisahkan beberapa item dengan <span className="text-white bg-white/[0.06] px-1 py-0.5 rounded text-[9px] font-mono">koma</span>.
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">1</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Tambah Item ke Pembelian</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Klik <code className="px-1.5 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[11px] font-mono">Buat Pembelian</code> lalu gunakan input bar untuk mencari item. Ketik nama, scan barcode, atau pisahkan beberapa item dengan <code className="px-1.5 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[11px] font-mono">koma</code>.
                       </p>
                     </div>
                   </div>
+                  <div className="h-px bg-white/[0.04] -mx-4" />
+
                   {/* Step 2 */}
-                  <div className="flex gap-2.5">
-                    <div className="w-4 h-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">2</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium mb-0.5">Item Baru? Isi SKU &amp; Satuan</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed">
-                        Jika item <span className="text-amber-400">belum ada di inventory</span>, form akan muncul otomatis. Kamu <span className="text-white">wajib isi SKU</span> (kode unik) dan <span className="text-white">pilih satuan</span> (kg, gr, ml, liter, pcs, dll). Item ini berstatus <span className="text-amber-400">pending</span> — belum tersimpan sampai pembelian disimpan.
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">2</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Item Baru? Isi SKU &amp; Satuan</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Jika item belum ada di inventory, form akan muncul otomatis. Wajib isi <span className="text-slate-200 font-medium">SKU</span> (kode unik) dan <span className="text-slate-200 font-medium">pilih satuan</span> (kg, gr, ml, liter, pcs, dll). Item berstatus pending sampai pembelian disimpan.
                       </p>
                     </div>
                   </div>
+                  <div className="h-px bg-white/[0.04] -mx-4" />
+
                   {/* Step 3 */}
-                  <div className="flex gap-2.5">
-                    <div className="w-4 h-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">3</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium mb-0.5">Isi Detail Pembelian</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed">
-                        Untuk tiap item, isi:
-                      </p>
-                      <div className="mt-1.5 grid grid-cols-2 gap-1.5">
-                        <div className="rounded-md bg-white/[0.03] border border-white/[0.04] px-2 py-1.5">
-                          <p className="text-[9px] text-slate-600 uppercase tracking-wider">Satuan Beli</p>
-                          <p className="text-[10px] text-slate-400">Cth: <span className="text-white">sak</span>, <span className="text-white">ekor</span>, <span className="text-white">karung</span></p>
-                        </div>
-                        <div className="rounded-md bg-white/[0.03] border border-white/[0.04] px-2 py-1.5">
-                          <p className="text-[9px] text-slate-600 uppercase tracking-wider">Jumlah</p>
-                          <p className="text-[10px] text-slate-400">Berapa <span className="text-white">satuan beli</span> yang dibeli</p>
-                        </div>
-                        <div className="rounded-md bg-white/[0.03] border border-white/[0.04] px-2 py-1.5">
-                          <p className="text-[9px] text-slate-600 uppercase tracking-wider">Isi / Unit</p>
-                          <p className="text-[10px] text-slate-400">Isi per 1 satuan beli (dalam <span className="text-white">base unit</span>)</p>
-                        </div>
-                        <div className="rounded-md bg-white/[0.03] border border-white/[0.04] px-2 py-1.5">
-                          <p className="text-[9px] text-slate-600 uppercase tracking-wider">Harga / Unit</p>
-                          <p className="text-[10px] text-slate-400">Harga per 1 <span className="text-white">satuan beli</span> (Rp)</p>
-                        </div>
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">3</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Isi Detail Pembelian</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed mb-3">Untuk tiap item, isi kolom berikut:</p>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        {[
+                          { label: 'Satuan Beli', desc: 'Cth: sak, ekor, dus' },
+                          { label: 'Jumlah', desc: 'Jml satuan beli' },
+                          { label: 'Isi / Unit', desc: 'Isi per satuan (base)' },
+                          { label: 'Harga / Unit', desc: 'Harga per satuan beli' },
+                        ].map((f) => (
+                          <div key={f.label} className="rounded-md bg-white/[0.02] border border-white/[0.04] px-3 py-2">
+                            <p className="text-[10px] text-slate-500 uppercase tracking-wide font-medium">{f.label}</p>
+                            <p className="text-[11px] text-slate-300 mt-0.5">{f.desc}</p>
+                          </div>
+                        ))}
                       </div>
                     </div>
                   </div>
+                  <div className="h-px bg-white/[0.04] -mx-4" />
+
                   {/* Step 4 */}
-                  <div className="flex gap-2.5">
-                    <div className="w-4 h-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">4</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium mb-0.5">Simpan &amp; Stok Otomatis Masuk</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed">
-                        Klik <span className="text-white bg-white/[0.06] px-1 py-0.5 rounded text-[9px] font-mono">Simpan Pembelian</span>. Stok otomatis bertambah dan <span className="text-white">HPP dihitung otomatis</span>.
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">4</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Simpan &amp; Stok Otomatis Masuk</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Klik <code className="px-1.5 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[11px] font-mono">Simpan Pembelian</code>. Stok otomatis bertambah dan HPP dihitung otomatis.
                       </p>
-                      <div className="mt-1.5 rounded-md bg-amber-500/[0.04] border border-amber-500/10 px-2.5 py-2">
-                        <p className="text-[10px] text-amber-400/80 font-medium mb-0.5">📐 Rumus HPP</p>
-                        <p className="text-[10px] text-slate-500 font-mono">HPP = Harga per Satuan Beli ÷ Isi per Unit</p>
-                        <p className="text-[10px] text-slate-600 mt-1">Cth: Beli 1 sak @ Rp90.000, isi 25kg → HPP = Rp90.000 ÷ 25 = <span className="text-amber-400">Rp3.600/kg</span></p>
+                      {/* Formula — Stripe-style callout */}
+                      <div className="mt-3 rounded-md bg-white/[0.02] border border-white/[0.06] border-l-2 border-l-amber-500/60 px-3 py-2.5">
+                        <p className="text-[10px] text-slate-500 uppercase tracking-wide font-medium mb-1">Rumus HPP</p>
+                        <code className="text-[11px] text-slate-300 font-mono">HPP = Harga per Satuan Beli ÷ Isi per Unit</code>
+                        <p className="text-[11px] text-slate-500 mt-1.5">Contoh: 1 sak @ Rp90.000, isi 25kg → HPP = <span className="text-slate-200 font-medium">Rp3.600/kg</span></p>
                       </div>
                     </div>
                   </div>
-                  {/* Tips */}
-                  <div className="rounded-md bg-white/[0.02] border border-white/[0.04] px-2.5 py-2">
-                    <p className="text-[10px] text-slate-600 mb-1 font-medium uppercase tracking-wider">Tips</p>
-                    <ul className="text-[10px] text-slate-500 space-y-0.5">
-                      <li>• Scan barcode langsung dari input bar — tidak perlu tekan Enter</li>
-                      <li>• Ketik beberapa nama pisah <span className="text-white">koma</span> untuk tambah banyak item sekaligus</li>
-                      <li>• Item baru muncul dengan badge <span className="text-amber-400">Baru</span> — bisa di-ganti sebelum simpan</li>
-                      <li>• Pembelian yang sudah terkait produk tidak bisa dihapus</li>
+
+                  {/* Tips — minimal list */}
+                  <div className="mt-1 rounded-md bg-white/[0.02] border border-white/[0.06] px-3 py-2.5">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wide font-medium mb-2">Tips</p>
+                    <ul className="text-[11px] text-slate-400 space-y-1.5">
+                      <li className="flex items-start gap-2">
+                        <span className="text-slate-600 mt-1">—</span>
+                        <span>Scan barcode langsung dari input bar, tidak perlu tekan Enter</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-slate-600 mt-1">—</span>
+                        <span>Pisahkan beberapa nama item dengan <code className="px-1 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[10px] font-mono">koma</code> untuk tambah sekaligus</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-slate-600 mt-1">—</span>
+                        <span>Item baru muncul dengan badge <span className="text-amber-400 font-medium">Baru</span>, bisa diganti sebelum simpan</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-red-400/70 mt-1">!</span>
+                        <span>Pembelian yang sudah terkait produk <span className="text-slate-200 font-medium">tidak bisa dihapus</span></span>
+                      </li>
                     </ul>
                   </div>
                 </div>
@@ -2849,8 +3411,25 @@ export default function PurchasePage() {
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                className="h-7 px-2 text-slate-400 hover:text-white hover:bg-white/[0.04]"
-                                onClick={() => openPoEdit(po)}
+                                className={cn(
+                                  "h-7 px-2 transition-colors",
+                                  po.hasRealBusinessHistory
+                                    ? "text-slate-600 cursor-not-allowed"
+                                    : "text-slate-400 hover:text-white hover:bg-white/[0.04]"
+                                )}
+                                onClick={() => {
+                                  if (po.hasRealBusinessHistory) {
+                                    toast.error('Pembelian memiliki riwayat bisnis (transfer/penjualan) — tidak bisa diedit')
+                                    return
+                                  }
+                                  openPoEdit(po)
+                                }}
+                                disabled={po.hasRealBusinessHistory}
+                                title={
+                                  po.hasRealBusinessHistory
+                                    ? 'Ada riwayat transfer/penjualan'
+                                    : 'Edit pembelian'
+                                }
                               >
                                 <Pencil className="h-3.5 w-3.5" />
                               </Button>
@@ -2860,22 +3439,29 @@ export default function PurchasePage() {
                                 size="sm"
                                 className={cn(
                                   "h-7 px-2 hover:text-red-300 hover:bg-red-500/[0.06]",
-                                  (po.hasLinkedItems || po.hasUsageHistory) 
+                                  (po.hasRealBusinessHistory || po.hasUsageHistory) 
                                     ? "opacity-50 cursor-not-allowed text-red-400/50" 
-                                    : "text-red-400"
+                                    : po.hasProductLinks
+                                      ? "text-amber-400 hover:text-amber-300 hover:bg-amber-500/[0.06]"
+                                      : "text-red-400"
                                 )}
                                 onClick={() => {
-                                  if (po.hasLinkedItems || po.hasUsageHistory) {
-                                    toast.error('Sudah ada link ke produk/pembelian/transfer — tidak bisa dihapus')
+                                  if (po.hasRealBusinessHistory || po.hasUsageHistory) {
+                                    toast.error('Pembelian memiliki riwayat bisnis — tidak bisa dihapus')
                                     return
+                                  }
+                                  if (po.hasProductLinks) {
+                                    toast.warning('Link ke produk akan dibersihkan otomatis')
                                   }
                                   setDeletePoId(po.id)
                                 }}
-                                disabled={po.hasLinkedItems || po.hasUsageHistory}
+                                disabled={po.hasRealBusinessHistory || po.hasUsageHistory}
                                 title={
-                                  (po.hasLinkedItems || po.hasUsageHistory)
-                                    ? 'Sudah ada link ke produk/pembelian/transfer'
-                                    : 'Hapus pembelian'
+                                  (po.hasRealBusinessHistory || po.hasUsageHistory)
+                                    ? 'Ada riwayat bisnis — tidak bisa dihapus'
+                                    : po.hasProductLinks
+                                      ? 'Hapus (link produk akan dibersihkan)'
+                                      : 'Hapus pembelian'
                                 }
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
@@ -2892,22 +3478,22 @@ export default function PurchasePage() {
             </div>
 
             {/* Mobile Cards */}
-            <div className="md:hidden space-y-2">
+            <div className="md:hidden space-y-3">
               {poList.length === 0 ? (
                 <Card className="bg-nebula border-white/[0.06] rounded-xl">
                   <CardContent className="py-12 text-center">
                     <div className="flex flex-col items-center">
-                      <div className="w-12 h-12 rounded-2xl bg-white/[0.04] flex items-center justify-center mb-3">
-                        <ShoppingCart className="h-6 w-6 text-slate-600" />
+                      <div className="w-14 h-14 rounded-2xl bg-white/[0.04] flex items-center justify-center mb-3">
+                        <ShoppingCart className="h-7 w-7 text-slate-600" />
                       </div>
-                      <p className="text-sm text-slate-400 mb-1">Belum ada pembelian</p>
+                      <p className="text-sm text-slate-400 mb-1 font-medium">Belum ada pembelian</p>
                       <p className="text-xs text-slate-600 mb-4">Catat pembelian pertama untuk mulai melacak stok</p>
                       <Button
                         size="sm"
                         onClick={() => { resetPoCreateForm(); openPoCreate() }}
-                        className="theme-bg theme-hover text-white text-xs h-8 px-4 rounded-lg gap-1.5"
+                        className="theme-bg theme-hover text-white text-xs h-9 px-5 rounded-lg gap-1.5"
                       >
-                        <Plus className="h-3.5 w-3.5" />
+                        <Plus className="h-4 w-4" />
                         Buat Pembelian
                       </Button>
                     </div>
@@ -2915,86 +3501,133 @@ export default function PurchasePage() {
                 </Card>
               ) : (
                 <AnimatePresence>
-                  {poList.map((po) => (
+                  {poList.map((po) => {
+                    // Determine card accent based on expiry status
+                    const hasExpiredItems = po._batchSummary?.expiredItems > 0
+                    const hasExpiringSoon = po._batchSummary?.nearestExp && !hasExpiredItems
+                    
+                    return (
                     <motion.div
                       key={po.id}
                       initial={{ opacity: 0, y: 8 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, y: -8 }}
-                      transition={{ duration: 0.2 }}
+                      transition={{ duration: 0.15 }}
                     >
-                      <Card className="bg-nebula border-white/[0.06] rounded-xl hover:border-white/[0.1] transition-colors">
-                        <CardContent className="p-3 space-y-2">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-xs text-white font-medium font-mono truncate">{po.orderNumber}</span>
-                            <div className="flex items-center gap-0.5 shrink-0">
-                              <span className="text-[11px] text-emerald-400 font-medium mr-1">{formatCurrency(po.totalCost)}</span>
-                              <button
-                                className="w-7 h-7 rounded-md flex items-center justify-center text-slate-500 hover:text-white hover:bg-white/[0.06] transition-colors"
-                                onClick={() => openPoDetail(po)}
-                              >
-                                <Eye className="h-3.5 w-3.5" />
-                              </button>
-                              <button
-                                className="w-7 h-7 rounded-md flex items-center justify-center text-slate-500 hover:text-white hover:bg-white/[0.06] transition-colors"
-                                onClick={() => openPoEdit(po)}
-                              >
-                                <Pencil className="h-3.5 w-3.5" />
-                              </button>
-                              {isOwner && (
+                      {/* Compact Mobile Card - Single Row Layout */}
+                      <div className={cn(
+                        "flex items-center gap-3 p-3 rounded-xl border transition-colors active:bg-white/[0.03]",
+                        hasExpiredItems ? "bg-red-500/[0.04] border-red-500/20" : 
+                        hasExpiringSoon ? "bg-amber-500/[0.03] border-amber-500/18" : 
+                        "bg-white/[0.02] border-white/[0.06]"
+                      )}>
+                        {/* Icon */}
+                        <div className={cn(
+                          "w-9 h-9 rounded-lg flex items-center justify-center shrink-0",
+                          hasExpiredItems ? "bg-red-500/10" : hasExpiringSoon ? "bg-amber-500/10" : "bg-white/[0.04]"
+                        )}>
+                          <FileText className={cn(
+                            "h-4 w-4",
+                            hasExpiredItems ? "text-red-400" : hasExpiringSoon ? "text-amber-400" : "text-slate-500"
+                          )} />
+                        </div>
+
+                        {/* Main Content - Flexible */}
+                        <div className="flex-1 min-w-0">
+                          {/* PO Number + Badges */}
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm text-white font-semibold font-mono truncate">{po.orderNumber}</span>
+                            {po.hasProductLinks && (
+                              <span className="inline-flex items-center px-1.5 py-0 rounded bg-violet-500/15 text-violet-400 text-[9px] font-bold shrink-0">
+                                <Sparkles className="h-2.5 w-2.5 mr-0.5" />
+                                Produk
+                              </span>
+                            )}
+                          </div>
+                          {/* Supplier + Items + Date - Single Line */}
+                          <div className="flex items-center gap-2 mt-0.5 text-slate-500">
+                            <span className="text-[11px] truncate max-w-[100px]">{po.supplierName || '-'}</span>
+                            <span className="text-[10px]">•</span>
+                            <span className="text-[11px]">{po.itemCount ?? po._count?.items ?? 0} item</span>
+                            <span className="text-[10px]">•</span>
+                            <span className="text-[10px]">{formatDate(po.createdAt).split(' ')[0]}</span>
+                          </div>
+                        </div>
+
+                        {/* Right Side - Price + Actions */}
+                        <div className="flex items-center gap-2 shrink-0">
+                          <div className="text-right">
+                            <span className="text-sm font-bold text-emerald-400 tabular-nums block leading-tight">{formatCurrency(po.totalCost)}</span>
+                            {po._batchSummary?.expiredItems > 0 && (
+                              <span className="text-[9px] text-red-400 font-medium">Expired!</span>
+                            )}
+                          </div>
+                          
+                          {/* Action Buttons - Compact */}
+                          <div className="flex items-center gap-0.5">
+                            <button
+                              className="w-8 h-8 rounded-lg flex items-center justify-center text-slate-500 hover:text-sky-400 hover:bg-sky-500/10 transition-colors"
+                              onClick={() => openPoDetail(po)}
+                            >
+                              <Eye className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              className={cn(
+                                "w-8 h-8 rounded-lg flex items-center justify-center transition-colors",
+                                po.hasRealBusinessHistory
+                                  ? "text-slate-700 cursor-not-allowed"
+                                  : "text-slate-500 hover:text-white hover:bg-white/[0.06]"
+                              )}
+                              onClick={() => {
+                                if (po.hasRealBusinessHistory) {
+                                  toast.error('Pembelian memiliki riwayat bisnis — tidak bisa diedit')
+                                  return
+                                }
+                                openPoEdit(po)
+                              }}
+                              disabled={po.hasRealBusinessHistory}
+                              title={po.hasRealBusinessHistory ? 'Ada riwayat bisnis' : 'Edit'}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            {isOwner && (
                               <button
                                 className={cn(
-                                  "w-7 h-7 rounded-md flex items-center justify-center transition-colors",
-                                  (po.hasLinkedItems || po.hasUsageHistory)
-                                    ? "text-red-400/30 cursor-not-allowed"
-                                    : "text-slate-500 hover:text-red-400 hover:bg-red-500/[0.06]"
+                                  "w-8 h-8 rounded-lg flex items-center justify-center transition-colors",
+                                  (po.hasRealBusinessHistory || po.hasUsageHistory)
+                                    ? "text-red-400/20 cursor-not-allowed"
+                                    : po.hasProductLinks
+                                      ? "text-amber-400 hover:text-amber-300 hover:bg-amber-500/[0.08]"
+                                      : "text-slate-500 hover:text-red-400 hover:bg-red-500/[0.06]"
                                 )}
-                                onClick={() => !(po.hasLinkedItems || po.hasUsageHistory) && setDeletePoId(po.id)}
-                                disabled={po.hasLinkedItems || po.hasUsageHistory}
+                                onClick={() => {
+                                  if (po.hasRealBusinessHistory || po.hasUsageHistory) {
+                                    toast.error('Pembelian memiliki riwayat bisnis — tidak bisa dihapus')
+                                    return
+                                  }
+                                  if (po.hasProductLinks) {
+                                    toast.warning('Link ke produk akan dibersihkan otomatis')
+                                  }
+                                  setDeletePoId(po.id)
+                                }}
+                                disabled={po.hasRealBusinessHistory || po.hasUsageHistory}
                                 title={
-                                  (po.hasLinkedItems || po.hasUsageHistory)
-                                    ? 'Sudah ada link ke produk/pembelian/transfer'
-                                    : 'Hapus'
+                                  (po.hasRealBusinessHistory || po.hasUsageHistory)
+                                    ? 'Ada riwayat bisnis'
+                                    : po.hasProductLinks
+                                      ? 'Hapus (link dibersihkan)'
+                                      : 'Hapus'
                                 }
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
                               </button>
-                              )}
-                            </div>
-                          </div>
-                          <div className="flex items-center justify-between text-slate-400">
-                            <span className="text-[11px]">{po.supplierName || '-'}</span>
-                            <span className="text-[11px]">{formatDate(po.createdAt)}</span>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <div className="flex items-center gap-1.5 text-slate-500">
-                              <Package className="h-3 w-3" />
-                              <span className="text-[11px]">{po.itemCount ?? po._count?.items ?? 0} item</span>
-                            </div>
-                            {po._batchSummary && (po._batchSummary.itemsWithBatch > 0 || po._batchSummary.itemsWithExp > 0) && (
-                              <div className="flex items-center gap-1">
-                                {po._batchSummary.itemsWithBatch > 0 && (
-                                  <span className="text-[9px] font-mono text-blue-400/70 bg-blue-500/10 px-1.5 py-0.5 rounded leading-none">
-                                    B:{po._batchSummary.sampleBatch || `${po._batchSummary.itemsWithBatch}`}
-                                  </span>
-                                )}
-                                {po._batchSummary.nearestExp && (
-                                  <span className={cn(
-                                    "text-[9px] px-1.5 py-0.5 rounded font-medium leading-none",
-                                    po._batchSummary.expiredItems > 0
-                                      ? "text-red-400 bg-red-500/10"
-                                      : "text-amber-400/70 bg-amber-500/10"
-                                  )}>
-                                    Exp: {formatDate(po._batchSummary.nearestExp).split(' ')[0]}
-                                  </span>
-                                )}
-                              </div>
                             )}
                           </div>
-                        </CardContent>
-                      </Card>
+                        </div>
+                      </div>
                     </motion.div>
-                  ))}
+                  )
+                })}
                 </AnimatePresence>
               )}
             </div>
@@ -3199,138 +3832,148 @@ export default function PurchasePage() {
               </div>
             </div>
 
-            {/* Panduan Alur Inventory - dengan Pulse Highlight */}
+            {/* Panduan Inventory — Linear / Stripe / Mercury Style */}
             <div className={cn(
-              "rounded-xl border overflow-hidden transition-all duration-300",
-              showInventoryGuide 
-                ? "bg-white/[0.02] border-white/[0.06]" 
-                : "bg-gradient-to-r from-cyan-500/[0.08] via-blue-500/[0.05] to-teal-500/[0.08] border-cyan-500/30 shadow-lg shadow-cyan-500/5"
+              "rounded-lg border transition-all duration-200",
+              showInventoryGuide
+                ? "bg-white/[0.03] border-white/[0.08]"
+                : "bg-white/[0.02] border-white/[0.06] hover:border-white/[0.1]"
             )}>
               <button
-                className="w-full flex items-center justify-between gap-2 p-3 text-left hover:bg-white/[0.03] transition-colors relative"
+                className="w-full flex items-center justify-between px-4 py-3 text-left group"
                 onClick={() => setShowInventoryGuide(prev => !prev)}
               >
-                {/* Pulse indicator when closed */}
-                {!showInventoryGuide && (
-                  <span className="absolute top-2 right-2 flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-500"></span>
-                  </span>
-                )}
-                <div className="flex items-center gap-2">
-                  <div className={cn(
-                    "flex items-center justify-center w-6 h-6 rounded-md transition-colors",
-                    showInventoryGuide ? "bg-emerald-500/10" : "bg-cyan-500/15 animate-pulse"
-                  )}>
-                    <Info className={cn(
-                      "h-3.5 w-3.5 shrink-0 transition-colors",
-                      showInventoryGuide ? "text-emerald-400" : "text-cyan-400"
-                    )} />
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center justify-center w-7 h-7 rounded-md bg-white/[0.04]">
+                    <PackageOpen className="h-3.5 w-3.5 text-slate-400 group-hover:text-slate-200 transition-colors" />
                   </div>
-                  <span className={cn(
-                    "text-[11px] font-medium transition-colors",
-                    showInventoryGuide ? "text-slate-300" : "text-cyan-300"
-                  )}>Panduan Inventory &amp; Produk</span>
-                  {!showInventoryGuide && (
-                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 font-medium animate-pulse">
-                      NEW
-                    </span>
-                  )}
+                  <div>
+                    <span className="text-xs font-medium text-slate-200 group-hover:text-white transition-colors">Panduan Inventory</span>
+                    <p className="text-[11px] text-slate-500 mt-px">Kelola stok, kategori, dan kebijakan inventory</p>
+                  </div>
                 </div>
-                <ChevronDown className={cn('h-3.5 w-3.5 text-slate-500 transition-transform duration-200', showInventoryGuide && 'rotate-180')} />
+                <ChevronDown className={cn(
+                  'h-4 w-4 text-slate-500 transition-transform duration-200',
+                  showInventoryGuide ? 'rotate-180 text-slate-300' : ''
+                )} />
               </button>
+
               {showInventoryGuide && (
-                <div className="px-3 pb-3 space-y-3 border-t border-white/[0.04] pt-3">
+                <div className="px-4 pb-4 space-y-0">
+                  <div className="h-px bg-white/[0.06] -mx-4 mb-4" />
+
                   {/* Apa itu Inventory Item */}
-                  <div className="flex gap-2.5">
-                    <div className="w-4 h-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <Package className="h-2.5 w-2.5 text-emerald-400" />
+                  <div className="flex gap-3 py-3">
+                    <div className="flex-shrink-0 mt-px">
+                      <Package className="h-4 w-4 text-slate-500" />
                     </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium mb-0.5">Apa itu Inventory Item?</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed">
-                        Inventory item adalah <span className="text-white">bahan baku atau stok toko</span> yang kamu beli dari supplier. Setiap item punya <span className="text-white">SKU</span> (kode unik), <span className="text-white">base unit</span> (satuan dasar: kg, gr, ml, pcs), <span className="text-white">stok</span>, dan <span className="text-white">HPP</span> (Harga Pokok Penjualan).
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Apa itu Inventory Item?</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Bahan baku atau stok toko yang kamu beli dari supplier. Setiap item punya <code className="px-1 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[10px] font-mono">SKU</code>, <code className="px-1 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[10px] font-mono">base unit</code>, <code className="px-1 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[10px] font-mono">stok</code>, dan <code className="px-1 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[10px] font-mono">HPP</code>.
                       </p>
                     </div>
                   </div>
-                  {/* Cara Stok Masuk */}
-                  <div className="flex gap-2.5">
-                    <div className="w-4 h-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">1</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium mb-0.5">Cara Stok Masuk</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed">
-                        Stok bertambah otomatis saat kamu <span className="text-emerald-400">menyimpan pembelian</span> di tab Pembelian. HPP dihitung otomatis dari rata-rata harga beli. Semua item baru akan otomatis tercatat di inventory saat pembelian disimpan.
+                  <div className="h-px bg-white/[0.04] -mx-4" />
+
+                  {/* Step 1 — Stok Masuk */}
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">1</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Cara Stok Masuk</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Stok bertambah otomatis saat kamu <span className="text-slate-200 font-medium">menyimpan pembelian</span> di tab Pembelian. HPP dihitung otomatis dari rata-rata harga beli.
                       </p>
                     </div>
                   </div>
-                  {/* Post ke Produk */}
-                  <div className="flex gap-2.5">
-                    <div className="w-4 h-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">2</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium mb-0.5">Post ke Produk Jual</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed mb-1.5">
-                        Inventory item bisa dijadikan <span className="text-white">produk jual</span> dengan memilih item → klik <span className="text-white bg-white/[0.06] px-1 py-0.5 rounded text-[9px] font-mono">Post Produk</span>. Ada 2 mode:
+                  <div className="h-px bg-white/[0.04] -mx-4" />
+
+                  {/* Step 2 — Post ke Produk */}
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">2</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Post ke Produk Jual</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed mb-3">
+                        Inventory item bisa dijadikan <span className="text-slate-200 font-medium">produk jual</span> dengan klik <code className="px-1 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[10px] font-mono">Post Produk</code>. Ada 2 mode:
                       </p>
-                      <div className="space-y-1.5">
-                        <div className="rounded-md bg-white/[0.03] border border-white/[0.04] px-2.5 py-1.5">
-                          <p className="text-[10px] text-white font-medium">🍳 Komposisi (F&amp;B)</p>
-                          <p className="text-[10px] text-slate-500">Beberapa item inventory → <span className="text-slate-300">1 produk</span>. Cth: Tepung 200gr + Gula 50gr + Telur 2pcs → Kue Bolu</p>
+                      <div className="space-y-2">
+                        <div className="rounded-md bg-white/[0.02] border border-white/[0.06] border-l-2 border-l-rose-500/50 px-3 py-2.5">
+                          <div className="flex items-center gap-2 mb-1">
+                            <ChefHat className="h-3.5 w-3.5 text-slate-400" />
+                            <p className="text-[11px] font-medium text-slate-200">Komposisi (F&amp;B)</p>
+                          </div>
+                          <p className="text-[11px] text-slate-400 leading-relaxed">Beberapa inventory → 1 produk. Cth: Tepung 200gr + Gula 50gr → Kue Bolu</p>
                         </div>
-                        <div className="rounded-md bg-white/[0.03] border border-white/[0.04] px-2.5 py-1.5">
-                          <p className="text-[10px] text-white font-medium">🛒 Satu-satu (Ritel)</p>
-                          <p className="text-[10px] text-slate-500">1 item inventory → <span className="text-slate-300">1 produk</span> langsung. Cth: Susu UHT 1L → produk Susu UHT 1L dengan harga jual sendiri</p>
+                        <div className="rounded-md bg-white/[0.02] border border-white/[0.06] border-l-2 border-l-blue-500/50 px-3 py-2.5">
+                          <div className="flex items-center gap-2 mb-1">
+                            <ShoppingBag className="h-3.5 w-3.5 text-slate-400" />
+                            <p className="text-[11px] font-medium text-slate-200">Satu-satu (Ritel)</p>
+                          </div>
+                          <p className="text-[11px] text-slate-400 leading-relaxed">1 inventory → 1 produk langsung. Cth: Susu UHT 1L → produk Susu UHT 1L</p>
                         </div>
                       </div>
                     </div>
                   </div>
-                  {/* Kategori */}
-                  <div className="flex gap-2.5">
-                    <div className="w-4 h-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">3</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium mb-0.5">Kategori &amp; Low Stock Alert</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed">
-                        Gunakan <span className="text-white">Kategori</span> untuk mengelompokkan item (Bahan Pokok, Minuman, Bumbu, dll). Set <span className="text-white">Low Stock Alert</span> agar item yang stoknya menipis ditandai <span className="text-red-400">merah</span> di tabel.
+                  <div className="h-px bg-white/[0.04] -mx-4" />
+
+                  {/* Step 3 — Kategori */}
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">3</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Kategori &amp; Low Stock Alert</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Gunakan <span className="text-slate-200 font-medium">Kategori</span> untuk mengelompokkan item. Set <span className="text-slate-200 font-medium">Low Stock Alert</span> agar item yang stoknya menipis ditandai merah.
                       </p>
                     </div>
                   </div>
-                  {/* Kebijakan Hapus vs Nonaktifkan */}
-                  <div className="rounded-md bg-gradient-to-r from-violet-500/[0.06] to-purple-500/[0.04] border border-violet-500/15 px-2.5 py-2">
-                    <p className="text-[10px] text-violet-300 mb-1.5 font-medium uppercase tracking-wider flex items-center gap-1">
-                      <Trash2 className="h-3 w-3" /> Kebijakan Hapus & Nonaktifkan
-                    </p>
-                    <div className="space-y-2">
-                      <div className="rounded-md bg-emerald-500/[0.06] border border-emerald-500/15 px-2 py-1.5">
-                        <p className="text-[10px] text-emerald-400 font-medium mb-0.5">✅ Bisa DIHAPUS</p>
-                        <ul className="text-[9px] text-slate-400 space-y-0.5">
-                          <li>• Item baru tanpa histori sama sekali</li>
-                          <li>• Item yang hanya punya <span className="text-emerald-300">stok awal migrasi</span> (belum ada transaksi)</li>
-                          <li>• Data stok awal & link otomatis akan dibersihkan</li>
+
+                  {/* Kebijakan Hapus vs Nonaktifkan — Stripe-style callout */}
+                  <div className="mt-3 rounded-md bg-white/[0.02] border border-white/[0.06] border-l-2 border-l-violet-500/50 px-3 py-3">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wide font-medium mb-3">Kebijakan Hapus &amp; Nonaktifkan</p>
+                    <div className="space-y-3">
+                      <div>
+                        <div className="flex items-center gap-1.5 mb-1.5">
+                          <CheckCircle2 className="h-3 w-3 text-emerald-400" />
+                          <p className="text-[11px] font-medium text-slate-200">Bisa dihapus</p>
+                        </div>
+                        <ul className="text-[11px] text-slate-400 space-y-1 ml-5">
+                          <li>Item baru tanpa histori sama sekali</li>
+                          <li>Item yang hanya punya stok awal migrasi</li>
+                          <li>Data stok awal &amp; link akan dibersihkan</li>
                         </ul>
                       </div>
-                      <div className="rounded-md bg-red-500/[0.06] border border-red-500/15 px-2 py-1.5">
-                        <p className="text-[10px] text-red-400 font-medium mb-0.5">❌ Harus NONAKTIFKAN</p>
-                        <ul className="text-[9px] text-slate-400 space-y-0.5">
-                          <li>• Item dengan <span className="text-red-300">riwayat pembelian</span> dari supplier</li>
-                          <li>• Item yang sudah <span className="text-red-300">terjual / terkonsumsi</span></li>
-                          <li>• Item dengan <span className="text-red-300">riwayat transfer</span> antar outlet</li>
-                          <li>• Item dengan <span className="text-red-300">komposisi/resep</span> manual (BOM)</li>
+                      <div className="h-px bg-white/[0.04]" />
+                      <div>
+                        <div className="flex items-center gap-1.5 mb-1.5">
+                          <XCircle className="h-3 w-3 text-red-400" />
+                          <p className="text-[11px] font-medium text-slate-200">Harus nonaktifkan</p>
+                        </div>
+                        <ul className="text-[11px] text-slate-400 space-y-1 ml-5">
+                          <li>Item dengan riwayat pembelian</li>
+                          <li>Item yang sudah terjual / terkonsumsi</li>
+                          <li>Item dengan riwayat transfer</li>
+                          <li>Item dengan komposisi/resep manual</li>
                         </ul>
                       </div>
                     </div>
                   </div>
-                  {/* Catatan */}
-                  <div className="rounded-md bg-white/[0.02] border border-white/[0.04] px-2.5 py-2">
-                    <p className="text-[10px] text-slate-600 mb-1 font-medium uppercase tracking-wider">Catatan</p>
-                    <ul className="text-[10px] text-slate-500 space-y-0.5">
-                      <li>• Kolom <span className="text-white">Digunakan</span> = jumlah produk yang memakai item ini</li>
-                      <li>• HPP selalu dihitung otomatis — tidak bisa di-edit manual</li>
-                      <li>• Item nonaktif tetap muncul di laporan tapi <span className="text-slate-400">tersembunyi</span> di tabel utama</li>
+
+                  {/* Catatan Penting */}
+                  <div className="mt-3 rounded-md bg-white/[0.02] border border-white/[0.06] px-3 py-2.5">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wide font-medium mb-2">Catatan</p>
+                    <ul className="text-[11px] text-slate-400 space-y-1.5">
+                      <li className="flex items-start gap-2">
+                        <span className="text-slate-600 mt-0.5">—</span>
+                        <span>Kolom <code className="px-1 py-0.5 rounded bg-white/[0.06] text-slate-200 text-[10px] font-mono">Digunakan</code> = jumlah produk yang memakai item ini</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-slate-600 mt-0.5">—</span>
+                        <span>HPP selalu dihitung otomatis — tidak bisa di-edit manual</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-slate-600 mt-0.5">—</span>
+                        <span>Item nonaktif tetap muncul di laporan tapi tersembunyi di tabel utama</span>
+                      </li>
                     </ul>
                   </div>
                 </div>
@@ -3488,11 +4131,18 @@ export default function PurchasePage() {
                     <TableHeader>
                       <TableRow className="border-white/[0.06] hover:bg-transparent bg-white/[0.02]">
                         <TableHead className="w-12 pl-4">
-                          <Checkbox
-                            checked={invList.length > 0 && invList.every(i => selectedInvIds.has(i.id)) ? true : invList.length > 0 ? 'indeterminate' : false}
-                            onCheckedChange={() => toggleSelectAllInv()}
-                            className="h-4 w-4"
-                          />
+                          <div className="flex items-center gap-1.5">
+                            <Checkbox
+                              checked={allInvIds.length > 0 && allInvIds.every(id => selectedInvIds.has(id)) ? true : selectedInvIds.size > 0 ? 'indeterminate' : false}
+                              onCheckedChange={() => toggleSelectAllInv()}
+                              className="h-4 w-4"
+                            />
+                            {selectedInvIds.size > 0 && (
+                              <span className="text-[10px] text-slate-500 font-medium tabular-nums">
+                                {selectedInvIds.size}/{allInvIds.length}
+                              </span>
+                            )}
+                          </div>
                         </TableHead>
                         <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider min-w-[220px]">Nama Item</TableHead>
                         <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider w-[130px]">Kategori</TableHead>
@@ -3538,6 +4188,10 @@ export default function PurchasePage() {
                           const isSelected = selectedInvIds.has(item.id)
                           const colorClasses = item.category ? getCategoryColorClasses(item.category.color) : null
                           const isArchived = item.status === 'ARCHIVED'
+                          // Calculate delete safety status for visual indicator
+                          const deleteStatus = getDeleteSafetyStatus(item)
+                          // Calculate edit block status
+                          const editBlockStatus = getEditBlockStatus(item)
                           return (
                             <TableRow 
                               key={item.id} 
@@ -3571,7 +4225,7 @@ export default function PurchasePage() {
                               <TableCell className="py-3">
                                 <div className="flex items-center gap-2">
                                   <span className={cn(
-                                    'text-xs font-medium truncate max-w-[180px] block',
+                                    'text-xs font-medium truncate max-w-[160px] block',
                                     isArchived ? 'text-slate-500 line-through decoration-slate-600' : 'text-slate-100'
                                   )}>
                                     {item.name}
@@ -3588,6 +4242,25 @@ export default function PurchasePage() {
                                       Stok Rendah
                                     </Badge>
                                   )}
+                                  {/* Delete Safety Indicator */}
+                                  {!isArchived && deleteStatus.riskLevel === 'safe' && (
+            <Badge variant="secondary" className="text-[8px] px-1.5 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/20 rounded-full shrink-0" title={deleteStatus.description}>
+              <ShieldCheck className="h-2.5 w-2.5 mr-0.5" />
+              Aman
+            </Badge>
+          )}
+          {!isArchived && deleteStatus.riskLevel === 'warning' && (
+            <Badge variant="secondary" className="text-[8px] px-1.5 py-0 bg-amber-500/10 text-amber-400 border-amber-500/20 rounded-full shrink-0" title={deleteStatus.description}>
+              <AlertCircle className="h-2.5 w-2.5 mr-0.5" />
+              Migrasi
+            </Badge>
+          )}
+          {!isArchived && deleteStatus.riskLevel === 'blocked' && (
+            <Badge variant="secondary" className="text-[8px] px-1.5 py-0 bg-red-500/10 text-red-400 border-red-500/20 rounded-full shrink-0" title={deleteStatus.description}>
+              <Lock className="h-2.5 w-2.5 mr-0.5" />
+              Terkunci
+            </Badge>
+          )}
                                 </div>
                               </TableCell>
                               <TableCell>
@@ -3653,9 +4326,21 @@ export default function PurchasePage() {
                                   <Button
                                     variant="ghost"
                                     size="sm"
-                                    className="h-7 w-7 p-0 text-slate-400 hover:text-amber-400 hover:bg-amber-500/10 rounded-lg transition-colors"
-                                    onClick={() => openInvForm(item)}
-                                    title="Edit item"
+                                    className={cn(
+                                      "h-7 w-7 p-0 rounded-lg transition-colors",
+                                      editBlockStatus.isBlocked
+                                        ? 'text-slate-600 cursor-not-allowed'
+                                        : 'text-slate-400 hover:text-amber-400 hover:bg-amber-500/10'
+                                    )}
+                                    onClick={() => {
+                                      if (editBlockStatus.isBlocked) {
+                                        toast.error(editBlockStatus.reason || 'Tidak bisa diedit')
+                                        return
+                                      }
+                                      openInvForm(item)
+                                    }}
+                                    disabled={editBlockStatus.isBlocked}
+                                    title={editBlockStatus.isBlocked ? editBlockStatus.reason : 'Edit item'}
                                   >
                                     <Pencil className="h-3.5 w-3.5" />
                                   </Button>
@@ -3695,20 +4380,20 @@ export default function PurchasePage() {
               </Card>
             </div>
 
-            {/* Enhanced Mobile Sort Chips */}
-            <div className="md:hidden space-y-1.5">
-              <div className="flex items-center gap-1.5 overflow-x-auto custom-scrollbar px-0.5">
-                <span className="text-[9px] text-slate-600 uppercase tracking-wider font-medium shrink-0 flex items-center gap-1">
-                  <ArrowUpDown className="h-3 w-3" />
-                  Sort:
-                </span>
+            {/* Enhanced Mobile Sort Chips - Modern Glass Design */}
+            <div className="md:hidden">
+              <div className="flex items-center gap-2 overflow-x-auto custom-scrollbar pb-1 scrollbar-thin">
+                <div className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/[0.03] border border-white/[0.06] backdrop-blur-sm">
+                  <ArrowUpDown className="h-3 w-3 text-slate-500" />
+                  <span className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Sort</span>
+                </div>
                 {([
                   ['name-asc', 'A-Z', 'violet'],
                   ['name-desc', 'Z-A', 'violet'],
-                  ['stock-desc', 'Stock ↓', 'cyan'],
-                  ['stock-asc', 'Stock ↑', 'cyan'],
-                  ['value-desc', 'Nilai ↓', 'emerald'],
-                  ['value-asc', 'Nilai ↑', 'emerald'],
+                  ['stock-desc', 'Stok ↓', 'emerald'],
+                  ['stock-asc', 'Stok ↑', 'emerald'],
+                  ['value-desc', 'Nilai ↓', 'cyan'],
+                  ['value-asc', 'Nilai ↑', 'cyan'],
                   ['updatedAt-desc', 'Baru', 'amber'],
                   ['updatedAt-asc', 'Lama', 'amber'],
                 ] as const).map(([val, label, color]) => (
@@ -3716,15 +4401,16 @@ export default function PurchasePage() {
                     key={val}
                     onClick={() => { setInvSortBy(val); setInvPage(1); setSelectedInvIds(new Set()) }}
                     className={cn(
-                      'shrink-0 px-2.5 py-1 rounded-lg text-[10px] font-medium transition-all whitespace-nowrap border',
+                      'shrink-0 px-3 py-1.5 rounded-full text-[10px] font-semibold transition-all duration-200 whitespace-nowrap backdrop-blur-sm',
                       invSortBy === val
                         ? cn(
-                            color === 'violet' && 'bg-violet-500/15 text-violet-400 border-violet-500/30 shadow-sm',
-                            color === 'cyan' && 'bg-cyan-500/15 text-cyan-400 border-cyan-500/30 shadow-sm',
-                            color === 'emerald' && 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30 shadow-sm',
-                            color === 'amber' && 'bg-amber-500/15 text-amber-400 border-amber-500/30 shadow-sm',
+                            'shadow-lg ring-1 ring-white/10 scale-[1.02]',
+                            color === 'violet' && 'bg-gradient-to-r from-violet-500/20 to-purple-500/20 text-violet-300 border border-violet-400/30',
+                            color === 'cyan' && 'bg-gradient-to-r from-cyan-500/20 to-blue-500/20 text-cyan-300 border border-cyan-400/30',
+                            color === 'emerald' && 'bg-gradient-to-r from-emerald-500/20 to-green-500/20 text-emerald-300 border border-emerald-400/30',
+                            color === 'amber' && 'bg-gradient-to-r from-amber-500/20 to-orange-500/20 text-amber-300 border border-amber-400/30',
                           )
-                        : 'text-slate-500 hover:text-slate-300 hover:bg-white/[0.04] border-white/[0.06]',
+                        : 'text-slate-500 bg-white/[0.02] border border-transparent hover:text-slate-300 hover:bg-white/[0.05] hover:border-white/[0.08]',
                     )}
                   >
                     {label}
@@ -3733,201 +4419,172 @@ export default function PurchasePage() {
               </div>
             </div>
 
-            {/* Enhanced Mobile Cards */}
-            <div className="md:hidden space-y-3">
+            {/* Compact Mobile Cards - List Style Layout */}
+            <div className="md:hidden space-y-2">
               {invList.length === 0 ? (
-                <Card className="bg-nebula border-white/[0.06] overflow-hidden">
-                  <CardContent className="py-14 text-center">
-                    <div className="flex flex-col items-center max-w-[240px] mx-auto">
-                      {/* Enhanced Empty State for Mobile */}
-                      <div className="relative w-16 h-16 mb-4">
-                        <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-emerald-500/10 to-blue-500/10 animate-pulse" />
-                        <div className="relative w-full h-full rounded-2xl bg-white/[0.03] border border-white/[0.08] flex items-center justify-center">
-                          <PackagePlus className="h-7 w-7 text-slate-500" />
-                        </div>
-                        <div className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-emerald-500/20 flex items-center justify-center">
-                          <Plus className="h-2.5 w-2.5 text-emerald-400" />
-                        </div>
+                <div className="relative overflow-hidden rounded-xl bg-white/[0.02] border border-white/[0.06]">
+                  <div className="py-10 px-5 text-center">
+                    <div className="flex flex-col items-center">
+                      <div className="w-14 h-14 rounded-xl bg-white/[0.04] flex items-center justify-center mb-3">
+                        <PackageOpen className="h-7 w-7 text-slate-600" />
                       </div>
-                      <h3 className="text-sm font-semibold text-white mb-1">Inventory Kosong</h3>
-                      <p className="text-xs text-slate-400 mb-1 leading-relaxed">Belum ada item di inventory</p>
-                      <p className="text-[11px] text-slate-600 mb-4 leading-relaxed">Buat pembelian pertama untuk mulai</p>
+                      <p className="text-sm text-slate-400 mb-1 font-medium">Inventory Kosong</p>
+                      <p className="text-xs text-slate-600 mb-4">Buat pembelian pertama untuk menambah stok</p>
                       <Button
                         size="sm"
                         onClick={() => { resetPoCreateForm(); openPoCreate() }}
-                        className="theme-bg theme-hover text-white text-xs h-9 px-4 rounded-xl gap-1.5 shadow-lg"
+                        className="theme-bg theme-hover text-white text-xs h-9 px-5 rounded-lg gap-1.5"
                       >
-                        <ShoppingCart className="h-3.5 w-3.5" />
+                        <ShoppingCart className="h-4 w-4" />
                         Buat Pembelian
                       </Button>
                     </div>
-                  </CardContent>
-                </Card>
+                  </div>
+                </div>
               ) : (
-                <AnimatePresence>
+                <AnimatePresence mode="popLayout">
                   {invList.map((item, index) => {
                     const isLow = item.stock <= item.lowStockAlert
                     const isSelected = selectedInvIds.has(item.id)
                     const colorClasses = item.category ? getCategoryColorClasses(item.category.color) : null
                     const isArchived = item.status === 'ARCHIVED'
+                    // Calculate delete safety status for visual indicator
+                    const deleteStatus = getDeleteSafetyStatus(item)
+                    // Calculate edit block status
+                    const editBlockStatus = getEditBlockStatus(item)
+                    
                     return (
                       <motion.div
                         key={item.id}
-                        initial={{ opacity: 0, y: 12 }}
+                        layout
+                        initial={{ opacity: 0, y: 8 }}
                         animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -12 }}
-                        transition={{ duration: 0.25, delay: index * 0.03 }}
+                        exit={{ opacity: 0, y: -8 }}
+                        transition={{ duration: 0.15, delay: index * 0.015 }}
                       >
-                        <Card className={cn(
-                          'relative overflow-hidden transition-all duration-200',
-                          // Base styling
-                          'bg-nebula border-white/[0.06] hover:border-white/[0.1]',
-                          // Selected state
-                          isSelected && 'border-emerald-500/40 ring-1 ring-emerald-500/15 bg-emerald-500/[0.02]',
-                          // Low stock glow effect
-                          isLow && !isArchived && 'shadow-sm shadow-red-500/5',
-                          // Archived state
-                          isArchived && 'opacity-60',
-                        )}>
-n                          {/* Left accent bar for low stock / archived */}
+                        {/* Compact List Item - Single Row */}
+                        <div 
+                          className={cn(
+                            'flex items-center gap-2.5 p-2.5 rounded-xl border transition-colors active:bg-white/[0.03]',
+                            isSelected ? 'bg-emerald-500/[0.08] border-emerald-500/30' :
+                            isLow && !isArchived ? 'bg-red-500/[0.03] border-red-500/15' :
+                            isArchived ? 'bg-white/[0.01] border-white/[0.04] opacity-60' :
+                            'bg-white/[0.02] border-white/[0.06]'
+                          )}
+                          onClick={() => toggleInvSelect(item.id)}
+                        >
+                          {/* Left accent bar */}
                           {isLow && !isArchived && (
-                            <div className="absolute left-0 top-0 bottom-0 w-1 bg-gradient-to-b from-red-500 to-red-500/40" />
+                            <div className="w-[3px] h-10 rounded-full bg-red-500/60 shrink-0" />
                           )}
                           {isArchived && (
-                            <div className="absolute left-0 top-0 bottom-0 w-1 bg-gradient-to-b from-amber-500 to-amber-500/40" />
+                            <div className="w-[3px] h-10 rounded-full bg-amber-500/60 shrink-0" />
                           )}
-n                          <CardContent className="p-3.5 space-y-3">
-                            {/* Header Row - Name + Stock Hero */}
-                            <div className="flex items-start justify-between gap-3">\                              <div className="flex items-start gap-2.5 min-w-0 flex-1">
-                                <Checkbox
-                                  checked={isSelected}
-                                  onCheckedChange={() => toggleInvSelect(item.id)}
-                                  className="h-4 w-4 mt-0.5 shrink-0 data-[state=checked]:bg-emerald-500 data-[state=checked]:border-emerald-500"
-                                />
-                                <div className="min-w-0 flex-1">
-                                  <p className={cn(
-                                    'text-sm font-semibold truncate block leading-tight',
-                                    isArchived ? 'text-slate-500 line-through decoration-slate-600' : 'text-white'
-                                  )}>
-                                    {item.name}
-                                  </p>
-n                                  <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-                                    {isArchived && (
-                                      <Badge variant="secondary" className="text-[9px] px-2 py-0 bg-amber-500/15 text-amber-400 border-amber-500/25 rounded-full">
-                                        <Archive className="h-2.5 w-2.5 mr-1" />
-                                        Nonaktif
-                                      </Badge>
-                                    )}
-                                    {isLow && !isArchived && (
-                                      <Badge variant="secondary" className="text-[9px] px-2 py-0 bg-red-500/15 text-red-400 border-red-500/25 rounded-full animate-pulse">
-                                        <AlertTriangle className="h-2.5 w-2.5 mr-1" />
-                                        Stok Rendah
-                                      </Badge>
-                                    )}
-                                    {item.category && colorClasses && (
-                                      <Badge 
-                                        variant="outline" 
-                                        className={cn(
-                                          'text-[9px] px-2 py-0 rounded-full border font-medium',
-                                          colorClasses.bg,
-                                          colorClasses.text,
-                                          colorClasses.border,
-                                        )}
-                                      >
-                                        {item.category.name}
-                                      </Badge>
-                                    )}
-                                  </div>
-                                </div>
-                              </div>
-n                              {/* Hero Stock Number */}
-                              <div className={cn(
-                                'shrink-0 text-right',
-                                isLow && 'animate-pulse'
-                              )}>
-                                <div className={cn(
-                                  'inline-flex flex-col items-end px-3 py-2 rounded-xl tabular-nums',
-                                  isLow 
-                                    ? 'bg-red-500/10 ring-1 ring-red-500/20' 
-                                    : 'bg-white/[0.04]'
-                                )}>
-                                  <span className={cn(
-                                    'text-xl font-bold leading-none',
-                                    isLow ? 'text-red-400' : 'text-white'
-                                  )}>
-                                    {formatNumber(item.stock)}
-                                  </span>
-                                  <span className={cn(
-                                    'text-[10px] font-medium mt-0.5',
-                                    isLow ? 'text-red-400/70' : 'text-slate-500'
-                                  )}>
-                                    {item.baseUnit}
-                                  </span>
-                                </div>
-                              </div>
-                            </div>
-n                            {/* Stats Row - HPP & Total Value */}
-                            <div className="grid grid-cols-2 gap-2">
-                              <div className="rounded-lg bg-white/[0.03] border border-white/[0.04] px-2.5 py-2">
-                                <p className="text-[9px] text-slate-600 uppercase tracking-wider mb-0.5">HPP Satuan</p>
-                                <p className="text-xs text-slate-300 font-medium tabular-nums">{formatCurrency(item.avgCost)}<span className="text-slate-600">/{item.baseUnit}</span></p>
-                              </div>
-                              <div className="rounded-lg bg-emerald-500/[0.05] border border-emerald-500/10 px-2.5 py-2">
-                                <p className="text-[9px] text-emerald-500/70 uppercase tracking-wider mb-0.5">Total Nilai</p>
-                                <p className="text-xs text-emerald-400 font-semibold tabular-nums">{formatCurrency(item.stock * item.avgCost)}</p>
-                              </div>
-                            </div>
-                            {/* Usage indicator */}
-                            {(item._count?.compositions ?? 0) > 0 && (
-                              <div className="flex items-center gap-1.5 text-[10px] text-violet-400">
-                                <Sparkles className="h-3 w-3" />
-                                <span>Dipakai di <strong>{item._count?.compositions ?? 0}</strong> produk</span>
-                              </div>
+                          
+                          {/* Checkbox - Compact */}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); toggleInvSelect(item.id) }}
+                            className={cn(
+                              'w-6 h-6 rounded-md border-2 flex items-center justify-center shrink-0 transition-all',
+                              isSelected 
+                                ? 'bg-emerald-500 border-emerald-500 text-white' 
+                                : 'border-slate-600 hover:border-slate-500'
                             )}
-n                            {/* Action Buttons */}
-                            <div className="flex items-center gap-1.5 pt-2 border-t border-white/[0.04]">
-                              <Button
-                                size="sm"
-                                className="flex-1 h-8 text-[11px] gap-1.5 text-slate-400 hover:text-blue-400 hover:bg-blue-500/10 rounded-lg transition-colors"
-                                onClick={() => openInvDetail(item)}
-                              >
-                                <Eye className="h-3.5 w-3.5" />
-                                Detail
-                              </Button>
-                              <Button
-                                size="sm"
-                                className="h-8 w-8 p-0 text-slate-400 hover:text-amber-400 hover:bg-amber-500/10 rounded-lg transition-colors"
-                                onClick={() => openInvForm(item)}
-                                title="Edit"
-                              >
-                                <Pencil className="h-3.5 w-3.5" />
-                              </Button>
-                              <Button
-                                size="sm"
-                                className={cn(
-                                  'h-8 w-8 p-0 rounded-lg transition-colors',
-                                  isArchived
-                                    ? 'text-amber-400 hover:text-amber-300 hover:bg-amber-500/10'
-                                    : 'text-slate-400 hover:text-red-400 hover:bg-red-500/10',
-                                )}
-                                onClick={() => {
-                                  if (isArchived) {
-                                    handleRestoreInv(item.id)
-                                  } else {
-                                    void openDeleteInvDialog(item.id)
-                                  }
-                                }}
-                                title={isArchived ? 'Aktifkan kembali' : 'Arsipkan'}
-                              >
-                                {isArchived ? (
-                                  <RotateCcw className="h-3.5 w-3.5" />
-                                ) : (
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                )}
-                              </Button>
+                          >
+                            {isSelected && <Check className="h-3 w-3" strokeWidth={3} />}
+                          </button>
+
+                          {/* Main Content */}
+                          <div className="flex-1 min-w-0">
+                            {/* Name + Status Badges */}
+                            <div className="flex items-center gap-1.5">
+                              <span className={cn(
+                                'text-sm font-semibold truncate',
+                                isArchived ? 'text-slate-500 line-through' : 'text-white'
+                              )}>
+                                {item.name}
+                              </span>
+                              {isArchived && (
+                                <span className="px-1 py-0 rounded bg-amber-500/15 text-amber-400 text-[8px] font-bold shrink-0">OFF</span>
+                              )}
+                              {isLow && !isArchived && (
+                                <span className="px-1 py-0 rounded bg-red-500/15 text-red-400 text-[8px] font-bold shrink-0">!</span>
+                              )}
+                              {!isArchived && deleteStatus.riskLevel === 'safe' && (
+                                <span className="px-1 py-0 rounded bg-emerald-500/15 text-emerald-400 text-[8px] font-bold shrink-0">✓</span>
+                              )}
                             </div>
-                          </CardContent>
-                        </Card>
+                            {/* Category + Stock + Unit - Single Line */}
+                            <div className="flex items-center gap-2 mt-0.5 text-slate-500">
+                              {item.category && colorClasses ? (
+                                <span className={cn('text-[10px] px-1.5 py-0 rounded font-medium', colorClasses.bg, colorClasses.text)}>
+                                  {item.category.name}
+                                </span>
+                              ) : (
+                                <span className="text-[10px] text-slate-600">-</span>
+                              )}
+                              <span className="text-[10px]">•</span>
+                              <span className={cn('text-[12px] font-bold tabular-nums', isLow && !isArchived ? 'text-red-400' : 'text-slate-300')}>
+                                {formatNumber(item.stock)}
+                              </span>
+                              <span className="text-[10px]">{item.baseUnit}</span>
+                              <span className="text-[10px]">•</span>
+                              <span className="text-[11px] text-slate-400">{formatCurrency(item.avgCost)}</span>
+                            </div>
+                          </div>
+
+                          {/* Action Buttons - Compact Icon Only */}
+                          <div className="flex items-center gap-0.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              className="w-7 h-7 rounded-md flex items-center justify-center text-slate-500 hover:text-blue-400 hover:bg-blue-500/10 transition-colors"
+                              onClick={() => openInvDetail(item)}
+                              title="Detail"
+                            >
+                              <Eye className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              className={cn(
+                                "w-7 h-7 rounded-md flex items-center justify-center transition-colors",
+                                editBlockStatus.isBlocked
+                                  ? "text-slate-700 cursor-not-allowed"
+                                  : "text-slate-500 hover:text-amber-400 hover:bg-amber-500/10"
+                              )}
+                              onClick={() => {
+                                if (editBlockStatus.isBlocked) {
+                                  toast.error(editBlockStatus.reason || 'Tidak bisa diedit')
+                                  return
+                                }
+                                openInvForm(item)
+                              }}
+                              disabled={editBlockStatus.isBlocked}
+                              title={editBlockStatus.isBlocked ? editBlockStatus.reason : 'Edit'}
+                            >
+                              <Pencil className="h-3 w-3.5" />
+                            </button>
+                            <button
+                              className={cn(
+                                "w-7 h-7 rounded-md flex items-center justify-center transition-colors",
+                                isArchived
+                                  ? "text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
+                                  : "text-slate-500 hover:text-red-400 hover:bg-red-500/10"
+                              )}
+                              onClick={() => {
+                                if (isArchived) {
+                                  handleRestoreInv(item.id)
+                                } else {
+                                  void openDeleteInvDialog(item.id)
+                                }
+                              }}
+                              title={isArchived ? 'Aktifkan' : 'Hapus'}
+                            >
+                              {isArchived ? (
+                                <RotateCcw className="h-3 w-3.5" />
+                              ) : (
+                                <Trash2 className="h-3 w-3.5" />
+                              )}
+                            </button>
+                          </div>
+                        </div>
                       </motion.div>
                     )
                   })}
@@ -3936,7 +4593,7 @@ n                            {/* Action Buttons */}
             </div>
 
             {/* Pagination */}
-            <Pagination currentPage={invPage} totalPages={invTotalPages} onPageChange={(p) => { setInvPage(p); setSelectedInvIds(new Set()) }} />
+            <Pagination currentPage={invPage} totalPages={invTotalPages} onPageChange={(p) => { setInvPage(p) }} />
           </TabsContent>
         </Tabs>
       </motion.div>
@@ -4070,37 +4727,78 @@ n                            {/* Action Buttons */}
               {isOwner && (
               <div>
                 <div className="flex gap-2 pt-2 border-t border-white/[0.04]">
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="flex-1 h-8 text-xs gap-1.5 text-slate-400 hover:text-white hover:bg-white/[0.04]"
-                    onClick={() => { openPoEdit(poDetailData!) }}
-                  >
-                    <Edit3 className="h-3.5 w-3.5" />
-                    Edit
-                  </Button>
+                  {/* EDIT BUTTON - SINKRON DENGAN TABLE LOGIC */}
                   <Button
                     size="sm"
                     variant="ghost"
                     className={cn(
                       "flex-1 h-8 text-xs gap-1.5",
-                      (poDetailHasLinked || poDetailHasUsageHistory)
-                        ? "text-red-400/40 cursor-not-allowed"
-                        : "text-red-400 hover:text-red-300 hover:bg-red-500/[0.06]"
+                      poDetailHasRealBusinessHistory
+                        ? "text-slate-600 cursor-not-allowed"
+                        : "text-slate-400 hover:text-white hover:bg-white/[0.04]"
                     )}
-                    onClick={() => { if (!poDetailHasLinked && !poDetailHasUsageHistory) setDeletePoId(poDetailData!.id) }}
-                    disabled={poDetailHasLinked || poDetailHasUsageHistory}
+                    onClick={() => {
+                      if (poDetailHasRealBusinessHistory) {
+                        toast.error('Pembelian memiliki riwayat bisnis (transfer/penjualan) — tidak bisa diedit')
+                        return
+                      }
+                      openPoEdit(poDetailData!)
+                    }}
+                    disabled={poDetailHasRealBusinessHistory}
+                    title={poDetailHasRealBusinessHistory ? 'Ada riwayat transfer/penjualan' : 'Edit pembelian'}
+                  >
+                    <Edit3 className="h-3.5 w-3.5" />
+                    Edit
+                  </Button>
+                  {/* HAPUS BUTTON - SINKRON DENGAN TABLE LOGIC */}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className={cn(
+                      "flex-1 h-8 text-xs gap-1.5",
+                      (poDetailHasRealBusinessHistory || poDetailHasUsageHistory)
+                        ? "text-red-400/40 cursor-not-allowed"
+                        : poDetailHasLinked
+                          ? "text-amber-400 hover:text-amber-300 hover:bg-amber-500/[0.06]"
+                          : "text-red-400 hover:text-red-300 hover:bg-red-500/[0.06]"
+                    )}
+                    onClick={() => {
+                      if (poDetailHasRealBusinessHistory || poDetailHasUsageHistory) {
+                        toast.error('Pembelian memiliki riwayat bisnis — tidak bisa dihapus')
+                        return
+                      }
+                      if (poDetailHasLinked) {
+                        toast.warning('Link ke produk akan dibersihkan otomatis')
+                      }
+                      setDeletePoId(poDetailData!.id)
+                    }}
+                    disabled={poDetailHasRealBusinessHistory || poDetailHasUsageHistory}
+                    title={
+                      (poDetailHasRealBusinessHistory || poDetailHasUsageHistory)
+                        ? 'Ada riwayat bisnis — tidak bisa dihapus'
+                        : poDetailHasLinked
+                          ? 'Hapus (link produk akan dibersihkan)'
+                          : 'Hapus pembelian'
+                    }
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                     Hapus
                   </Button>
                 </div>
-                {(poDetailHasLinked || poDetailHasUsageHistory) && (
+                {/* Warning message - sinkron dengan table logic */}
+                {poDetailHasRealBusinessHistory && (
+                  <p className="text-[10px] text-red-400/70 text-center -mt-1">
+                    ⚠ Pembelian memiliki riwayat transfer/penjualan — tidak bisa edit/hapus
+                  </p>
+                )}
+                {!poDetailHasRealBusinessHistory && poDetailHasLinked && (
                   <p className="text-[10px] text-amber-400/70 text-center -mt-1">
-                    {poDetailHasUsageHistory
-                      ? '⚠ Item sudah terpakai dalam transaksi — tidak bisa dihapus'
-                      : '⚠ Item terkait produk — hapus pembelian bisa mengubah komposisi'
-                    }
+                    ⚠ Item terkait produk — hapus pembelian bisa mengubah komposisi
+                  </p>
+                )}
+                {!poDetailHasRealBusinessHistory && !poDetailHasLinked && poDetailHasUsageHistory && (
+                  <p className="text-[10px] text-amber-400/70 text-center -mt-1">
+                    ⚠ Item sudah terpakai dalam transaksi — tidak bisa dihapus
                   </p>
                 )}
               </div>
@@ -4137,135 +4835,116 @@ n                            {/* Action Buttons */}
           <div className="space-y-4 mt-1 flex-1 overflow-y-auto">
 
             {/* ══════════════════════════════════════════════════════ */}
-            {/* STEP-BY-STEP GUIDE (collapsible)                      */}
+            {/* STEP-BY-STEP GUIDE (collapsible) — Linear / Stripe Style */}
             {/* ══════════════════════════════════════════════════════ */}
             <div className={cn(
-              "rounded-xl border overflow-hidden transition-all duration-300",
-              showPurchaseDialogGuide 
-                ? "bg-white/[0.02] border-white/[0.06]" 
-                : "bg-gradient-to-r from-violet-500/[0.08] via-purple-500/[0.05] to-fuchsia-500/[0.08] border-violet-500/30 shadow-lg shadow-violet-500/5"
+              "rounded-lg border transition-all duration-200",
+              showPurchaseDialogGuide
+                ? "bg-white/[0.03] border-white/[0.08]"
+                : "bg-white/[0.02] border-white/[0.06] hover:border-white/[0.1]"
             )}>
               <button
                 type="button"
-                className="w-full flex items-center justify-between gap-2 px-3.5 py-2.5 text-left hover:bg-white/[0.03] transition-colors relative"
+                className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-white/[0.01] transition-colors"
                 onClick={() => setShowPurchaseDialogGuide(prev => !prev)}
               >
-                {/* Pulse indicator when closed */}
-                {!showPurchaseDialogGuide && (
-                  <span className="absolute top-2 right-2 flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
-                  </span>
-                )}
-                <div className="flex items-center gap-2">
-                  <div className={cn(
-                    "w-5 h-5 rounded-md flex items-center justify-center shrink-0 transition-colors",
-                    showPurchaseDialogGuide ? "bg-emerald-500/10" : "bg-violet-500/15 animate-pulse"
-                  )}>
-                    <Info className={cn(
-                      "h-3 w-3 transition-colors",
-                      showPurchaseDialogGuide ? "text-emerald-400" : "text-violet-400"
-                    )} />
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center justify-center w-6 h-6 rounded-md bg-white/[0.04]">
+                    <Info className="h-3.5 w-3.5 text-slate-400" />
                   </div>
-                  <span className={cn(
-                    "text-[11px] font-medium transition-colors",
-                    showPurchaseDialogGuide ? "text-slate-400" : "text-violet-300"
-                  )}>Panduan 3 Langkah</span>
-                  {!showPurchaseDialogGuide && (
-                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/20 text-violet-300 font-medium animate-pulse">
-                      TIPS
-                    </span>
-                  )}
+                  <span className="text-xs font-medium text-slate-300">Panduan 3 Langkah</span>
                 </div>
-                <ChevronDown className={cn("h-3.5 w-3.5 text-slate-500 transition-transform duration-200", showPurchaseDialogGuide && 'rotate-180')} />
+                <ChevronDown className={cn(
+                  "h-4 w-4 text-slate-500 transition-transform duration-200",
+                  showPurchaseDialogGuide && 'rotate-180 text-slate-300'
+                )} />
               </button>
 
               {showPurchaseDialogGuide && (
-                <div className="px-3.5 pb-3.5 space-y-2.5 border-t border-white/[0.04] pt-3">
+                <div className="px-4 pb-4 space-y-0 border-t border-white/[0.04] pt-4">
                   {/* Step 1 */}
-                  <div className="flex gap-2.5">
-                    <div className="w-5 h-5 rounded-md bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">1</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium">Cari atau ketik nama barang</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed">
-                        Ketik nama item di kolom pencarian. Jika barang <span className="text-amber-400">belum ada</span>, sistem akan otomatis meminta SKU dan satuan — item baru langsung tercatat saat pembelian disimpan.
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">1</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Cari atau ketik nama barang</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Ketik nama item di kolom pencarian. Jika barang belum ada, sistem akan otomatis meminta SKU dan satuan — item baru langsung tercatat saat pembelian disimpan.
                       </p>
                     </div>
                   </div>
+                  <div className="h-px bg-white/[0.04]" />
+
                   {/* Step 2 */}
-                  <div className="flex gap-2.5">
-                    <div className="w-5 h-5 rounded-md bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">2</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium">Isi detail pembelian tiap item</p>
-                      <div className="text-[10px] text-slate-500 leading-relaxed mt-0.5 space-y-1">
-                        <div className="flex items-start gap-1.5">
-                          <span className="text-emerald-400/60 shrink-0">•</span>
-                          <span><span className="text-white font-medium">Satuan Beli</span> — Cara supplier menjual (cth: sak, karung, dus, ekor)</span>
-                        </div>
-                        <div className="flex items-start gap-1.5">
-                          <span className="text-emerald-400/60 shrink-0">•</span>
-                          <span><span className="text-white font-medium">Jumlah</span> — Berapa satuan beli yang dipesan (cth: 5 sak)</span>
-                        </div>
-                        <div className="flex items-start gap-1.5">
-                          <span className="text-emerald-400/60 shrink-0">•</span>
-                          <span><span className="text-white font-medium">Isi per Satuan</span> — Isi dalam satuan dasar (cth: 1 sak = 25 kg)</span>
-                        </div>
-                        <div className="flex items-start gap-1.5">
-                          <span className="text-emerald-400/60 shrink-0">•</span>
-                          <span><span className="text-white font-medium">Harga per Satuan Beli</span> — Harga dari supplier per satuan beli (cth: Rp320.000/sak)</span>
-                        </div>
-                        <div className="flex items-start gap-1.5">
-                          <span className="text-emerald-400/60 shrink-0">•</span>
-                          <span><span className="text-white font-medium">Batch / No. Lot</span> — Nomor batch dari supplier <span className="text-slate-500">(opsional, otomatis dibuat jika kosong)</span></span>
-                        </div>
-                        <div className="flex items-start gap-1.5">
-                          <span className="text-emerald-400/60 shrink-0">•</span>
-                          <span><span className="text-white font-medium">Tanggal Kadaluarsa</span> — Tanggal expired barang <span className="text-slate-500">(opsional, untuk tracking FEFO)</span></span>
-                        </div>
-                      </div>
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">2</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Isi detail pembelian tiap item</p>
+                      <ul className="text-[11px] text-slate-400 leading-relaxed space-y-1.5 mt-1.5 ml-0.5">
+                        <li className="flex items-start gap-2">
+                          <span className="text-slate-600 shrink-0 mt-0.5">—</span>
+                          <span><span className="text-slate-200 font-medium">Satuan Beli</span> — Cara supplier menjual (cth: sak, karung, dus, ekor)</span>
+                        </li>
+                        <li className="flex items-start gap-2">
+                          <span className="text-slate-600 shrink-0 mt-0.5">—</span>
+                          <span><span className="text-slate-200 font-medium">Jumlah</span> — Berapa satuan beli yang dipesan (cth: 5 sak)</span>
+                        </li>
+                        <li className="flex items-start gap-2">
+                          <span className="text-slate-600 shrink-0 mt-0.5">—</span>
+                          <span><span className="text-slate-200 font-medium">Isi per Satuan</span> — Isi dalam satuan dasar (cth: 1 sak = 25 kg)</span>
+                        </li>
+                        <li className="flex items-start gap-2">
+                          <span className="text-slate-600 shrink-0 mt-0.5">—</span>
+                          <span><span className="text-slate-200 font-medium">Harga per Satuan Beli</span> — Harga dari supplier per satuan beli (cth: Rp320.000/sak)</span>
+                        </li>
+                        <li className="flex items-start gap-2">
+                          <span className="text-slate-600 shrink-0 mt-0.5">—</span>
+                          <span><span className="text-slate-200 font-medium">Batch / No. Lot</span> — Nomor batch dari supplier <span className="text-slate-500">(opsional, otomatis dibuat jika kosong)</span></span>
+                        </li>
+                        <li className="flex items-start gap-2">
+                          <span className="text-slate-600 shrink-0 mt-0.5">—</span>
+                          <span><span className="text-slate-200 font-medium">Tanggal Kadaluarsa</span> — Tanggal expired barang <span className="text-slate-500">(opsional, untuk tracking FEFO)</span></span>
+                        </li>
+                      </ul>
                     </div>
                   </div>
+                  <div className="h-px bg-white/[0.04]" />
+
                   {/* Step 3 */}
-                  <div className="flex gap-2.5">
-                    <div className="w-5 h-5 rounded-md bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-                      <span className="text-[9px] text-emerald-400 font-bold">3</span>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-slate-300 font-medium">Klik "Simpan Pembelian"</p>
-                      <p className="text-[10px] text-slate-500 leading-relaxed">
+                  <div className="flex gap-3 py-3">
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/[0.06] flex items-center justify-center text-[10px] font-medium text-slate-300 mt-px">3</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-slate-200 mb-1">Klik "Simpan Pembelian"</p>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
                         Stok otomatis bertambah di inventory. HPP (Harga Pokok) dihitung rata-rata dari semua pembelian. Item baru otomatis tercatat.
                       </p>
                     </div>
                   </div>
-                  {/* Quick example */}
-                  <div className="rounded-lg bg-white/[0.03] border border-white/[0.04] px-3 py-2.5">
-                    <p className="text-[10px] text-slate-500 font-medium mb-1.5">💡 Contoh: Beli Tepung Segitiga</p>
-                    <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
-                      <div className="flex items-center justify-between text-slate-500">
+
+                  {/* Example — Stripe-style callout */}
+                  <div className="mt-1 rounded-md bg-white/[0.02] border border-white/[0.06] border-l-2 border-l-amber-500/50 px-3 py-3">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wide font-medium mb-2">Contoh: Beli Tepung Segitiga</p>
+                    <div className="space-y-1 text-[11px]">
+                      <div className="flex justify-between text-slate-400">
                         <span>Satuan Beli</span>
-                        <span className="text-white font-mono">sak</span>
+                        <span className="text-slate-200 font-mono">sak</span>
                       </div>
-                      <div className="flex items-center justify-between text-slate-500">
+                      <div className="flex justify-between text-slate-400">
                         <span>Jumlah</span>
-                        <span className="text-white font-mono">10</span>
+                        <span className="text-slate-200 font-mono">10</span>
                       </div>
-                      <div className="flex items-center justify-between text-slate-500">
+                      <div className="flex justify-between text-slate-400">
                         <span>Isi per sak</span>
-                        <span className="text-white font-mono">25 kg</span>
+                        <span className="text-slate-200 font-mono">25 kg</span>
                       </div>
-                      <div className="flex items-center justify-between text-slate-500">
+                      <div className="flex justify-between text-slate-400">
                         <span>Harga/sak</span>
-                        <span className="text-white font-mono">Rp320.000</span>
+                        <span className="text-slate-200 font-mono">Rp320.000</span>
                       </div>
                     </div>
-                    <div className="mt-1.5 pt-1.5 border-t border-white/[0.04] text-[10px] text-slate-500 space-y-0.5">
+                    <div className="mt-2 pt-2 border-t border-white/[0.04] text-[11px] text-slate-400 space-y-1">
                       <div className="flex justify-between">
                         <span>Subtotal</span>
-                        <span className="text-slate-300 font-medium">Rp3.200.000</span>
+                        <span className="text-slate-200 font-medium">Rp3.200.000</span>
                       </div>
                       <div className="flex justify-between">
                         <span>Stok masuk</span>
@@ -5468,8 +6147,12 @@ n                            {/* Action Buttons */}
         <AlertDialogContent className="bg-nebula border-white/[0.06]">
           <AlertDialogHeader>
             <AlertDialogTitle className="text-white">Hapus {selectedInvIds.size} Item Inventory?</AlertDialogTitle>
-            <AlertDialogDescription className="text-slate-400 text-sm">
-              Item yang dihapus tidak dapat dikembalikan. Semua batch, komposisi, dan riwayat akan ikut terhapus.
+            <AlertDialogDescription className="text-slate-400 text-sm space-y-2">
+              <p>Setiap item akan diperiksa terlebih dahulu:</p>
+              <ul className="list-disc list-inside text-[11px] space-y-0.5 text-slate-500 ml-1">
+                <li>Item dengan hanya stok awal migrasi <span className="text-emerald-400">akan dihapus</span> (data migrasi dibersihkan)</li>
+                <li>Item dengan histori pembelian/transaksi <span className="text-amber-400">akan dilewati</span> (gunakan Nonaktifkan)</li>
+              </ul>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="gap-2">
@@ -5479,14 +6162,14 @@ n                            {/* Action Buttons */}
               onClick={(e) => { e.preventDefault(); handleInvBulkDelete() }}
               disabled={invBulkDeleting}
             >
-              {invBulkDeleting ? <Loader2 className="h-4 w-4 animate-spin" /> : '🗑 Hapus'}
+              {invBulkDeleting ? <Loader2 className="h-4 w-4 animate-spin" /> : (<><Trash2 className="h-3.5 w-3.5 inline mr-1" />Hapus yang Bisa</>)}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
 
       {/* Edit Inventory Excel Dialog */}
-      <ResponsiveDialog open={invEditExcelOpen} onOpenChange={(open) => { if (!open) { setInvEditExcelOpen(false); setInvEditExcelFile(null); setInvEditExcelResult(null) } }}>
+      <ResponsiveDialog open={invEditExcelOpen} onOpenChange={(open) => { if (!open) { setInvEditExcelOpen(false); setInvEditExcelFile(null); setInvEditExcelResult(null); setInvEditExcelProgress('') } }}>
         <ResponsiveDialogContent className="sm:max-w-md">
           <ResponsiveDialogHeader>
             <ResponsiveDialogTitle className="text-white text-sm font-semibold">Edit Inventory via Excel</ResponsiveDialogTitle>
@@ -5496,27 +6179,61 @@ n                            {/* Action Buttons */}
           </ResponsiveDialogHeader>
           {!invEditExcelResult ? (
             <div className="space-y-3 py-1">
+              {/* ⚠️ WARNING: Editability Notice */}
+              <div className="rounded-lg border border-amber-500/25 bg-amber-500/[0.06] p-3 space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1.5">
+                    <p className="text-[11px] text-amber-300 font-semibold">PENTING: Status Edit Setiap Item</p>
+                    <div className="space-y-1 text-[10px]">
+                      <p className="text-amber-400/80">• File Excel berisi kolom <strong>"Status Edit"</strong> yang menunjukkan item bisa diedit atau tidak</p>
+                      <p className="text-amber-400/80">• <strong>🔒 TERKUNCI</strong>: Hanya Nama, SKU, Kategori yang bisa diubah (sudah ada riwayat bisnis)</p>
+                      <p className="text-amber-400/80">• <strong>⚠️ TERBATAS</strong>: Terlink ke produk - hati-hati ganti satuan!</p>
+                      <p className="text-amber-400/80">• <strong>✅ BOLEH</strong>: Bebas edit semua kolom (item baru/tanpa riwayat)</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="rounded-lg border border-white/[0.06] bg-white/[0.03] p-3 space-y-2">
                 <p className="text-[11px] text-slate-400 font-medium">Langkah-langkah:</p>
                 <div className="space-y-1.5">
                   <div className="flex items-start gap-2 text-[11px] text-slate-300">
                     <span className="flex-shrink-0 h-4 w-4 rounded-full bg-emerald-500/15 border border-emerald-500/20 flex items-center justify-center text-[10px] text-emerald-400 font-bold">1</span>
-                    <span>Download template edit berisi data inventory saat ini</span>
+                    <span>Download data inventori (sudah termasuk status edit)</span>
                   </div>
                   <div className="flex items-start gap-2 text-[11px] text-slate-300">
                     <span className="flex-shrink-0 h-4 w-4 rounded-full bg-emerald-500/15 border border-emerald-500/20 flex items-center justify-center text-[10px] text-emerald-400 font-bold">2</span>
-                    <span>Edit kolom yang ingin diubah</span>
+                    <span>CEK kolom "Status Edit" sebelum mengubah data</span>
                   </div>
                   <div className="flex items-start gap-2 text-[11px] text-slate-300">
                     <span className="flex-shrink-0 h-4 w-4 rounded-full bg-emerald-500/15 border border-emerald-500/20 flex items-center justify-center text-[10px] text-emerald-400 font-bold">3</span>
+                    <span>Edit kolom yang diizinkan untuk status item tersebut</span>
+                  </div>
+                  <div className="flex items-start gap-2 text-[11px] text-slate-300">
+                    <span className="flex-shrink-0 h-4 w-4 rounded-full bg-emerald-500/15 border border-emerald-500/20 flex items-center justify-center text-[10px] text-emerald-400 font-bold">4</span>
                     <span>Upload file yang sudah diedit</span>
                   </div>
                 </div>
               </div>
-              <Button onClick={() => void downloadBlob('/api/inventory/items/export', `inventory-edit-template-${new Date().toISOString().slice(0, 10)}.xlsx`, setInvEditExcelUploading)} disabled={invEditExcelUploading} variant="outline" className="w-full bg-white/[0.04] border-white/[0.04] text-slate-300 hover:text-white hover:bg-white/[0.04] h-9 text-xs">
+              <Button onClick={() => void downloadBlob('/api/inventory/items/export', `inventory-data-${new Date().toISOString().slice(0, 10)}.xlsx`, setInvEditExcelUploading)} disabled={invEditExcelUploading} variant="outline" className="w-full bg-white/[0.04] border-white/[0.04] text-slate-300 hover:text-white hover:bg-white/[0.04] h-9 text-xs">
                 {invEditExcelUploading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Download className="mr-1.5 h-3.5 w-3.5" />}
-                Download Template Edit
+                Download Data Inventori
               </Button>
+              {/* Progress Indicator */}
+              {invEditExcelUploading && invEditExcelProgress && (
+                <div className="rounded-lg bg-blue-500/10 border border-blue-500/20 p-3 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin text-blue-400" />
+                    <span className="text-xs text-blue-300 font-medium">{invEditExcelProgress}</span>
+                  </div>
+                  <div className="w-full bg-white/[0.08] rounded-full h-1.5 overflow-hidden">
+                    <div className="bg-blue-500 h-full rounded-full animate-pulse" style={{ width: '60%' }} />
+                  </div>
+                  <p className="text-[10px] text-slate-500">Mohon tunggu, proses ini bisa memakan waktu beberapa detik...</p>
+                </div>
+              )}
+              
               <div
                 onDragOver={(e) => { e.preventDefault(); setInvEditExcelDragOver(true) }}
                 onDragLeave={() => setInvEditExcelDragOver(false)}
@@ -5527,10 +6244,10 @@ n                            {/* Action Buttons */}
                     setInvEditExcelFile(file)
                   }
                 }}
-                className={`relative rounded-xl border-2 border-dashed p-6 text-center transition-all ${invEditExcelDragOver ? 'border-emerald-500/50 bg-emerald-500/[0.05]' : invEditExcelFile ? 'border-emerald-500/30 bg-emerald-500/[0.03]' : 'border-white/[0.1] hover:border-white/[0.2]'}`}
+                className={`relative rounded-xl border-2 border-dashed p-6 text-center transition-all ${invEditExcelUploading ? 'pointer-events-none opacity-50' : ''} ${invEditExcelDragOver ? 'border-emerald-500/50 bg-emerald-500/[0.05]' : invEditExcelFile ? 'border-emerald-500/30 bg-emerald-500/[0.03]' : 'border-white/[0.1] hover:border-white/[0.2]'}`}
               >
-                <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) setInvEditExcelFile(f); e.target.value = '' }} id="inv-edit-excel-input" />
-                <label htmlFor="inv-edit-excel-input" className="cursor-pointer">
+                <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) setInvEditExcelFile(f); e.target.value = '' }} id="inv-edit-excel-input" disabled={invEditExcelUploading} />
+                <label htmlFor="inv-edit-excel-input" className={`cursor-pointer ${invEditExcelUploading ? 'cursor-not-allowed' : ''}`}>
                   {invEditExcelFile ? (
                     <div className="flex flex-col items-center gap-2">
                       <FileSpreadsheet className="h-8 w-8 text-emerald-400" />
@@ -5547,19 +6264,61 @@ n                            {/* Action Buttons */}
                 </label>
               </div>
               <Button onClick={handleInvEditExcelUpload} disabled={!invEditExcelFile || invEditExcelUploading} className="w-full h-9 text-xs">
-                {invEditExcelUploading ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> Mengupdate...</> : <><Upload className="h-3.5 w-3.5 mr-1.5" /> Upload & Update</>}
+                {invEditExcelUploading ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> Memproses...</> : <><Upload className="h-3.5 w-3.5 mr-1.5" /> Upload & Update</>}
               </Button>
             </div>
           ) : (
             <div className="space-y-3 py-1">
-              <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-4 text-center space-y-2">
-                <CheckCircle2 className="h-8 w-8 text-emerald-400 mx-auto" />
-                <p className="text-sm font-medium text-white">Update Selesai!</p>
-                <div className="flex justify-center gap-4 text-xs text-slate-400">
-                  <span><span className="text-emerald-400 font-semibold">{invEditExcelResult.updated}</span> diupdate</span>
-                  {invEditExcelResult.notFound > 0 && <span><span className="text-amber-400 font-semibold">{invEditExcelResult.notFound}</span> tidak ditemukan</span>}
-                </div>
+              <div className={`rounded-lg border p-4 text-center space-y-2 ${
+                invEditExcelResult.updated > 0 
+                  ? 'bg-emerald-500/10 border-emerald-500/20' 
+                  : invEditExcelResult.warnings.length > 0 && invEditExcelResult.errors.length === 0
+                    ? 'bg-amber-500/10 border-amber-500/20'
+                    : 'bg-red-500/10 border-red-500/20'
+              }`}>
+                {invEditExcelResult.updated > 0 ? (
+                  <>
+                    <CheckCircle2 className="h-8 w-8 text-emerald-400 mx-auto" />
+                    <p className="text-sm font-medium text-white">Update Selesai!</p>
+                    <div className="flex justify-center gap-4 text-xs text-slate-400">
+                      <span><span className="text-emerald-400 font-semibold">{invEditExcelResult.updated}</span> diupdate</span>
+                      {invEditExcelResult.notFound > 0 && <span><span className="text-amber-400 font-semibold">{invEditExcelResult.notFound}</span> tidak ditemukan</span>}
+                      {invEditExcelResult.warnings.length > 0 && <span><span className="text-amber-400 font-semibold">{invEditExcelResult.warnings.length}</span> diabaikan</span>}
+                    </div>
+                  </>
+                ) : invEditExcelResult.warnings.length > 0 && invEditExcelResult.errors.length === 0 ? (
+                  <>
+                    <AlertCircle className="h-8 w-8 text-amber-400 mx-auto" />
+                    <p className="text-sm font-medium text-white">Tidak Ada Perubahan Tersimpan</p>
+                    <p className="text-[11px] text-slate-400">Kolom Stok & HPP bersifat read-only</p>
+                  </>
+                ) : (
+                  <>
+                    <XCircle className="h-8 w-8 text-red-400 mx-auto" />
+                    <p className="text-sm font-medium text-white">Update Gagal</p>
+                    <p className="text-[11px] text-slate-400">{invEditExcelResult.errors.length} error ditemukan</p>
+                  </>
+                )}
               </div>
+              
+              {/* Warnings section (read-only fields) */}
+              {invEditExcelResult.warnings.length > 0 && (
+                <div className="rounded-lg bg-amber-500/5 border border-amber-500/15 p-3 max-h-24 overflow-y-auto custom-scrollbar">
+                  <p className="text-[11px] text-amber-300 font-medium mb-1.5 flex items-center gap-1.5">
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                    {invEditExcelResult.warnings.length} kolom read-only diabaikan:
+                  </p>
+                  <p className="text-[10px] text-slate-500 mb-2">Stok & HPP dihitung otomatis dari batch/pembelian</p>
+                  {invEditExcelResult.warnings.slice(0, 5).map((w, i) => (
+                    <p key={i} className="text-[11px] text-slate-400 truncate">• {w}</p>
+                  ))}
+                  {invEditExcelResult.warnings.length > 5 && (
+                    <p className="text-[10px] text-slate-500">...dan {invEditExcelResult.warnings.length - 5} lainnya</p>
+                  )}
+                </div>
+              )}
+              
+              {/* Errors section */}
               {invEditExcelResult.errors.length > 0 && (
                 <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 max-h-28 overflow-y-auto custom-scrollbar">
                   <p className="text-[11px] text-red-300 font-medium mb-1.5">{invEditExcelResult.errors.length} error:</p>
@@ -5568,6 +6327,7 @@ n                            {/* Action Buttons */}
                   ))}
                 </div>
               )}
+              
               <Button onClick={() => { setInvEditExcelFile(null); setInvEditExcelResult(null) }} className="w-full bg-white/[0.04] border border-white/[0.06] text-slate-300 hover:text-white hover:bg-white/[0.04] h-8 text-xs">
                 Selesai
               </Button>
@@ -5581,16 +6341,150 @@ n                            {/* Action Buttons */}
         <AlertDialogContent className="bg-nebula border-white/[0.06]">
           <AlertDialogHeader>
             <AlertDialogTitle className="text-white">
-              {deleteInvLoading ? 'Memeriksa item...' : invDeleteBlocked?.blockType === 'hasHistory' ? '🚫 Item Tidak Dapat Dihapus' : 'Hapus Item?'}
+              {deleteInvLoading ? 'Memeriksa item...' : 
+                invDeleteBlocked?.blockType === 'hasPurchases' ? (<><ShoppingCart className="h-4 w-4 inline mr-1.5 -mt-0.5" />Item Ada Riwayat Pembelian</>) :
+                invDeleteBlocked?.blockType === 'hasTransfers' ? (<><ArrowRightLeft className="h-4 w-4 inline mr-1.5 -mt-0.5" />Item Ada Riwayat Transfer</>) :
+                invDeleteBlocked?.blockType === 'hasSales' ? (<><Receipt className="h-4 w-4 inline mr-1.5 -mt-0.5" />Item Ada Riwayat Penjualan</>) :
+                invDeleteBlocked?.blockType === 'hasCompositions' ? (<><Package className="h-4 w-4 inline mr-1.5 -mt-0.5" />Item Terhubung ke Produk</>) :
+                invDeleteBlocked?.blockType === 'hasMixedHistory' ? (<><AlertTriangle className="h-4 w-4 inline mr-1.5 -mt-0.5" />Item Memiliki Berbagai Histori</>) :
+                invDeleteBlocked?.blockType === 'hasHistory' ? (<><Link2 className="h-4 w-4 inline mr-1.5 -mt-0.5" />Item Terhubung ke Data Lain</>) : 
+                'Hapus Item?'
+              }
             </AlertDialogTitle>
             {!invDeleteBlocked && !deleteInvLoading ? (
               <AlertDialogDescription className="text-slate-400">
-                Item yang dihapus tidak dapat dikembalikan.
+                Item ini bisa dihapus (belum ada riwayat pembelian).
+                Stok awal dari migrasi akan ikut terhapus.
               </AlertDialogDescription>
             ) : null}
           </AlertDialogHeader>
 
-          {/* Blocked: has business history → suggest archive */}
+          {/* Blocked: has purchase history → suggest archive */}
+          {invDeleteBlocked && invDeleteBlocked.blockType === 'hasPurchases' && (
+            <div className="space-y-3 my-2">
+              <div className="flex items-start gap-2 rounded-lg bg-red-500/10 border border-red-500/20 p-3">
+                <ShoppingCart className="h-4 w-4 text-red-400 mt-0.5 shrink-0" />
+                <div className="text-sm">
+                  <p className="text-red-300 font-medium">{invDeleteBlocked.message}</p>
+                  <p className="text-slate-400 text-xs mt-2 leading-relaxed">
+                    Item yang sudah dibeli dari supplier tidak dapat dihapus untuk menjaga integritas data keuangan dan laporan pembelian.
+                  </p>
+                  <div className="mt-2 space-y-1">
+                    {invDeleteBlocked.blockers?.map((b, i) => (
+                      <div key={i} className="flex items-center gap-2 text-slate-400 text-xs">
+                        <span className="text-slate-600">•</span> {b}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-amber-400/80 text-xs mt-2.5 leading-relaxed italic font-medium">
+                    <Lightbulb className="h-3 w-3 inline text-amber-400" /> {invDeleteBlocked.suggestion}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Blocked: has transfer history → suggest archive */}
+          {invDeleteBlocked && invDeleteBlocked.blockType === 'hasTransfers' && (
+            <div className="space-y-3 my-2">
+              <div className="flex items-start gap-2 rounded-lg bg-blue-500/10 border border-blue-500/20 p-3">
+                <ArrowRightLeft className="h-4 w-4 text-blue-400 mt-0.5 shrink-0" />
+                <div className="text-sm">
+                  <p className="text-blue-300 font-medium">{invDeleteBlocked.message}</p>
+                  <p className="text-slate-400 text-xs mt-2 leading-relaxed">
+                    Item yang sudah ditransfer antar outlet tidak dapat dihapus untuk menjaga konsistensi data inventari multi-outlet.
+                  </p>
+                  <div className="mt-2 space-y-1">
+                    {invDeleteBlocked.blockers?.map((b, i) => (
+                      <div key={i} className="flex items-center gap-2 text-slate-400 text-xs">
+                        <span className="text-slate-600">•</span> {b}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-amber-400/80 text-xs mt-2.5 leading-relaxed italic font-medium">
+                    <Lightbulb className="h-3 w-3 inline text-amber-400" /> {invDeleteBlocked.suggestion}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Blocked: has sales/consumption history → suggest archive */}
+          {invDeleteBlocked && invDeleteBlocked.blockType === 'hasSales' && (
+            <div className="space-y-3 my-2">
+              <div className="flex items-start gap-2 rounded-lg bg-purple-500/10 border border-purple-500/20 p-3">
+                <Receipt className="h-4 w-4 text-purple-400 mt-0.5 shrink-0" />
+                <div className="text-sm">
+                  <p className="text-purple-300 font-medium">{invDeleteBlocked.message}</p>
+                  <p className="text-slate-400 text-xs mt-2 leading-relaxed">
+                    Item yang telah terpakai dalam transaksi penjualan tidak dapat dihapus untuk menjaga integritas data penjualan dan analisis.
+                  </p>
+                  <div className="mt-2 space-y-1">
+                    {invDeleteBlocked.blockers?.map((b, i) => (
+                      <div key={i} className="flex items-center gap-2 text-slate-400 text-xs">
+                        <span className="text-slate-600">•</span> {b}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-amber-400/80 text-xs mt-2.5 leading-relaxed italic font-medium">
+                    <Lightbulb className="h-3 w-3 inline text-amber-400" /> {invDeleteBlocked.suggestion}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Blocked: has composition/BOM links → suggest archive */}
+          {invDeleteBlocked && invDeleteBlocked.blockType === 'hasCompositions' && (
+            <div className="space-y-3 my-2">
+              <div className="flex items-start gap-2 rounded-lg bg-orange-500/10 border border-orange-500/20 p-3">
+                <Package className="h-4 w-4 text-orange-400 mt-0.5 shrink-0" />
+                <div className="text-sm">
+                  <p className="text-orange-300 font-medium">{invDeleteBlocked.message}</p>
+                  <p className="text-slate-400 text-xs mt-2 leading-relaxed">
+                    Item ini digunakan sebagai bahan dalam resep/komposisi produk. Hapus atau ubah komposisi produk terlebih dahulu.
+                  </p>
+                  <div className="mt-2 space-y-1">
+                    {invDeleteBlocked.blockers?.map((b, i) => (
+                      <div key={i} className="flex items-center gap-2 text-slate-400 text-xs">
+                        <span className="text-slate-600">•</span> {b}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-amber-400/80 text-xs mt-2.5 leading-relaxed italic font-medium">
+                    <Lightbulb className="h-3 w-3 inline text-amber-400" /> {invDeleteBlocked.suggestion}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Blocked: mixed history types → suggest archive */}
+          {invDeleteBlocked && invDeleteBlocked.blockType === 'hasMixedHistory' && (
+            <div className="space-y-3 my-2">
+              <div className="flex items-start gap-2 rounded-lg bg-rose-500/10 border border-rose-500/20 p-3">
+                <AlertTriangle className="h-4 w-4 text-rose-400 mt-0.5 shrink-0" />
+                <div className="text-sm">
+                  <p className="text-rose-300 font-medium">{invDeleteBlocked.message}</p>
+                  <p className="text-slate-400 text-xs mt-2 leading-relaxed">
+                    Item ini memiliki berbagai jenis histori bisnis dan tidak dapat dihapus untuk menjaga integritas data secara keseluruhan.
+                  </p>
+                  <div className="mt-2 space-y-1">
+                    {invDeleteBlocked.blockers?.map((b, i) => (
+                      <div key={i} className="flex items-center gap-2 text-slate-400 text-xs">
+                        <span className="text-slate-600">•</span> {b}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-amber-400/80 text-xs mt-2.5 leading-relaxed italic font-medium">
+                    <Lightbulb className="h-3 w-3 inline text-amber-400" /> {invDeleteBlocked.suggestion}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Blocked: other history (fallback for hasHistory) */}
           {invDeleteBlocked && invDeleteBlocked.blockType === 'hasHistory' && (
             <div className="space-y-3 my-2">
               <div className="flex items-start gap-2 rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
@@ -5632,13 +6526,33 @@ n                            {/* Action Buttons */}
 
           <AlertDialogFooter className="gap-2">
             <AlertDialogCancel className="text-slate-400 hover:text-white hover:bg-white/[0.04]">Batal</AlertDialogCancel>
-            {invDeleteBlocked?.blockType === 'hasHistory' ? (
+            {invDeleteBlocked?.blockType === 'hasPurchases' || 
+             invDeleteBlocked?.blockType === 'hasTransfers' || 
+             invDeleteBlocked?.blockType === 'hasSales' || 
+             invDeleteBlocked?.blockType === 'hasCompositions' || 
+             invDeleteBlocked?.blockType === 'hasMixedHistory' || 
+             invDeleteBlocked?.blockType === 'hasHistory' ? (
               <AlertDialogAction
-                className="bg-amber-500/15 text-amber-400 hover:bg-amber-500/25 border border-amber-500/20"
+                className={cn(
+                  "border transition-all",
+                  invDeleteBlocked?.blockType === 'hasPurchases' && 'bg-red-500/15 text-red-400 hover:bg-red-500/25 border-red-500/20',
+                  invDeleteBlocked?.blockType === 'hasTransfers' && 'bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 border-blue-500/20',
+                  invDeleteBlocked?.blockType === 'hasSales' && 'bg-purple-500/15 text-purple-400 hover:bg-purple-500/25 border-purple-500/20',
+                  invDeleteBlocked?.blockType === 'hasCompositions' && 'bg-orange-500/15 text-orange-400 hover:bg-orange-500/25 border-orange-500/20',
+                  (invDeleteBlocked?.blockType === 'hasMixedHistory' || invDeleteBlocked?.blockType === 'hasHistory') && 'bg-amber-500/15 text-amber-400 hover:bg-amber-500/25 border-amber-500/20'
+                )}
                 onClick={(e) => handleArchiveInv(e)}
                 disabled={archivingInv || deleteInvLoading}
               >
-                {archivingInv ? <Loader2 className="h-4 w-4 animate-spin" /> : '🚫 Nonaktifkan'}
+                {archivingInv ? <Loader2 className="h-4 w-4 animate-spin" /> : (
+                  <>
+                    {invDeleteBlocked?.blockType === 'hasPurchases' && (<><Lock className="h-3.5 w-3.5 inline mr-1" />Nonaktifkan Saja</>)}
+                    {invDeleteBlocked?.blockType === 'hasTransfers' && (<><Lock className="h-3.5 w-3.5 inline mr-1" />Nonaktifkan Saja</>)}
+                    {invDeleteBlocked?.blockType === 'hasSales' && (<><Ban className="h-3.5 w-3.5 inline mr-1" />Nonaktifkan</>)}
+                    {invDeleteBlocked?.blockType === 'hasCompositions' && (<><Ban className="h-3.5 w-3.5 inline mr-1" />Nonaktifkan</>)}
+                    {(invDeleteBlocked?.blockType === 'hasMixedHistory' || invDeleteBlocked?.blockType === 'hasHistory') && (<><Ban className="h-3.5 w-3.5 inline mr-1" />Nonaktifkan</>)}
+                  </>
+                )}
               </AlertDialogAction>
             ) : (
               <AlertDialogAction
@@ -5646,7 +6560,7 @@ n                            {/* Action Buttons */}
                 onClick={(e) => handleDeleteInv(e)}
                 disabled={archivingInv || deleteInvLoading}
               >
-                {deleteInvLoading || archivingInv ? <Loader2 className="h-4 w-4 animate-spin" /> : '🗑 Hapus'}
+                {deleteInvLoading || archivingInv ? <Loader2 className="h-4 w-4 animate-spin" /> : (<><Trash2 className="h-3.5 w-3.5 inline mr-1" />Hapus</>)}
               </AlertDialogAction>
             )}
           </AlertDialogFooter>
@@ -5657,83 +6571,340 @@ n                            {/* Action Buttons */}
       {/* CATEGORY DIALOGS                                               */}
       {/* ══════════════════════════════════════════════════════════ */}
 
-      {/* Category Management Dialog */}
+      {/* Category Management Dialog - Modern Glass Design */}
       <ResponsiveDialog open={categoryDialogOpen} onOpenChange={setCategoryDialogOpen}>
-        <ResponsiveDialogContent className="sm:max-w-lg">
-          <ResponsiveDialogHeader>
-            <ResponsiveDialogTitle className="text-white text-base">Kelola Kategori</ResponsiveDialogTitle>
-            <ResponsiveDialogDescription className="text-slate-400 text-xs">
-              Kategori untuk mengelompokkan item inventory
-            </ResponsiveDialogDescription>
-          </ResponsiveDialogHeader>
-          <div className="space-y-3 mt-2">
-            {/* Add form */}
-            <div className="flex items-center gap-2">
-              <Input
-                value={catFormName}
-                onChange={(e) => setCatFormName(e.target.value)}
-                placeholder="Nama kategori baru"
-                className={cn(inputClass, 'flex-1')}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleCategorySubmit() }}
-              />
-              <Select value={catFormColor} onValueChange={setCatFormColor}>
-                <SelectTrigger className={cn(inputClass, 'w-20')}>
-                  <div className="flex items-center gap-1.5">
-                    <span className={cn('w-2.5 h-2.5 rounded-full', getCategoryColorClasses(catFormColor).dot)} />
-                    <span className="text-[10px] text-slate-400">{catFormColor}</span>
+        <ResponsiveDialogContent className="sm:max-w-lg max-h-[90vh] overflow-hidden flex flex-col bg-nebula">
+          {/* Modern Header with Glass Effect & Stats */}
+          <div className="relative overflow-hidden rounded-t-xl">
+            {/* Background Effects */}
+            <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/10 via-transparent to-cyan-500/5" />
+            <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/10 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2" />
+            <div className="absolute bottom-0 left-0 w-24 h-24 bg-cyan-500/10 rounded-full blur-2xl translate-y-1/2 -translate-x-1/2" />
+            <div className="absolute inset-0 opacity-[0.03]" style={{ backgroundImage: 'radial-gradient(circle at 1px 1px, white 1px, transparent 0)', backgroundSize: '20px 20px' }} />
+            
+            <div className="relative px-4 pt-4 pb-3">
+              <ResponsiveDialogHeader className="text-left border-none pb-0 space-y-1">
+                <ResponsiveDialogTitle className="text-white text-base font-bold flex items-center gap-2.5">
+                  <div className="relative flex items-center justify-center w-9 h-9 rounded-lg bg-gradient-to-br from-emerald-500/20 to-cyan-500/15 border border-white/[0.10]">
+                    <Tags className="h-4 w-4 text-emerald-400" />
                   </div>
-                </SelectTrigger>
-                <SelectContent className="bg-nebula border-white/[0.06]">
-                  {CATEGORY_COLORS.map((c) => (
-                    <SelectItem key={c} value={c} className="text-slate-200 text-xs">
-                      <div className="flex items-center gap-2">
-                        <span className={cn('w-2.5 h-2.5 rounded-full', getCategoryColorClasses(c).dot)} />
-                        {c}
-                      </div>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                size="sm"
-                className="h-9 px-3 theme-bg theme-hover text-white text-xs shrink-0"
-                disabled={catFormLoading}
-                onClick={handleCategorySubmit}
-              >
-                {catFormLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
-              </Button>
+                  <div className="flex flex-col">
+                    <span>Kelola Kategori</span>
+                    <span className="text-[10px] font-normal text-slate-500 font-medium">Organisir item inventory Anda</span>
+                  </div>
+                </ResponsiveDialogTitle>
+              </ResponsiveDialogHeader>
+              
+              {/* Quick Stats Bar - compact */}
+              {categories.length > 0 && (
+                <div className="flex items-center gap-2 mt-3 pt-3 border-t border-white/[0.06]">
+                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-white/[0.04] border border-white/[0.06]">
+                    <FolderOpen className="h-3 w-3 text-emerald-400" />
+                    <span className="text-[10px] text-slate-400 font-medium">{categories.length} Kategori</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-white/[0.04] border border-white/[0.06]">
+                    <Package className="h-3 w-3 text-cyan-400" />
+                    <span className="text-[10px] text-slate-400 font-medium">{categories.reduce((sum, c) => sum + (c._count?.items || 0), 0)} Item</span>
+                  </div>
+                </div>
+              )}
             </div>
+          </div>
 
-            {/* Category list */}
-            {categories.length === 0 ? (
-              <div className="py-8 text-center">
-                <Tags className="h-6 w-6 text-slate-600 mx-auto mb-1.5" />
-                <p className="text-xs text-slate-500">Belum ada kategori</p>
+          <div className="space-y-3 mt-2 px-1 flex-1 overflow-y-auto custom-scrollbar">
+            {/* Add/Edit Form - Compact Design */}
+            {editingCatId ? (
+              /* Edit Mode Form - Compact */
+              <div className="relative overflow-hidden rounded-xl bg-gradient-to-br from-amber-500/[0.08] to-orange-500/[0.03] border border-amber-500/20">
+                <div className="absolute top-0 left-0 w-full h-px bg-gradient-to-r from-transparent via-amber-500/40 to-transparent" />
+                <div className="p-3.5 space-y-3 relative">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-amber-500/15 border border-amber-500/25 w-fit">
+                      <Pencil className="h-3 w-3 text-amber-400" />
+                      <span className="text-[10px] text-amber-400 font-semibold uppercase tracking-wider">Mode Edit</span>
+                    </div>
+                    <button onClick={cancelEditCategory} className="p-1 rounded-md hover:bg-white/[0.08] transition-colors text-slate-400 hover:text-white">
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  
+                  <Input
+                    value={catFormName}
+                    onChange={(e) => setCatFormName(e.target.value)}
+                    placeholder="Nama kategori..."
+                    className='w-full h-10 text-sm rounded-lg bg-white/[0.05] border-white/[0.10] focus:border-amber-500/40 focus:ring-amber-500/20'
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleEditCategorySave() }}
+                    autoFocus
+                  />
+                  
+                  <div className="space-y-2">
+                    <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider flex items-center gap-1.5">
+                      <Palette className="h-3 w-3 text-amber-400" />
+                      Pilih Warna
+                    </p>
+                    <div className="grid grid-cols-6 gap-2 p-2 rounded-lg bg-black/10 border border-white/[0.04]">
+                      {CATEGORY_COLORS.map((color) => {
+                        const colorClass = getCategoryColorClasses(color)
+                        const isSelected = catFormColor === color
+                        return (
+                          <button
+                            key={color}
+                            type="button"
+                            onClick={() => setCatFormColor(color)}
+                            className={cn(
+                              'flex flex-col items-center gap-1 p-1.5 rounded-lg transition-all duration-200',
+                              isSelected ? 'bg-white/[0.10] ring-2 ring-white/30 scale-105' : 'hover:bg-white/[0.06] hover:scale-102'
+                            )}
+                          >
+                            <span className={cn(
+                              'w-6 h-6 rounded-full transition-all duration-200 ring-offset-1 ring-offset-nebula shadow-sm',
+                              colorClass.dot,
+                              isSelected ? 'ring-2 ring-white scale-110 ring-offset-amber-500/20' : 'hover:ring-2 hover:ring-white/20'
+                            )} />
+                            <span className={cn('text-[8px] font-bold leading-none truncate w-full text-center uppercase', isSelected ? 'text-white' : 'text-slate-500')}>
+                              {color.slice(0, 3)}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                  
+                  <div className="flex gap-2 pt-1">
+                    <Button size="sm" variant="outline" className="flex-1 h-9 text-xs border-white/[0.10] text-slate-300 hover:bg-white/[0.06] hover:text-white rounded-lg font-medium" onClick={cancelEditCategory}>Batal</Button>
+                    <Button size="sm" className="flex-1 h-9 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-white border-0 text-xs font-semibold shadow-md shadow-amber-500/25 rounded-lg disabled:opacity-50" disabled={catFormLoading} onClick={handleEditCategorySave}>
+                      {catFormLoading ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1" />Menyimpan...</> : <><Check className="h-3.5 w-3.5 mr-1" />Simpan</>}
+                    </Button>
+                  </div>
+                </div>
               </div>
             ) : (
-              <div className="space-y-1.5 max-h-[250px] overflow-y-auto">
-                {categories.map((c) => {
-                  const cc = getCategoryColorClasses(c.color)
-                  return (
-                    <div key={c.id} className="flex items-center gap-3 p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04]">
-                      <span className={cn('w-3 h-3 rounded-full shrink-0', cc.dot)} />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs text-slate-200 font-medium truncate">{c.name}</p>
-                        {c._count && c._count.items > 0 && (
-                          <p className="text-[10px] text-slate-500">{c._count.items} item</p>
-                        )}
-                      </div>
+              /* Add Mode Form - Compact */
+              <div className="relative overflow-hidden rounded-xl bg-gradient-to-br from-emerald-500/[0.06] to-cyan-500/[0.03] border border-emerald-500/15">
+                <div className="absolute top-0 left-0 w-full h-px bg-gradient-to-r from-transparent via-emerald-500/30 to-transparent" />
+                <div className="p-3.5 space-y-3">
+                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-emerald-500/15 border border-emerald-500/25 w-fit">
+                    <Plus className="h-3 w-3 text-emerald-400" />
+                    <span className="text-[10px] text-emerald-400 font-semibold uppercase tracking-wider">Tambah Baru</span>
+                  </div>
+                  
+                  <Input
+                    value={catFormName}
+                    onChange={(e) => setCatFormName(e.target.value)}
+                    placeholder="Nama kategori baru..."
+                    className='w-full h-10 text-sm rounded-lg bg-white/[0.05] border-white/[0.10] focus:border-emerald-500/40 focus:ring-emerald-500/20 placeholder:text-slate-500'
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleCategorySubmit() }}
+                  />
+                  
+                  <div className="space-y-2">
+                    <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider flex items-center gap-1.5">
+                      <Palette className="h-3 w-3 text-emerald-400" />
+                      Pilih Warna
+                    </p>
+                    <div className="grid grid-cols-6 gap-2 p-2 rounded-lg bg-black/10 border border-white/[0.04]">
+                      {CATEGORY_COLORS.map((color) => {
+                        const colorClass = getCategoryColorClasses(color)
+                        const isSelected = catFormColor === color
+                        return (
+                          <button
+                            key={color}
+                            type="button"
+                            onClick={() => setCatFormColor(color)}
+                            className={cn(
+                              'flex flex-col items-center gap-1 p-1.5 rounded-lg transition-all duration-200',
+                              isSelected ? 'bg-white/[0.10] ring-2 ring-white/30 scale-105' : 'hover:bg-white/[0.06] hover:scale-102'
+                            )}
+                          >
+                            <span className={cn(
+                              'w-6 h-6 rounded-full transition-all duration-200 ring-offset-1 ring-offset-nebula shadow-sm',
+                              colorClass.dot,
+                              isSelected ? 'ring-2 ring-white scale-110 ring-offset-emerald-500/20' : 'hover:ring-2 hover:ring-white/20'
+                            )} />
+                            <span className={cn('text-[8px] font-bold leading-none truncate w-full text-center uppercase', isSelected ? 'text-white' : 'text-slate-500')}>
+                              {color.slice(0, 3)}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                  
+                  <Button
+                    className="w-full h-9 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-white text-xs font-semibold gap-1.5 rounded-lg shadow-md shadow-emerald-500/20 disabled:opacity-50 transition-all duration-200"
+                    disabled={catFormLoading || !catFormName.trim()}
+                    onClick={handleCategorySubmit}
+                  >
+                    {catFormLoading ? <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Menambahkan...</> : <><Plus className="h-3.5 w-3.5" /> Tambah Kategori</>}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* Category List Section - Compact Cards */}
+            {categories.length === 0 ? (
+              /* Compact Empty State */
+              <div className="py-10 text-center rounded-xl border border-dashed border-white/[0.08] bg-gradient-to-b from-white/[0.02] to-transparent relative overflow-hidden">
+                <div className="absolute top-6 left-1/2 -translate-x-1/2 w-28 h-28 bg-emerald-500/5 rounded-full blur-2xl" />
+                
+                <div className="relative">
+                  <div className="inline-flex items-center justify-center w-14 h-14 rounded-xl bg-gradient-to-br from-violet-500/10 to-emerald-500/10 border border-white/[0.08] mb-3 shadow-inner">
+                    <Tags className="h-6 w-6 text-slate-500" />
+                  </div>
+                  <p className="text-sm text-slate-300 font-semibold mb-1">Belum Ada Kategori</p>
+                  <p className="text-xs text-slate-500 mb-4 max-w-[220px] mx-auto leading-snug">
+                    Buat kategori pertama untuk mengelompokkan item inventory
+                  </p>
+                  <Button
+                    variant="outline"
+                    className="h-9 px-4 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/10 hover:text-emerald-300 hover:border-emerald-500/50 gap-1.5 text-xs font-medium rounded-lg transition-all duration-200"
+                    onClick={() => document.querySelector<HTMLInputElement>('input[placeholder*="kategori baru"]')?.focus()}
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Buat Kategori Pertama
+                  </Button>
+                  <p className="text-[10px] text-slate-600 mt-3 flex items-center justify-center gap-1">
+                    <Sparkles className="h-2.5 w-2.5" />
+                    Tip: Gunakan warna berbeda untuk membedakan tipe item
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {/* Modern Bulk Actions Bar */}
+                <div className="flex items-center justify-between p-3 rounded-xl bg-white/[0.02] border border-white/[0.06] backdrop-blur-sm">
+                  <label className="flex items-center gap-3 cursor-pointer select-none group">
+                    <Checkbox
+                      checked={categories.length > 0 && selectedCatIds.size === categories.length}
+                      onCheckedChange={toggleSelectAllCats}
+                      className="data-[state=checked]:bg-emerald-500 data-[state=checked]:border-emerald-500 h-5 w-5 rounded-md data-[state=checked]:shadow-lg data-[state=checked]:shadow-emerald-500/30"
+                    />
+                    <span className="text-xs text-slate-400 group-hover:text-slate-300 transition-colors font-medium">
+                      {selectedCatIds.size === categories.length && selectedCatIds.size > 0 
+                        ? `Semua (${categories.length})` 
+                        : 'Pilih Semua'}
+                    </span>
+                  </label>
+                  {selectedCatIds.size > 0 && (
+                    <motion.div initial={{ scale: 0.8, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ type: "spring", stiffness: 500, damping: 25 }}>
                       <Button
                         variant="ghost"
                         size="sm"
-                        className="h-7 px-2 text-red-400 hover:text-red-300 hover:bg-red-500/[0.06] shrink-0"
-                        onClick={() => setDeleteCatId(c.id)}
+                        className="h-9 px-4 text-red-400 hover:text-red-300 hover:bg-red-500/10 text-xs font-semibold gap-2 rounded-lg border border-red-500/20 bg-red-500/[0.05]"
+                        onClick={() => setBulkDeleteCatsOpen(true)}
                       >
-                        <Trash2 className="h-3 w-3" />
+                        <Trash2 className="h-4 w-4" />
+                        Hapus ({selectedCatIds.size})
                       </Button>
-                    </div>
-                  )
-                })}
+                    </motion.div>
+                  )}
+                </div>
+
+                {/* Category Cards List - Redesigned with Always-Visible Actions */}
+                <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/5">
+                  {categories.map((c) => {
+                    const cc = getCategoryColorClasses(c.color)
+                    const isSelected = selectedCatIds.has(c.id)
+                    const isEditing = editingCatId === c.id
+                    
+                    return (
+                      <motion.div
+                        key={c.id}
+                        initial={{ opacity: 0, y: 6 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ duration: 0.2, ease: 'easeOut' }}
+                        whileHover={{ scale: 1.005 }}
+                        className={cn(
+                          'group relative flex items-center gap-3 p-3.5 rounded-xl transition-all duration-200',
+                          'border backdrop-blur-sm',
+                          isSelected 
+                            ? 'bg-emerald-500/[0.08] border-emerald-500/25 shadow-lg shadow-emerald-500/5' 
+                            : 'bg-white/[0.02] border-white/[0.06] hover:bg-white/[0.04] hover:border-white/[0.10]',
+                          isEditing && 'ring-1 ring-amber-500/40 bg-amber-500/[0.04]'
+                        )}
+                      >
+                        {/* Selection Checkbox - Always Visible with Emerald Theme */}
+                        <Checkbox
+                          checked={isSelected}
+                          onCheckedChange={() => toggleCatSelection(c.id)}
+                          className={cn(
+                            'shrink-0 h-4.5 w-4.5 transition-all duration-200',
+                            isSelected 
+                              ? 'data-[state=checked]:bg-emerald-500 data-[state=checked]:border-emerald-500' 
+                              : 'data-[state=checked]:bg-emerald-500 data-[state=checked]:border-emerald-500'
+                          )}
+                        />
+
+                        {/* Enhanced Color Dot + Info */}
+                        <div className="flex items-center gap-3 min-w-0 flex-1">
+                          <span className={cn(
+                            'w-4 h-4 rounded-full shrink-0 ring-2 ring-offset-2 ring-offset-nebula/80 shadow-md',
+                            cc.dot,
+                            cc.dot.replace('bg-', 'ring-')
+                          )} />
+                          <div className="min-w-0 flex-1">
+                            <p className={cn(
+                              'text-sm font-semibold truncate transition-colors',
+                              isSelected ? 'text-white' : 'text-slate-200 group-hover:text-white'
+                            )}>
+                              {c.name}
+                            </p>
+                            <div className="flex items-center gap-2 mt-1">
+                              {c._count && c._count.items > 0 ? (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-white/[0.06] text-[11px] text-slate-400 font-medium tabular-nums">
+                                  {c._count.items} item
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-white/[0.03] text-[11px] text-slate-600 font-medium">
+                                  kosong
+                                </span>
+                              )}
+                              <span className="w-1 h-1 rounded-full bg-slate-700" />
+                              <span className={cn('text-[11px] font-medium capitalize', cc.text)}>{c.color}</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Action Buttons - ALWAYS VISIBLE for Touch-Friendly UX */}
+                        <div className="flex items-center gap-1 shrink-0">
+                          {!isEditing && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-9 w-9 p-0 text-slate-500 hover:text-amber-400 hover:bg-amber-500/10 rounded-lg transition-colors"
+                              onClick={() => startEditCategory(c)}
+                              title="Edit kategori"
+                              aria-label={`Edit ${c.name}`}
+                            >
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-9 w-9 p-0 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                            onClick={() => setDeleteCatId(c.id)}
+                            title="Hapus kategori"
+                            aria-label={`Hapus ${c.name}`}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      </motion.div>
+                    )
+                  })}
+                </div>
+
+                {/* Enhanced Footer Stats */}
+                <div className="flex items-center justify-between px-2 pt-2 pb-1">
+                  <p className="text-xs text-slate-500 font-medium">
+                    {categories.length} kategori{categories.length === 1 ? '' : ''}
+                    {selectedCatIds.size > 0 && (
+                      <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 text-[11px] font-semibold">
+                        {selectedCatIds.size} dipilih
+                      </span>
+                    )}
+                  </p>
+                </div>
               </div>
             )}
           </div>
@@ -5757,6 +6928,59 @@ n                            {/* Action Buttons */}
               disabled={deletingCat}
             >
               {deletingCat ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Hapus'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Bulk Delete Categories Confirmation */}
+      <AlertDialog open={bulkDeleteCatsOpen} onOpenChange={(open) => { if (!open) setBulkDeleteCatsOpen(false) }}>
+        <AlertDialogContent className="bg-nebula border-white/[0.06]">
+          <AlertDialogHeader>
+            <div className="flex items-center gap-3 mb-2">
+              <div className="flex items-center justify-center w-10 h-10 rounded-full bg-red-500/10">
+                <Trash2 className="h-5 w-5 text-red-400" />
+              </div>
+              <div>
+                <AlertDialogTitle className="text-white">Hapus {selectedCatIds.size} Kategori?</AlertDialogTitle>
+              </div>
+            </div>
+            <AlertDialogDescription className="text-slate-400 text-sm leading-relaxed">
+              <span className="text-red-400 font-medium">{selectedCatIds.size} kategori</span> yang dipilih akan dihapus permanen.
+              Item dalam kategori ini akan menjadi tanpa kategori.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {/* Preview of categories to delete */}
+          <div className="py-2 px-3 rounded-lg bg-white/[0.02] border border-white/[0.05] max-h-[120px] overflow-y-auto">
+            <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wider mb-2">Kategori yang akan dihapus:</p>
+            <div className="flex flex-wrap gap-1.5">
+              {Array.from(selectedCatIds).map(id => {
+                const cat = categories.find(c => c.id === id)
+                if (!cat) return null
+                const cc = getCategoryColorClasses(cat.color)
+                return (
+                  <span key={id} className={cn('inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-full', cc.bg, cc.text)}>
+                    <span className={cn('w-2 h-2 rounded-full', cc.dot)} />
+                    {cat.name}
+                  </span>
+                )
+              })}
+            </div>
+          </div>
+          <AlertDialogFooter className="gap-2 pt-3">
+            <AlertDialogCancel className="text-slate-400 hover:text-white hover:bg-white/[0.04]" disabled={bulkDeletingCats}>
+              Batal
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-red-500/15 text-red-400 hover:bg-red-500/25 border border-red-500/20"
+              onClick={handleBulkDeleteCategories}
+              disabled={bulkDeletingCats}
+            >
+              {bulkDeletingCats ? (
+                <><Loader2 className="h-4 w-4 animate-spin mr-1" />Menghapus...</>
+              ) : (
+                <><Trash2 className="h-3.5 w-3.5 inline mr-1" />Hapus {selectedCatIds.size} Kategori</>
+              )}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -6536,10 +7760,22 @@ n                            {/* Action Buttons */}
                   <p className="text-sm font-bold text-white">{invDetailData._count.compositions}</p>
                   <p className="text-[10px] text-slate-500">Komposisi</p>
                 </div>
-                <div className="bg-white/[0.03] rounded-lg p-2.5 border border-white/[0.04] text-center">
-                  <p className="text-sm font-bold text-white">{invDetailData._count.movements}</p>
-                  <p className="text-[10px] text-slate-500">Movement</p>
-                </div>
+                {(() => {
+                  // Check if all movements are migration (initial stock only)
+                  const isMigrationOnly = invDetailData.movements.length > 0 && 
+                    invDetailData.movements.every(m => m.referenceType === 'MIGRATION')
+                  const hasMovements = invDetailData._count.movements > 0
+                  
+                  return (
+                    <div className="bg-white/[0.03] rounded-lg p-2.5 border border-white/[0.04] text-center">
+                      <p className="text-sm font-bold text-white">{invDetailData._count.movements}</p>
+                      <p className="text-[10px] text-slate-500">
+                        {!hasMovements ? 'Riwayat Stok' : 
+                         isMigrationOnly ? 'Stok Awal' : 'Riwayat Stok'}
+                      </p>
+                    </div>
+                  )
+                })()}
               </div>
 
               {/* Detail fields */}
@@ -6566,25 +7802,36 @@ n                            {/* Action Buttons */}
                 </div>
               </div>
 
-              {/* Tabs: Produk Terkait, Movement, Batch */}
+              {/* Tabs: Produk Terkait, Stok/Movement, Batch */}
               <Tabs value={invDetailTab} onValueChange={(v) => {
                 setInvDetailTab(v)
                 if (v === 'batch' && invDetailData) void fetchBatchTimeline(invDetailData.id)
               }} className="w-full min-w-0">
-                <TabsList className="bg-white/[0.04] h-8 w-full grid grid-cols-3 min-w-0">
-                  <TabsTrigger value="products" className="text-[10px] h-7 gap-1 data-[state=active]:bg-white/[0.08] text-slate-400 data-[state=active]:text-white">
-                    <Link2 className="h-3 w-3" />
-                    Produk ({invDetailData.linkedProducts.length})
-                  </TabsTrigger>
-                  <TabsTrigger value="movements" className="text-[10px] h-7 gap-1 data-[state=active]:bg-white/[0.08] text-slate-400 data-[state=active]:text-white">
-                    <Activity className="h-3 w-3" />
-                    Movement ({invDetailData._count.movements})
-                  </TabsTrigger>
-                  <TabsTrigger value="batch" className="text-[10px] h-7 gap-1 data-[state=active]:bg-white/[0.08] text-slate-400 data-[state=active]:text-white">
-                    <Hash className="h-3 w-3" />
-                    Batch
-                  </TabsTrigger>
-                </TabsList>
+                {(() => {
+                  // Calculate once for both stats card and tab
+                  const isMigrationOnly = invDetailData.movements.length > 0 && 
+                    invDetailData.movements.every(m => m.referenceType === 'MIGRATION')
+                  const movementCount = invDetailData._count.movements
+                  const movementLabel = !movementCount ? 'Riwayat' : 
+                    isMigrationOnly ? 'Stok Awal' : 'Riwayat'
+                  
+                  return (
+                    <TabsList className="bg-white/[0.04] h-8 w-full grid grid-cols-3 min-w-0">
+                      <TabsTrigger value="products" className="text-[10px] h-7 gap-1 data-[state=active]:bg-white/[0.08] text-slate-400 data-[state=active]:text-white">
+                        <Link2 className="h-3 w-3" />
+                        Produk ({invDetailData.linkedProducts.length})
+                      </TabsTrigger>
+                      <TabsTrigger value="movements" className="text-[10px] h-7 gap-1 data-[state=active]:bg-white/[0.08] text-slate-400 data-[state=active]:text-white">
+                        <Activity className="h-3 w-3" />
+                        {movementLabel} ({movementCount})
+                      </TabsTrigger>
+                      <TabsTrigger value="batch" className="text-[10px] h-7 gap-1 data-[state=active]:bg-white/[0.08] text-slate-400 data-[state=active]:text-white">
+                        <Hash className="h-3 w-3" />
+                        Batch
+                      </TabsTrigger>
+                    </TabsList>
+                  )
+                })()}
 
                 {/* Linked Products Tab */}
                 <TabsContent value="products" className="mt-3">
@@ -6627,15 +7874,24 @@ n                            {/* Action Buttons */}
                   )}
                 </TabsContent>
 
-                {/* Movements Tab */}
+                {/* Movements Tab - menampilkan stok awal migrasi & pergerakan stok */}
                 <TabsContent value="movements" className="mt-3">
                   {invDetailData.movements.length === 0 ? (
                     <div className="py-8 text-center">
-                      <Activity className="h-6 w-6 text-slate-600 mx-auto mb-2" />
-                      <p className="text-xs text-slate-500">Belum ada riwayat pergerakan stok.</p>
+                      <PackageOpen className="h-6 w-6 text-slate-600 mx-auto mb-2" />
+                      <p className="text-xs text-slate-400 mb-1">Belum ada riwayat stok</p>
+                      <p className="text-[10px] text-slate-600">Stok akan tercatat setelah pembelian pertama atau migrasi data</p>
                     </div>
                   ) : (
-                    <div className="space-y-1.5 max-h-64 overflow-y-auto overflow-x-hidden pr-1">
+                    <div className="space-y-2">
+                      {/* Info card menjelaskan apa ini */}
+                      <div className="rounded-lg bg-sky-500/5 border border-sky-500/10 px-3 py-2 flex items-start gap-2">
+                        <Info className="h-3.5 w-3.5 text-sky-400 mt-0.5 shrink-0" />
+                        <p className="text-[10px] text-slate-400 leading-relaxed">
+                          <span className="text-sky-300 font-medium">Riwayat stok</span> mencatat perubahan qty: stok awal migrasi, pembelian, konsumsi, & penyesuaian.
+                        </p>
+                      </div>
+                      <div className="space-y-1.5 max-h-64 overflow-y-auto overflow-x-hidden pr-1">
                       {invDetailData.movements.map((m) => (
                         <div key={m.id} className="flex items-center gap-2.5 py-2 px-2.5 rounded-lg bg-white/[0.02] border border-white/[0.03] min-w-0">
                           <div className={cn(
@@ -6673,6 +7929,7 @@ n                            {/* Action Buttons */}
                           </div>
                         </div>
                       ))}
+                      </div>
                     </div>
                   )}
 
@@ -6819,6 +8076,30 @@ n                            {/* Action Buttons */}
               </div>
             )}
 
+            {!batchSearchLoading && !batchSearchResult && (
+              <div className="py-8 text-center">
+                <Hash className="h-8 w-8 text-slate-600 mx-auto mb-3" />
+                <p className="text-sm text-slate-400 mb-1">Cari Nomor Batch</p>
+                <p className="text-xs text-slate-500 mb-4">Masukkan nomor batch untuk melacak stok, expiry, dan riwayat penggunaan</p>
+                <div className="rounded-lg bg-white/[0.02] border border-white/[0.04] p-3 text-left max-w-xs mx-auto">
+                  <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wider mb-2">Contoh Format Batch</p>
+                  <ul className="text-[11px] text-slate-400 space-y-1">
+                    <li>• <span className="font-mono text-white">FM24001</span> — Format tanggal + urut</li>
+                    <li>• <span className="font-mono text-white">BTH-2024-001</span> — Format supplier + tanggal</li>
+                    <li>• <span className="font-mono text-white">EXP0724</span> — Format bulan/tahun expired</li>
+                  </ul>
+                </div>
+              </div>
+            )}
+
+            {!batchSearchLoading && batchSearchQuery.trim() && !batchSearchResult && (
+              <div className="py-6 text-center rounded-xl bg-red-500/[0.03] border border-red-500/10">
+                <Search className="h-6 w-6 text-slate-600 mx-auto mb-2" />
+                <p className="text-sm text-slate-400">Batch <span className="font-mono text-white">"{batchSearchQuery.trim()}"</span> tidak ditemukan</p>
+                <p className="text-xs text-slate-500 mt-1">Pastikan nomor batch sudah benar dan tercatat di sistem</p>
+              </div>
+            )}
+
             {batchSearchResult && !batchSearchLoading && (
               <div className="space-y-3">
                 {/* Batch Info Card */}
@@ -6910,8 +8191,8 @@ n                            {/* Action Buttons */}
                 <Flame className="h-4 w-4 text-red-400" />
               </div>
               <div>
-                <span>Laporan Waste (Sisa Mati)</span>
-                <p className="text-[11px] text-slate-500 font-normal mt-0.5">Rincian barang kadaluarsa & kerugian</p>
+                <span>Laporan Kadaluarsa</span>
+                <p className="text-[11px] text-slate-500 font-normal mt-0.5">Item expired & estimasi kerugian modal</p>
               </div>
             </ResponsiveDialogTitle>
             <ResponsiveDialogDescription className="text-slate-400 text-xs sr-only">
@@ -6953,6 +8234,23 @@ n                            {/* Action Buttons */}
               <div className="flex items-center justify-center py-8">
                 <Loader2 className="h-5 w-5 text-red-400 animate-spin" />
                 <span className="text-xs text-slate-400 ml-2">Memuat laporan...</span>
+              </div>
+            )}
+
+            {!wasteReportLoading && !wasteReportData && (
+              <div className="py-6 text-center">
+                <Flame className="h-8 w-8 text-slate-600 mx-auto mb-3" />
+                <p className="text-sm text-slate-400 mb-1">Cek Kerugian Kadaluarsa</p>
+                <p className="text-xs text-slate-500 mb-4 max-w-xs mx-auto">Lihat item yang sudah kadaluarsa dan hitung estimasi kerugian modal berdasarkan HPP</p>
+                <div className="rounded-lg bg-white/[0.02] border border-white/[0.04] p-3 text-left max-w-xs mx-auto">
+                  <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wider mb-2">Yang Ditampilkan</p>
+                  <ul className="text-[11px] text-slate-400 space-y-1.5">
+                    <li>• Item dengan status <span className="text-red-400 font-medium">EXPIRED</span></li>
+                    <li>• Sisa qty yang terbuang (tidak terjual)</li>
+                    <li>• Estimasi kerugian = sisa qty × HPP</li>
+                    <li>• Filter berdasarkan tanggal expired</li>
+                  </ul>
+                </div>
               </div>
             )}
 

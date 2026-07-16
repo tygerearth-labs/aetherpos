@@ -80,6 +80,9 @@ export async function GET(request: NextRequest) {
         { orderNumber: { contains: search } },
         { supplier: { name: { contains: search } } },
         { notes: { contains: search } },
+        { items: { some: { inventoryItem: { name: { contains: search } } } } },
+        { items: { some: { inventoryItem: { sku: { contains: search } } } } },
+        { createdBy: { name: { contains: search } } },
       ]
     }
 
@@ -211,6 +214,13 @@ export async function GET(request: NextRequest) {
         .filter(i => i.expiredDate)
         .sort((a, b) => new Date(a.expiredDate!).getTime() - new Date(b.expiredDate!).getTime())[0]?.expiredDate || null
 
+      // Granular flags for edit/delete control
+      const hasProductLinks = productLinkedPoIds.has(o.id) && !transferLinkedPoIds.has(o.id) && !transactionLinkedPoIds.has(o.id)
+      const hasTransferLinks = transferLinkedPoIds.has(o.id)
+      const hasTransactionLinks = transactionLinkedPoIds.has(o.id)
+      // hasRealBusinessHistory = blocks both edit and delete (transfers or sales)
+      const hasRealBusinessHistory = hasTransferLinks || hasTransactionLinks
+
       return {
         id: o.id,
         orderNumber: o.orderNumber,
@@ -221,8 +231,14 @@ export async function GET(request: NextRequest) {
         supplierName: o.supplier?.name || null,
         createdByName: o.createdBy.name,
         itemCount: o.items.length,
+        // Legacy flag for backward compatibility
         hasLinkedItems: hasLinkedItems.has(o.id),
         hasUsageHistory: poWithUsageHistory.has(o.id),
+        // New granular flags for precise control
+        hasProductLinks,
+        hasTransferLinks,
+        hasTransactionLinks,
+        hasRealBusinessHistory,
         _batchSummary: {
           itemsWithBatch,
           itemsWithExp,
