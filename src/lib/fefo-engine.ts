@@ -32,6 +32,7 @@
  */
 
 import { Prisma } from '@prisma/client'
+import { ciContains } from '@/lib/api/api-helpers'
 
 // ════════════════════════════════════════════════════════════
 // Types
@@ -810,6 +811,7 @@ export class FEFOEngine {
     id: string
     batchNumber: string
     inventoryItemName: string
+    baseUnit: string
     remainingQty: number
     expiredDate: Date | null
     purchaseOrderNumber: string
@@ -817,13 +819,24 @@ export class FEFOEngine {
   } | null> {
     const { batchNumber, outletId } = params
 
-    const batch = await tx.inventoryBatch.findFirst({
-      where: { batchNumber: { equals: batchNumber, mode: 'insensitive' }, outletId, status: 'AVAILABLE' },
+    // Case-insensitive duplicate check that works in BOTH PostgreSQL and SQLite.
+    // - PostgreSQL: ciContains adds `mode: 'insensitive'`
+    // - SQLite:     `contains` is already case-insensitive for ASCII
+    const candidates = await tx.inventoryBatch.findMany({
+      where: {
+        ...ciContains('batchNumber', batchNumber),
+        outletId,
+        status: 'AVAILABLE',
+      },
       include: {
-        inventoryItem: { select: { name: true } },
+        inventoryItem: { select: { name: true, baseUnit: true } },
         purchaseOrder: { select: { orderNumber: true } },
       },
+      take: 50,
     })
+
+    const lowered = batchNumber.toLowerCase()
+    const batch = candidates.find(b => b.batchNumber.toLowerCase() === lowered)
 
     if (!batch) return null
 
@@ -831,9 +844,10 @@ export class FEFOEngine {
       id: batch.id,
       batchNumber: batch.batchNumber,
       inventoryItemName: batch.inventoryItem.name,
+      baseUnit: batch.inventoryItem.baseUnit,
       remainingQty: batch.remainingQty,
       expiredDate: batch.expiredDate,
-      purchaseOrderNumber: batch.purchaseOrder.orderNumber,
+      purchaseOrderNumber: batch.purchaseOrder?.orderNumber ?? '',
       createdAt: batch.createdAt,
     }
   }
@@ -1072,18 +1086,15 @@ export class FEFOEngine {
   ): Promise<{
     totalLoss: number
     items: Array<{
-      inventoryItemId: string
-      itemName: string
+      id: string
+      inventoryItemName: string
+      batchNumber: string | null
+      initialQty: number
+      remainingQty: number
       baseUnit: string
-      totalExpiredQty: number
+      expiredDate: Date | null
+      unitCost: number
       totalLoss: number
-      batches: Array<{
-        batchNumber: string
-        expiredDate: Date | null
-        remainingQty: number
-        unitCost: number
-        loss: number
-      }>
     }>
   }> {
     const { outletId, startDate, endDate } = params
@@ -1100,59 +1111,32 @@ export class FEFOEngine {
           select: { name: true, baseUnit: true },
         },
       },
+      orderBy: { expiredDate: 'desc' },
     })
 
-    // Group by inventory item
-    const byItem = new Map<string, {
-      inventoryItemId: string
-      itemName: string
-      baseUnit: string
-      totalExpiredQty: number
-      totalLoss: number
-      batches: Array<{
-        batchNumber: string
-        expiredDate: Date | null
-        remainingQty: number
-        unitCost: number
-        loss: number
-      }>
-    }>()
-
+    // Return flat list of expired batches (one row per batch), matching the
+    // UI's WasteReportItem interface. totalLoss is the sum across all batches.
     let totalLoss = 0
-
-    for (const batch of batches) {
+    const items = batches.map(batch => {
       const loss = batch.remainingQty * batch.unitCost
       totalLoss += loss
-
-      const existing = byItem.get(batch.inventoryItemId)
-      const batchEntry = {
+      return {
+        id: batch.id,
+        inventoryItemName: batch.inventoryItem.name,
         batchNumber: batch.batchNumber,
-        expiredDate: batch.expiredDate,
+        initialQty: batch.initialQty,
         remainingQty: batch.remainingQty,
+        baseUnit: batch.inventoryItem.baseUnit,
+        expiredDate: batch.expiredDate,
         unitCost: batch.unitCost,
-        loss,
+        totalLoss: loss,
       }
+    })
 
-      if (existing) {
-        existing.totalExpiredQty += batch.remainingQty
-        existing.totalLoss += loss
-        existing.batches.push(batchEntry)
-      } else {
-        byItem.set(batch.inventoryItemId, {
-          inventoryItemId: batch.inventoryItemId,
-          itemName: batch.inventoryItem.name,
-          baseUnit: batch.inventoryItem.baseUnit,
-          totalExpiredQty: batch.remainingQty,
-          totalLoss: loss,
-          batches: [batchEntry],
-        })
-      }
-    }
+    // Sort by loss descending (biggest waste first)
+    items.sort((a, b) => b.totalLoss - a.totalLoss)
 
-    return {
-      totalLoss,
-      items: [...byItem.values()].sort((a, b) => b.totalLoss - a.totalLoss),
-    }
+    return { totalLoss, items }
   }
 
   /**
@@ -1170,12 +1154,13 @@ export class FEFOEngine {
       id: string
       batchNumber: string
       inventoryItemId: string
-      inventoryItemName: string
+      inventoryItem: { id: string; name: string; sku: string | null; baseUnit: string }
       baseUnit: string
       initialQty: number
       remainingQty: number
       unitCost: number
       expiredDate: Date | null
+      daysUntilExpiry: number | null
       supplierName: string | null
       status: string
       createdAt: Date
@@ -1183,29 +1168,53 @@ export class FEFOEngine {
     purchaseOrder: {
       id: string
       orderNumber: string
-      createdAt: Date
+      supplierName: string | null
+      date: Date
       totalCost: number
     } | null
     transactions: Array<{
+      id: string
       transactionId: string
       invoiceNumber: string
-      createdAt: Date
-      quantityConsumed: number
+      date: Date
+      qtyConsumed: number
+      sourceProducts: string
       sourceDetails: Array<{ productName: string; variantName?: string; productQty: number }>
     }>
   } | null> {
     const { batchNumber, outletId } = params
 
-    // MED-09 FIX: Case-insensitive batch search
-    const batch = await tx.inventoryBatch.findFirst({
-      where: { batchNumber: { equals: batchNumber, mode: 'insensitive' }, outletId },
+    // Case-insensitive batch search that works in BOTH PostgreSQL and SQLite.
+    // - PostgreSQL: ciContains adds `mode: 'insensitive'` (required for CI search)
+    // - SQLite:     `contains` is already case-insensitive for ASCII
+    //
+    // We prefer an exact case-insensitive match first, then fall back to a
+    // partial (contains) match for flexibility (e.g. "B2025" matches "B2025-001").
+    const candidates = await tx.inventoryBatch.findMany({
+      where: {
+        OR: [
+          ciContains('batchNumber', batchNumber),
+        ],
+        outletId,
+      },
       include: {
-        inventoryItem: { select: { name: true, baseUnit: true } },
+        inventoryItem: { select: { id: true, name: true, sku: true, baseUnit: true } },
         purchaseOrder: {
-          select: { id: true, orderNumber: true, createdAt: true, totalCost: true },
+          select: {
+            id: true,
+            orderNumber: true,
+            createdAt: true,
+            totalCost: true,
+            supplier: { select: { name: true } },
+          },
         },
       },
+      take: 50,
     })
+
+    // Prefer exact case-insensitive match; otherwise use the first partial match.
+    const lowered = batchNumber.toLowerCase()
+    const batch = candidates.find(b => b.batchNumber.toLowerCase() === lowered) || candidates[0]
 
     if (!batch) return null
 
@@ -1215,31 +1224,55 @@ export class FEFOEngine {
       orderBy: { createdAt: 'desc' },
     })
 
+    const now = new Date()
+    const daysUntilExpiry = batch.expiredDate
+      ? Math.ceil((batch.expiredDate.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))
+      : null
+
     return {
       batch: {
         id: batch.id,
         batchNumber: batch.batchNumber,
         inventoryItemId: batch.inventoryItemId,
-        inventoryItemName: batch.inventoryItem.name,
+        inventoryItem: {
+          id: batch.inventoryItem.id,
+          name: batch.inventoryItem.name,
+          sku: batch.inventoryItem.sku,
+          baseUnit: batch.inventoryItem.baseUnit,
+        },
         baseUnit: batch.inventoryItem.baseUnit,
         initialQty: batch.initialQty,
         remainingQty: batch.remainingQty,
         unitCost: batch.unitCost,
         expiredDate: batch.expiredDate,
+        daysUntilExpiry,
         supplierName: batch.supplierName,
         status: batch.status,
         createdAt: batch.createdAt,
       },
       purchaseOrder: batch.purchaseOrder
-        ? { ...batch.purchaseOrder }
+        ? {
+            id: batch.purchaseOrder.id,
+            orderNumber: batch.purchaseOrder.orderNumber,
+            supplierName: batch.purchaseOrder.supplier?.name ?? null,
+            date: batch.purchaseOrder.createdAt,
+            totalCost: batch.purchaseOrder.totalCost,
+          }
         : null,
-      transactions: consumptionLogs.map(log => ({
-        transactionId: log.transactionId,
-        invoiceNumber: log.invoiceNumber,
-        createdAt: log.createdAt,
-        quantityConsumed: log.quantityConsumed,
-        sourceDetails: JSON.parse(log.sourceDetails || '[]'),
-      })),
+      transactions: consumptionLogs.map(log => {
+        const details = JSON.parse(log.sourceDetails || '[]') as Array<{ productName: string; variantName?: string; productQty: number }>
+        return {
+          id: log.id,
+          transactionId: log.transactionId,
+          invoiceNumber: log.invoiceNumber,
+          date: log.createdAt,
+          qtyConsumed: log.quantityConsumed,
+          sourceProducts: details
+            .map(d => d.variantName ? `${d.productName} (${d.variantName})` : d.productName)
+            .join(', '),
+          sourceDetails: details,
+        }
+      }),
     }
   }
 
@@ -1259,6 +1292,7 @@ export class FEFOEngine {
     initialQty: number
     remainingQty: number
     unitCost: number
+    baseUnit: string
     expiredDate: Date | null
     supplierName: string | null
     status: string
@@ -1273,6 +1307,7 @@ export class FEFOEngine {
     const batches = await tx.inventoryBatch.findMany({
       where: { inventoryItemId, outletId },
       include: {
+        inventoryItem: { select: { baseUnit: true } },
         purchaseOrder: { select: { orderNumber: true } },
       },
       orderBy: [
@@ -1292,10 +1327,11 @@ export class FEFOEngine {
         initialQty: b.initialQty,
         remainingQty: b.remainingQty,
         unitCost: b.unitCost,
+        baseUnit: b.inventoryItem.baseUnit,
         expiredDate: b.expiredDate,
         supplierName: b.supplierName,
         status: b.status,
-        purchaseOrderNumber: b.purchaseOrder.orderNumber,
+        purchaseOrderNumber: b.purchaseOrder?.orderNumber ?? '',
         createdAt: b.createdAt,
         daysUntilExpiry,
         consumptionPercentage: b.initialQty > 0

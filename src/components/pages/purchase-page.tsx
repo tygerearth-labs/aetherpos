@@ -282,10 +282,21 @@ interface InventoryItemDetail {
   avgCost: number
   lowStockAlert: number
   category: { id: string; name: string; color: string } | null
-  _count: { compositions: number; purchaseItems: number; movements: number }
+  _count: { compositions: number; purchaseItems: number; movements: number; batches: number }
   linkedProducts: LinkedProduct[]
   movements: InventoryMovementRow[]
   movementPagination: { page: number; totalPages: number; total: number }
+  // Batch summary surfaced by /api/inventory/items/[id].
+  // Counts ALL batches (available + expired) so the UI can show real
+  // batch numbers even when every batch for an item is already expired.
+  batchSummary?: {
+    totalBatches: number
+    availableBatches: number
+    expiredBatches: number
+    totalRemainingQty: number
+    nearestExpiryDate: string | null
+    nearestExpiryStatus: 'EXPIRED' | 'EXPIRING_SOON' | 'FRESH' | null
+  }
 }
 
 interface InventoryListResponse {
@@ -2577,7 +2588,9 @@ export default function PurchasePage() {
       const res = await fetch(`/api/inventory/batches?type=timeline&inventoryItemId=${inventoryItemId}`)
       if (res.ok) {
         const json = await res.json()
-        setBatchTimeline(json.data ?? [])
+        // API returns the array directly (not wrapped in {data:...}),
+        // so fall back to `json` itself when `json.data` is undefined.
+        setBatchTimeline(json.data ?? json ?? [])
       }
     } catch { /* ignore */ }
     finally { setBatchTimelineLoading(false) }
@@ -2593,7 +2606,9 @@ export default function PurchasePage() {
       const res = await fetch(`/api/inventory/batches?type=search&batchNumber=${encodeURIComponent(q)}`)
       if (res.ok) {
         const json = await res.json()
-        setBatchSearchResult(json.data ?? null)
+        // API returns the result object directly (not wrapped in {data:...}),
+        // so fall back to `json` itself when `json.data` is undefined.
+        setBatchSearchResult(json.data ?? json ?? null)
       } else {
         toast.error('Batch tidak ditemukan')
       }
@@ -2609,7 +2624,8 @@ export default function PurchasePage() {
       const res = await fetch(`/api/inventory/batches?type=waste-report&${params}`)
       if (res.ok) {
         const json = await res.json()
-        setWasteReportData(json.data ?? null)
+        // API returns the report object directly (not wrapped in {data:...}).
+        setWasteReportData(json.data ?? json ?? null)
       }
     } catch { /* ignore */ }
     finally { setWasteReportLoading(false) }
@@ -2629,7 +2645,8 @@ export default function PurchasePage() {
         const res = await fetch(`/api/inventory/batches?type=check-duplicate&batchNumber=${encodeURIComponent(batchNumber)}`)
         if (res.ok) {
           const json = await res.json()
-          setBatchWarnings(prev => ({ ...prev, [idx]: json.data }))
+          // API returns {warning, duplicate} directly (not wrapped in {data:...}).
+          setBatchWarnings(prev => ({ ...prev, [idx]: json.data ?? json }))
         }
       } catch { /* ignore */ }
     }, 500)
@@ -3051,9 +3068,13 @@ export default function PurchasePage() {
   const labelClass = 'text-[11px] text-slate-500 uppercase tracking-wider font-medium'
 
   // ══════════════════════════════════════════════════════════
-  // Loading skeleton
+  // Loading skeleton — ONLY on initial load (no data yet).
+  // When data already exists and the user is just searching/filtering,
+  // we keep the full UI visible (search input, controls, table) so the
+  // page doesn't "refresh" and the user doesn't lose focus while typing.
+  // A subtle inline loading indicator is shown on the table itself.
   // ══════════════════════════════════════════════════════════
-  if (poLoading && tab === 'purchase') {
+  if (poLoading && poList.length === 0 && tab === 'purchase') {
     return (
       <div className="space-y-4">
         <Skeleton className="h-7 w-56 bg-white/[0.04]" />
@@ -3067,7 +3088,7 @@ export default function PurchasePage() {
     )
   }
 
-  if (invLoading && tab === 'inventory') {
+  if (invLoading && invList.length === 0 && tab === 'inventory') {
     return (
       <div className="space-y-4">
         <Skeleton className="h-7 w-56 bg-white/[0.04]" />
@@ -3131,8 +3152,12 @@ export default function PurchasePage() {
                   value={poSearch}
                   onChange={(e) => { setPoSearch(e.target.value); setPoPage(1) }}
                   placeholder="Cari No. PO..."
-                  className={cn(inputClass, 'pl-8')}
+                  className={cn(inputClass, 'pl-8', poLoading && poList.length > 0 && 'pr-8')}
                 />
+                {/* Inline loading spinner — shows when searching without clearing existing data */}
+                {poLoading && poList.length > 0 && (
+                  <Loader2 className="absolute right-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-emerald-400 animate-spin" />
+                )}
               </div>
               <Select value={poSortBy} onValueChange={(v) => { setPoSortBy(v); setPoPage(1) }}>
                 <SelectTrigger className="bg-white/[0.04] border-white/[0.06] text-white text-xs h-8 w-[140px] rounded-lg shrink-0">
@@ -3650,8 +3675,12 @@ export default function PurchasePage() {
                     value={invSearch}
                     onChange={(e) => { setInvSearch(e.target.value); setInvPage(1); setSelectedInvIds(new Set()) }}
                     placeholder="Cari item berdasarkan nama atau SKU..."
-                    className={cn(inputClass, 'pl-10 h-10 rounded-xl bg-white/[0.03] border-white/[0.08] focus:border-emerald-500/30 focus:bg-white/[0.05] transition-all')}
+                    className={cn(inputClass, 'pl-10 h-10 rounded-xl bg-white/[0.03] border-white/[0.08] focus:border-emerald-500/30 focus:bg-white/[0.05] transition-all', invLoading && invList.length > 0 && 'pr-10')}
                   />
+                  {/* Inline loading spinner — shows when searching without clearing existing data */}
+                  {invLoading && invList.length > 0 && (
+                    <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-emerald-400 animate-spin" />
+                  )}
                 </div>
                 {/* Reset Filters Button - appears when filters active */}
                 {(invSearch || invCategoryFilter !== 'all' || showInactiveItems) && (
@@ -7800,6 +7829,55 @@ export default function PurchasePage() {
                   <span className="text-[11px] text-slate-500">Low Stock Alert</span>
                   <span className="text-xs text-slate-200">{formatNumber(invDetailData.lowStockAlert)} {invDetailData.baseUnit}</span>
                 </div>
+                {/* Batch summary — surfaced from the detail payload so users can
+                    see per-batch stock at a glance without opening the Batch tab.
+                    IMPORTANT: We show totalBatches (available + expired), not just
+                    availableBatches, so expired-only items still show real batch
+                    counts instead of misleading "0 batch". */}
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-slate-500">Batch</span>
+                  <span className="text-xs text-slate-200">
+                    {(() => {
+                      const bs = invDetailData.batchSummary
+                      const total = bs?.totalBatches ?? invDetailData._count?.batches ?? 0
+                      const avail = bs?.availableBatches ?? 0
+                      const exp = bs?.expiredBatches ?? 0
+                      if (total === 0) return <span className="text-slate-500">Belum ada batch</span>
+                      return (
+                        <span className="flex items-center gap-1.5">
+                          <span>{total} batch</span>
+                          {avail > 0 && <span className="text-emerald-400">· {avail} tersedia</span>}
+                          {exp > 0 && <span className="text-red-400">· {exp} expired</span>}
+                          {(bs?.totalRemainingQty ?? 0) > 0 && (
+                            <span className="text-slate-500">· {formatNumber(bs!.totalRemainingQty)} {invDetailData.baseUnit}</span>
+                          )}
+                        </span>
+                      )
+                    })()}
+                  </span>
+                </div>
+                {invDetailData.batchSummary?.nearestExpiryDate && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-slate-500">
+                      {invDetailData.batchSummary.nearestExpiryStatus === 'EXPIRED' ? 'Expired Terdekat' : 'Expire Terdekat'}
+                    </span>
+                    {(() => {
+                      const expDate = new Date(invDetailData.batchSummary.nearestExpiryDate!)
+                      const daysLeft = Math.ceil((expDate.getTime() - Date.now()) / (24 * 60 * 60 * 1000))
+                      const status = invDetailData.batchSummary.nearestExpiryStatus
+                      const expColor = status === 'EXPIRED' ? 'text-red-400'
+                        : daysLeft < 7 ? 'text-amber-400'
+                        : daysLeft < 30 ? 'text-amber-300'
+                        : 'text-emerald-400'
+                      return (
+                        <span className={cn('text-xs font-medium', expColor)}>
+                          {expDate.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' })}
+                          <span className="text-slate-500"> ({daysLeft < 0 ? `${Math.abs(daysLeft)}h lalu` : `${daysLeft}h lagi`})</span>
+                        </span>
+                      )
+                    })()}
+                  </div>
+                )}
               </div>
 
               {/* Tabs: Produk Terkait, Stok/Movement, Batch */}
@@ -7827,7 +7905,7 @@ export default function PurchasePage() {
                       </TabsTrigger>
                       <TabsTrigger value="batch" className="text-[10px] h-7 gap-1 data-[state=active]:bg-white/[0.08] text-slate-400 data-[state=active]:text-white">
                         <Hash className="h-3 w-3" />
-                        Batch
+                        Batch ({invDetailData._count?.batches ?? 0})
                       </TabsTrigger>
                     </TabsList>
                   )
