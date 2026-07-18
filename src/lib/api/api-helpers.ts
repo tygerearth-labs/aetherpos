@@ -11,6 +11,95 @@
 import { type PrismaClient } from '@prisma/client'
 
 // ============================================================
+// Datasource Provider Detection
+// ============================================================
+
+/**
+ * Detect the active Prisma datasource provider at module load time.
+ * - PostgreSQL → `mode: 'insensitive'` is REQUIRED for case-insensitive `contains`
+ * - SQLite     → `contains` is already case-insensitive for ASCII; `mode` is NOT supported
+ *
+ * The user's real deployment uses PostgreSQL (Neon), while our sandbox uses
+ * SQLite. Search helpers below automatically adapt so the SAME code works in
+ * both environments without per-route conditionals.
+ */
+const DATASOURCE_PROVIDER: 'postgresql' | 'sqlite' = (() => {
+  try {
+    const url = process.env.DATABASE_URL || ''
+    if (url.startsWith('postgres') || url.startsWith('postgresql://')) return 'postgresql'
+    return 'sqlite'
+  } catch {
+    return 'sqlite'
+  }
+})()
+
+/** True when the active database is PostgreSQL (requires explicit `mode: 'insensitive'`). */
+export const IS_POSTGRES = DATASOURCE_PROVIDER === 'postgresql'
+
+/**
+ * Build a case-insensitive `contains` clause for a single field.
+ * Automatically adapts to the active datasource:
+ *   - PostgreSQL: `{ field: { contains: value, mode: 'insensitive' } }`
+ *   - SQLite:     `{ field: { contains: value } }` (already case-insensitive)
+ *
+ * Use this directly in where-clauses that don't go through `buildFlexibleSearch`:
+ *   @example
+ *   const where = {
+ *     OR: [
+ *       ciContains('batchNumber', query),
+ *       ciContains('supplierName', query),
+ *     ],
+ *     outletId,
+ *   }
+ */
+export function ciContains(field: string, value: string): Record<string, unknown> {
+  if (IS_POSTGRES) {
+    return { [field]: { contains: value, mode: 'insensitive' as const } }
+  }
+  return { [field]: { contains: value } }
+}
+
+/**
+ * Recursively add `mode: 'insensitive'` to every `{ contains: ... }` in a
+ * where-clause when running on PostgreSQL. No-op on SQLite.
+ *
+ * Useful for sanitizing hand-built where-clauses that mix `contains` with
+ * other operators (e.g. in fefo-engine.ts):
+ *   @example
+ *   const where = withInsensitiveMode({
+ *     OR: [{ batchNumber: { contains: q } }, { supplierName: { contains: q } }],
+ *     outletId,
+ *   })
+ */
+export function withInsensitiveMode(node: unknown): unknown {
+  // Base case: primitives
+  if (node === null || node === undefined) return node
+  if (typeof node !== 'object') return node
+  if (Array.isArray(node)) return node.map(withInsensitiveMode)
+
+  const obj = node as Record<string, unknown>
+  const result: Record<string, unknown> = {}
+
+  for (const [key, value] of Object.entries(obj)) {
+    // If this is a `{ contains: ... }` filter on a string field, add mode
+    if (
+      IS_POSTGRES &&
+      value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      'contains' in value &&
+      typeof (value as Record<string, unknown>).contains === 'string'
+    ) {
+      result[key] = { ...(value as Record<string, unknown>), mode: 'insensitive' }
+    } else {
+      result[key] = withInsensitiveMode(value)
+    }
+  }
+
+  return result
+}
+
+// ============================================================
 // Validation Helpers
 // ============================================================
 
@@ -308,6 +397,80 @@ export function parseVoidDetails(
   } catch {
     return { reason: '', voidedBy: '', voidedAt: '' }
   }
+}
+
+// ============================================================
+// Flexible Search Builder
+// ============================================================
+
+/**
+ * Tokenize a raw search string into normalized tokens.
+ * Splits on any whitespace, trims, lowercases for fallback matching,
+ * and removes empty entries. Also strips zero-width chars.
+ *
+ * Examples:
+ *   "Anti Septic"      → ["anti", "septic"]
+ *   "  anti   septic " → ["anti", "septic"]
+ *   "anti-septic"      → ["anti-septic"]
+ */
+export function tokenizeSearch(search: string): string[] {
+  if (!search) return []
+  return search
+    .replace(/[\u200B-\u200D\uFEFF]/g, '') // strip zero-width chars
+    .trim()
+    .split(/\s+/)
+    .filter((t) => t.length > 0)
+}
+
+/**
+ * Build a flexible, case-insensitive, token-aware Prisma `where` clause
+ * for full-text-ish search across multiple fields.
+ *
+ * Behavior:
+ *   - Splits the search query into whitespace-separated tokens.
+ *   - Each token must match in AT LEAST ONE of the provided field matchers
+ *     (AND across tokens, OR within fields). This makes search:
+ *       ✅ Case-insensitive  (SQLite `contains` → LIKE, case-insensitive for ASCII)
+ *       ✅ Order-independent ("septic anti" still matches "Anti Septic")
+ *       ✅ Space-tolerant    (extra spaces / different spacing still match)
+ *   - `fieldMatchers` is a function that receives a single token string and
+ *     returns an array of Prisma where-conditions (the OR set for that token).
+ *
+ * Returns either:
+ *   - An empty object `{}` if there is nothing to search (caller should not set OR/AND), or
+ *   - `{ OR: [...] }` for a single token, or
+ *   - `{ AND: [ {OR:[...]}, {OR:[...]} ] }` for multiple tokens.
+ *
+ * The returned object is meant to be merged into the route's `where` clause.
+ *
+ * @example
+ *   const searchClause = buildFlexibleSearch(search, (q) => [
+ *     { name: { contains: q } },
+ *     { sku: { contains: q } },
+ *     { barcode: { contains: q } },
+ *   ])
+ *   if (search) Object.assign(where, searchClause)
+ */
+export function buildFlexibleSearch(
+  search: string,
+  fieldMatchers: (token: string) => Record<string, unknown>[],
+): Record<string, unknown> {
+  const tokens = tokenizeSearch(search)
+  if (tokens.length === 0) return {}
+
+  // Single token: simple OR across fields (preserves original shape)
+  if (tokens.length === 1) {
+    const clause = { OR: fieldMatchers(tokens[0]) }
+    // On PostgreSQL, add `mode: 'insensitive'` to every `contains` so that
+    // "minyak" matches "Minyak". On SQLite this is a no-op (already CI for ASCII).
+    return withInsensitiveMode(clause) as Record<string, unknown>
+  }
+
+  // Multiple tokens: every token must match in at least one field
+  const clause = {
+    AND: tokens.map((token) => ({ OR: fieldMatchers(token) })),
+  }
+  return withInsensitiveMode(clause) as Record<string, unknown>
 }
 
 // ============================================================
