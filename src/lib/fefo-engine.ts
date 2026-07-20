@@ -31,8 +31,15 @@
  *   - InventoryItem.stock is denormalized: always kept in sync with sum(batch.remainingQty)
  */
 
-import { Prisma } from '@prisma/client'
+import { Prisma, PrismaClient } from '@prisma/client'
 import { ciContains } from '@/lib/api/api-helpers'
+
+/**
+ * A client that can be either the singleton PrismaClient OR a transaction
+ * client (tx). Read-only functions accept this union so callers can skip
+ * the `$transaction` wrapper entirely (which avoids the 5s default timeout).
+ */
+type DbClient = PrismaClient | TxClient
 
 // ════════════════════════════════════════════════════════════
 // Types
@@ -137,7 +144,27 @@ export class FEFOEngine {
 
     // 1. Fetch AVAILABLE batches sorted by FEFO: expiredDate ASC, null last
     //    BAT-008: Also filter out expired dates directly as a safety net
-    const batches: AvailableBatch[] = await tx.$queryRaw`
+    //
+    // FEFO-SHAPE-FIX: $queryRaw returns FLAT columns (itemName, baseUnit) because
+    // SQL aliases cannot produce nested objects. The AvailableBatch interface,
+    // however, declares `inventoryItem: { name, baseUnit }` (nested) so that the
+    // SAME type can be shared with Prisma `include` callers (which DO return nested).
+    // We therefore map the flat raw rows into the nested shape right after the query.
+    // Previously the code read `batches[0].inventoryItem.name` directly on the flat
+    // result → `inventoryItem` was undefined → "Cannot read properties of undefined
+    // (reading 'name')" → FATAL throw → entire checkout/sync rolled back.
+    const rawBatches: Array<{
+      id: string
+      batchNumber: string
+      inventoryItemId: string
+      initialQty: number
+      remainingQty: number
+      unitCost: number
+      expiredDate: Date | null
+      status: string
+      itemName: string
+      baseUnit: string
+    }> = await tx.$queryRaw`
       SELECT
         ib.id, ib."batchNumber", ib."inventoryItemId", ib."initialQty",
         ib."remainingQty", ib."unitCost", ib."expiredDate", ib.status,
@@ -154,6 +181,17 @@ export class FEFOEngine {
         ib."expiredDate" ASC,
         ib."createdAt" ASC
     `
+    const batches: AvailableBatch[] = rawBatches.map(b => ({
+      id: b.id,
+      batchNumber: b.batchNumber,
+      inventoryItemId: b.inventoryItemId,
+      initialQty: b.initialQty,
+      remainingQty: b.remainingQty,
+      unitCost: b.unitCost,
+      expiredDate: b.expiredDate,
+      status: b.status,
+      inventoryItem: { name: b.itemName, baseUnit: b.baseUnit },
+    }))
 
     if (batches.length === 0) {
       // No batches available — fall through (let the caller handle plain stock deduction)
@@ -497,7 +535,22 @@ export class FEFOEngine {
 
     // 1. Fetch AVAILABLE batches sorted by FEFO: expiredDate ASC, null last
     //    BAT-008: Filter out expired dates as safety net
-    const batches: AvailableBatch[] = await tx.$queryRaw`
+    //
+    // FEFO-SHAPE-FIX: see consumeBatch() above for full explanation.
+    // $queryRaw returns flat columns; AvailableBatch interface expects nested
+    // `inventoryItem`. Map flat→nested to prevent `undefined.name` crash.
+    const rawBatches: Array<{
+      id: string
+      batchNumber: string
+      inventoryItemId: string
+      initialQty: number
+      remainingQty: number
+      unitCost: number
+      expiredDate: Date | null
+      status: string
+      itemName: string
+      baseUnit: string
+    }> = await tx.$queryRaw`
       SELECT
         ib.id, ib."batchNumber", ib."inventoryItemId", ib."initialQty",
         ib."remainingQty", ib."unitCost", ib."expiredDate", ib.status,
@@ -514,6 +567,17 @@ export class FEFOEngine {
         ib."expiredDate" ASC,
         ib."createdAt" ASC
     `
+    const batches: AvailableBatch[] = rawBatches.map(b => ({
+      id: b.id,
+      batchNumber: b.batchNumber,
+      inventoryItemId: b.inventoryItemId,
+      initialQty: b.initialQty,
+      remainingQty: b.remainingQty,
+      unitCost: b.unitCost,
+      expiredDate: b.expiredDate,
+      status: b.status,
+      inventoryItem: { name: b.itemName, baseUnit: b.baseUnit },
+    }))
 
     if (batches.length === 0) {
       // No batch tracking for this item — that's fine
@@ -802,7 +866,7 @@ export class FEFOEngine {
    * @returns Existing batch info or null
    */
   static async checkDuplicateBatch(
-    tx: TxClient,
+    db: DbClient,
     params: {
       batchNumber: string
       outletId: string
@@ -822,7 +886,7 @@ export class FEFOEngine {
     // Case-insensitive duplicate check that works in BOTH PostgreSQL and SQLite.
     // - PostgreSQL: ciContains adds `mode: 'insensitive'`
     // - SQLite:     `contains` is already case-insensitive for ASCII
-    const candidates = await tx.inventoryBatch.findMany({
+    const candidates = await db.inventoryBatch.findMany({
       where: {
         ...ciContains('batchNumber', batchNumber),
         outletId,
@@ -864,6 +928,23 @@ export class FEFOEngine {
   ): Promise<number> {
     const now = new Date()
 
+    // AUDIT-1-010 FIX: Before marking batches EXPIRED, fetch their remainingQty
+    // per inventoryItem so we can ALSO decrement InventoryItem.stock. Previously
+    // this method only flipped the batch status AVAILABLE→EXPIRED, leaving
+    // InventoryItem.stock unchanged → `stock != SUM(AVAILABLE batches.remainingQty)`
+    // drift. Verified by audit: Anti Septic Solution had stock=1000 but only 1
+    // EXPIRED batch (remaining=1000) → stock said 1000 available but no AVAILABLE
+    // batch existed to consume from.
+    const expiringBatches = await tx.inventoryBatch.findMany({
+      where: {
+        outletId,
+        status: 'AVAILABLE',
+        expiredDate: { lt: now },
+        remainingQty: { gt: 0 },
+      },
+      select: { id: true, inventoryItemId: true, remainingQty: true, batchNumber: true },
+    })
+
     const result = await tx.inventoryBatch.updateMany({
       where: {
         outletId,
@@ -879,6 +960,39 @@ export class FEFOEngine {
 
     if (result.count > 0) {
       console.log(`[FEFO] Marked ${result.count} batch(es) as EXPIRED for outlet ${outletId}`)
+
+      // AUDIT-1-010: Decrement InventoryItem.stock by the expired remainingQty
+      // so the invariant `stock == SUM(AVAILABLE batches.remainingQty)` holds.
+      // Group by inventoryItemId and apply one decrement per item (atomic SQL).
+      const expiryByItem = new Map<string, number>()
+      for (const b of expiringBatches) {
+        expiryByItem.set(b.inventoryItemId, (expiryByItem.get(b.inventoryItemId) || 0) + b.remainingQty)
+      }
+      for (const [itemId, expiredQty] of expiryByItem) {
+        // Decrement stock but never below 0 (defensive — stock should already
+        // be >= expiredQty if the invariant held before).
+        await tx.$executeRaw`
+          UPDATE "InventoryItem" SET stock = MAX(0, stock - ${expiredQty})
+          WHERE id = ${itemId} AND "outletId" = ${outletId}
+        `
+        // Record an inventory movement so the expiry write-off is auditable.
+        try {
+          await tx.inventoryMovement.create({
+            data: {
+              type: 'EXPIRY_WRITEOFF',
+              inventoryItemId: itemId,
+              quantity: -expiredQty,
+              previousStock: 0, // unknown without a pre-read; movement type itself is the signal
+              newStock: 0,
+              referenceType: 'BATCH_EXPIRY',
+              notes: `Write-off batch expired (${expiredQty} units)`,
+              outletId,
+              userId: null, // system-generated; userId is nullable
+            },
+          })
+        } catch { /* movement is best-effort */ }
+      }
+      console.log(`[FEFO] AUDIT-1-010: Decremented stock for ${expiryByItem.size} item(s) due to batch expiry`)
     }
 
     return result.count
@@ -895,7 +1009,7 @@ export class FEFOEngine {
    * @returns Score 0-100 + breakdown
    */
   static async calculateFreshnessScore(
-    tx: TxClient,
+    db: DbClient,
     outletId: string
   ): Promise<{
     score: number
@@ -912,7 +1026,7 @@ export class FEFOEngine {
     const now = new Date()
     const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
 
-    const batches = await tx.inventoryBatch.findMany({
+    const batches = await db.inventoryBatch.findMany({
       where: {
         outletId,
         remainingQty: { gt: 0 },
@@ -983,7 +1097,7 @@ export class FEFOEngine {
    * @returns Heatmap data grouped by inventory item
    */
   static async getExpiryHeatmap(
-    tx: TxClient,
+    db: DbClient,
     outletId: string
   ): Promise<{
     expired: Array<{ inventoryItemId: string; itemName: string; batchNumber: string; remainingQty: number; unitCost: number; expiredDate: Date | null; totalLoss: number; baseUnit: string }>
@@ -995,7 +1109,7 @@ export class FEFOEngine {
     const sevenDays = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
     const thirtyDays = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
 
-    const batches = await tx.inventoryBatch.findMany({
+    const batches = await db.inventoryBatch.findMany({
       where: {
         outletId,
         remainingQty: { gt: 0 },
@@ -1077,7 +1191,7 @@ export class FEFOEngine {
    * Get waste report (financial loss from expired items) for a date range.
    */
   static async getWasteReport(
-    tx: TxClient,
+    db: DbClient,
     params: {
       outletId: string
       startDate: Date
@@ -1099,7 +1213,7 @@ export class FEFOEngine {
   }> {
     const { outletId, startDate, endDate } = params
 
-    const batches = await tx.inventoryBatch.findMany({
+    const batches = await db.inventoryBatch.findMany({
       where: {
         outletId,
         status: 'EXPIRED',
@@ -1144,7 +1258,7 @@ export class FEFOEngine {
    * Used for recall scenarios and customer complaints.
    */
   static async searchBatch(
-    tx: TxClient,
+    db: DbClient,
     params: {
       batchNumber: string
       outletId: string
@@ -1190,7 +1304,7 @@ export class FEFOEngine {
     //
     // We prefer an exact case-insensitive match first, then fall back to a
     // partial (contains) match for flexibility (e.g. "B2025" matches "B2025-001").
-    const candidates = await tx.inventoryBatch.findMany({
+    const candidates = await db.inventoryBatch.findMany({
       where: {
         OR: [
           ciContains('batchNumber', batchNumber),
@@ -1219,7 +1333,7 @@ export class FEFOEngine {
     if (!batch) return null
 
     // Get all consumption logs for this batch
-    const consumptionLogs = await tx.batchConsumptionLog.findMany({
+    const consumptionLogs = await db.batchConsumptionLog.findMany({
       where: { inventoryBatchId: batch.id, outletId },
       orderBy: { createdAt: 'desc' },
     })
@@ -1281,7 +1395,7 @@ export class FEFOEngine {
    * Shows all batches with their current status, remaining qty, and expiry.
    */
   static async getBatchTimeline(
-    tx: TxClient,
+    db: DbClient,
     params: {
       inventoryItemId: string
       outletId: string
@@ -1304,7 +1418,7 @@ export class FEFOEngine {
     const { inventoryItemId, outletId } = params
     const now = new Date()
 
-    const batches = await tx.inventoryBatch.findMany({
+    const batches = await db.inventoryBatch.findMany({
       where: { inventoryItemId, outletId },
       include: {
         inventoryItem: { select: { baseUnit: true } },
@@ -1346,7 +1460,7 @@ export class FEFOEngine {
    * Pure calculation — no LLM needed.
    */
   static async getPurchaseRecommendations(
-    tx: TxClient,
+    db: DbClient,
     outletId: string
   ): Promise<Array<{
     inventoryItemId: string
@@ -1364,7 +1478,7 @@ export class FEFOEngine {
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
 
     // Get inventory items with compositions (only items used in products matter)
-    const items = await tx.inventoryItem.findMany({
+    const items = await db.inventoryItem.findMany({
       where: {
         outletId,
         status: 'ACTIVE',
@@ -1382,7 +1496,7 @@ export class FEFOEngine {
 
     for (const item of items) {
       // Calculate avg daily consumption from movements (last 30 days)
-      const movements = await tx.inventoryMovement.findMany({
+      const movements = await db.inventoryMovement.findMany({
         where: {
           inventoryItemId: item.id,
           outletId,
@@ -1396,7 +1510,7 @@ export class FEFOEngine {
       const avgDailyConsumption = totalConsumed / 30
 
       // Get nearest expiry batch
-      const nearestBatch = await tx.inventoryBatch.findFirst({
+      const nearestBatch = await db.inventoryBatch.findFirst({
         where: {
           inventoryItemId: item.id,
           outletId,
