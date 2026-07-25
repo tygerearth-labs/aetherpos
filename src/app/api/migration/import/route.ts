@@ -1126,7 +1126,7 @@ export async function POST(request: NextRequest) {
               unit,
               categoryId,
               outletId,
-              lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 10,
+              lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 1,
               hasComposition,
             })
 
@@ -1184,7 +1184,7 @@ export async function POST(request: NextRequest) {
                   baseUnit: unit,
                   stock,
                   avgCost: hpp > 0 ? hpp : 0,
-                  lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 10,
+                  lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 1,
                   status: 'ACTIVE',
                   outletId,
                   categoryId: null,
@@ -1231,7 +1231,7 @@ export async function POST(request: NextRequest) {
                       baseUnit: unit,
                       stock,
                       avgCost: hpp > 0 ? hpp : 0,
-                      lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 10,
+                      lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 1,
                       status: 'ACTIVE',
                     },
                   })
