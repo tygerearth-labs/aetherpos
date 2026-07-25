@@ -987,6 +987,10 @@ export async function POST(request: NextRequest) {
           // Inventory items to update (per-row — different values per row)
           const invItemsToUpdate: Array<{ id: string; name: string; data: Prisma.InventoryItemUpdateInput }> = []
 
+          // Inventory items with real history: partial update for lowStockAlert only
+          // (lowStockAlert is NOT part of the authoritative ledger, safe to update)
+          const invItemsPartialAlertUpdate: Array<{ id: string; name: string; lowStockAlert: number }> = []
+
           // Inventory item IDs needing batch cleanup (re-migration: delete old MIGRATION movements + auto compositions)
           const invIdsToCleanup: string[] = []
           const cleanupWarningData: Map<string, { name: string; analysis: RemigrationAnalysis }> = new Map()
@@ -1180,7 +1184,7 @@ export async function POST(request: NextRequest) {
                   baseUnit: unit,
                   stock,
                   avgCost: hpp > 0 ? hpp : 0,
-                  lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 0,
+                  lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 10,
                   status: 'ACTIVE',
                   outletId,
                   categoryId: null,
@@ -1227,7 +1231,7 @@ export async function POST(request: NextRequest) {
                       baseUnit: unit,
                       stock,
                       avgCost: hpp > 0 ? hpp : 0,
-                      lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 0,
+                      lowStockAlert: lowStockAlert > 0 ? lowStockAlert : 10,
                       status: 'ACTIVE',
                     },
                   })
@@ -1258,10 +1262,16 @@ export async function POST(request: NextRequest) {
                   })
                   compositionsCreated++
                 } else {
-                  // Has real history: use existing, skip update, warn
+                  // Has real history: use existing, skip full update, warn
                   inventoryItemCache.set(name, existingInv.id)
                   inventoryItemsSkipped++
                   warnings.push(`⚠️ "${name}" menggunakan data existing: ${analysis.reason}`)
+
+                  // Partial update: lowStockAlert is NOT part of the authoritative ledger,
+                  // safe to update even for items with real history (fixes "alert = 0" bug)
+                  if (lowStockAlert > 0) {
+                    invItemsPartialAlertUpdate.push({ id: existingInv.id, name, lowStockAlert })
+                  }
 
                   // Still create 1:1 composition link (product is new, needs link)
                   compositionsToCreate.push({
@@ -1322,6 +1332,17 @@ export async function POST(request: NextRequest) {
               data: update.data,
             })
             inventoryItemCache.set(update.name, update.id)
+          }
+
+          // 4b2. Partial update: lowStockAlert for skipped items (has real history).
+          // lowStockAlert is NOT part of the authoritative ledger (Section 1 LOCK),
+          // so updating it does not violate any invariant. Fixes "alert = 0" bug
+          // where skipped items keep lowStockAlert=0 even when migration data specifies a value.
+          for (const partial of invItemsPartialAlertUpdate) {
+            await tx.inventoryItem.update({
+              where: { id: partial.id },
+              data: { lowStockAlert: partial.lowStockAlert },
+            })
           }
 
           // 4c. Create products (batched via createMany + re-query for IDs)
@@ -1386,9 +1407,8 @@ export async function POST(request: NextRequest) {
               productName: c.productName,
               productId: createdProductMap.get(c.productName) || productCache.get(c.productName) || null,
               variantId: null,
-              inventoryItemId: c.invIdOrName.length > 20
-                ? c.invIdOrName  // already an ID (existing inventory, 24-char cuid)
-                : (createdInvMap.get(c.invIdOrName) || inventoryItemCache.get(c.invIdOrName) || null),  // name → resolve from both maps
+              inventoryItemId: (createdInvMap.get(c.invIdOrName) ?? inventoryItemCache.get(c.invIdOrName))
+                ?? (/^c[a-z0-9]{24}$/.test(c.invIdOrName) ? c.invIdOrName : null),  // resolve name from maps first; only use directly if cuid pattern
               qty: 1,
               baseUnit: c.unit,
             })).filter(c => c.productId && c.inventoryItemId) // safety: skip if IDs not resolved
@@ -1444,9 +1464,8 @@ export async function POST(request: NextRequest) {
               referenceType: m.referenceType as 'MIGRATION',
               notes: m.notes,
               outletId: m.outletId,
-              inventoryItemId: m.invIdOrName.length > 20
-                ? m.invIdOrName  // already an ID (existing inventory)
-                : (createdInvMap.get(m.invIdOrName) || inventoryItemCache.get(m.invIdOrName) || null),  // name → resolve from both maps
+              inventoryItemId: (createdInvMap.get(m.invIdOrName) ?? inventoryItemCache.get(m.invIdOrName))
+                ?? (/^c[a-z0-9]{24}$/.test(m.invIdOrName) ? m.invIdOrName : null),  // resolve name from maps first; only use directly if cuid pattern
               userId: m.userId,
             })).filter(m => m.inventoryItemId) // safety: skip if ID not resolved
 
@@ -1942,7 +1961,7 @@ export async function POST(request: NextRequest) {
                         baseUnit: variantInvUnit,
                         stock: r.variantStock,
                         avgCost: r.variantHpp > 0 ? r.variantHpp : 0,
-                        lowStockAlert: 0,
+                        lowStockAlert: 10,
                         status: 'ACTIVE',
                         outletId,
                         categoryId: null,
@@ -1990,7 +2009,7 @@ export async function POST(request: NextRequest) {
                             baseUnit: variantInvUnit,
                             stock: r.variantStock,
                             avgCost: r.variantHpp > 0 ? r.variantHpp : 0,
-                            lowStockAlert: 0,
+                            lowStockAlert: 10,
                             status: 'ACTIVE',
                           },
                         })
@@ -2023,10 +2042,14 @@ export async function POST(request: NextRequest) {
                         })
                         compositionsCreated++
                       } else {
-                        // Has real history: use existing, skip update, warn
+                        // Has real history: use existing, skip full update, warn
                         inventoryItemCache.set(variantInvName, existingVariantInv.id)
                         inventoryItemsSkipped++
                         warnings.push(`⚠️ "${variantInvName}" menggunakan data existing: ${variantAnalysis.reason}`)
+
+                        // Partial update: lowStockAlert is NOT part of the authoritative ledger,
+                        // safe to update even for items with real history (fixes "alert = 0" bug)
+                        invItemsPartialAlertUpdate.push({ id: existingVariantInv.id, name: variantInvName, lowStockAlert: 10 })
 
                         // Still create 1:1 composition link (variant is new, needs link)
                         variantCompositionsToCreate.push({
@@ -2214,9 +2237,8 @@ export async function POST(request: NextRequest) {
                   variantName: c.variantName,
                   productId: allParentIdMap.get(c.parentName) || null,
                   variantId: createdVariantMap.get(`${c.parentName}||${c.variantName}`) || null,
-                  inventoryItemId: c.invIdOrName.length > 20
-                    ? c.invIdOrName  // already an ID (existing inventory, 24-char cuid)
-                    : (createdVariantInvMap.get(c.invIdOrName) || inventoryItemCache.get(c.invIdOrName) || null),  // name → resolve from both maps
+                  inventoryItemId: (createdVariantInvMap.get(c.invIdOrName) ?? inventoryItemCache.get(c.invIdOrName))
+                    ?? (/^c[a-z0-9]{24}$/.test(c.invIdOrName) ? c.invIdOrName : null),  // resolve name from maps first; only use directly if cuid pattern
                   qty: 1,
                   baseUnit: c.unit,
                 })).filter(c => c.productId && c.variantId && c.inventoryItemId)  // safety: skip if IDs not resolved
@@ -2264,9 +2286,8 @@ export async function POST(request: NextRequest) {
                   referenceType: m.referenceType as 'MIGRATION',
                   notes: m.notes,
                   outletId: m.outletId,
-                  inventoryItemId: m.invIdOrName.length > 20
-                    ? m.invIdOrName  // already an ID (existing inventory)
-                    : (createdVariantInvMap.get(m.invIdOrName) || inventoryItemCache.get(m.invIdOrName) || null),  // name → resolve from both maps
+                  inventoryItemId: (createdVariantInvMap.get(m.invIdOrName) ?? inventoryItemCache.get(m.invIdOrName))
+                    ?? (/^c[a-z0-9]{24}$/.test(m.invIdOrName) ? m.invIdOrName : null),  // resolve name from maps first; only use directly if cuid pattern
                   userId: m.userId,
                 })).filter(m => m.inventoryItemId)  // safety: skip if ID not resolved
 
