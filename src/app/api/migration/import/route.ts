@@ -1387,7 +1387,7 @@ export async function POST(request: NextRequest) {
               variantId: null,
               inventoryItemId: c.invIdOrName.length > 20
                 ? c.invIdOrName  // already an ID (existing inventory, 24-char cuid)
-                : (createdInvMap.get(c.invIdOrName) || c.invIdOrName),  // name → resolve
+                : (createdInvMap.get(c.invIdOrName) || inventoryItemCache.get(c.invIdOrName) || null),  // name → resolve
               qty: 1,
               baseUnit: c.unit,
             })).filter(c => c.productId && c.inventoryItemId) // safety: skip if IDs not resolved
@@ -1415,7 +1415,7 @@ export async function POST(request: NextRequest) {
               outletId: m.outletId,
               inventoryItemId: m.invIdOrName.length > 20
                 ? m.invIdOrName  // already an ID (existing inventory)
-                : (createdInvMap.get(m.invIdOrName) || m.invIdOrName),  // name → resolve
+                : (createdInvMap.get(m.invIdOrName) || inventoryItemCache.get(m.invIdOrName) || null),  // name → resolve
               userId: m.userId,
             })).filter(m => m.inventoryItemId) // safety: skip if ID not resolved
 
@@ -2155,7 +2155,7 @@ export async function POST(request: NextRequest) {
                   variantId: createdVariantMap.get(`${c.parentName}||${c.variantName}`)!,
                   inventoryItemId: c.invIdOrName.length > 20
                     ? c.invIdOrName  // already an ID (existing inventory, 24-char cuid)
-                    : (createdVariantInvMap.get(c.invIdOrName) || c.invIdOrName),  // name → resolve
+                    : (createdVariantInvMap.get(c.invIdOrName) || inventoryItemCache.get(c.invIdOrName) || null),  // name → resolve
                   qty: 1,
                   baseUnit: c.unit,
                 })).filter(c => c.productId && c.variantId && c.inventoryItemId)  // safety
@@ -2179,7 +2179,7 @@ export async function POST(request: NextRequest) {
                   outletId: m.outletId,
                   inventoryItemId: m.invIdOrName.length > 20
                     ? m.invIdOrName  // already an ID (existing inventory)
-                    : (createdVariantInvMap.get(m.invIdOrName) || m.invIdOrName),  // name → resolve
+                    : (createdVariantInvMap.get(m.invIdOrName) || inventoryItemCache.get(m.invIdOrName) || null),  // name → resolve
                   userId: m.userId,
                 })).filter(m => m.inventoryItemId)  // safety
 
