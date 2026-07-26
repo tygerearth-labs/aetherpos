@@ -75,6 +75,9 @@ export async function POST(request: NextRequest) {
     console.log('[Bulk Update Excel] Headers:', Object.keys(rows[0]))
 
     // WRAP IN TRANSACTION for atomicity (Fix Bug #1)
+    // V15.1 FIX: Add explicit timeout — default Prisma interactive tx timeout is 5s,
+    // which is way too short for 500 rows × multiple DB ops each. After timeout,
+    // Prisma closes the tx and any subsequent tx.* call throws "Transaction not found".
     await db.$transaction(async (tx) => {
       const categoryCache = new Map<string, string | null>()
 
@@ -243,6 +246,32 @@ export async function POST(request: NextRequest) {
           }
           updateData.lowStockAlert = Math.round(lsa)
           if (Math.round(lsa) !== existing.lowStockAlert) changes.lowStockAlert = { from: existing.lowStockAlert, to: Math.round(lsa) }
+        }
+
+        // Image URL — V14.3: support image URL update via bulk edit.
+        // Konvensi:
+        //   - Kosong / tidak ada kolom → skip (jangan ubah)
+        //   - Isi dengan "-" (strip) → hapus gambar (set null)
+        //   - Isi dengan URL valid (http/https) → update gambar
+        //   - Isi dengan string lain → error (validasi)
+        const imageRaw = String(findColumn(row, ['IMAGE URL', 'Image URL', 'URL Gambar', 'Gambar', 'Image', 'image', 'image_url', 'imageUrl']) || '').trim()
+        if (isNonEmpty(imageRaw)) {
+          if (imageRaw === '-') {
+            // Hapus gambar
+            if (existing.image) {
+              updateData.image = null
+              changes.image = { from: existing.image, to: '' }
+            }
+          } else if (/^https?:\/\//i.test(imageRaw)) {
+            // URL valid
+            if (imageRaw !== (existing.image || '')) {
+              updateData.image = imageRaw
+              changes.image = { from: existing.image || '', to: imageRaw }
+            }
+          } else {
+            result.errors.push(`Baris ${rowNum}: Image URL harus diawali http:// atau https:// (Nama: ${existing.name}). Untuk hapus gambar, isi dengan tanda "-"`)
+            continue
+          }
         }
 
         if (Object.keys(updateData).length === 0) continue
@@ -500,6 +529,9 @@ export async function POST(request: NextRequest) {
           }
         }
       }
+    }, {
+      timeout: 55_000,  // 55s — well above default 5s, under maxDuration=60
+      maxWait: 5_000,   // 5s to acquire a connection from the pool
     }) // End transaction
 
     // Audit log (Fix Bug #14)
