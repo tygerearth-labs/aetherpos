@@ -1,16 +1,21 @@
 /**
- * usePosSync() — Online/offline detection, sync queue management, auto-sync,
- * manual sync, and data freshness tracking for POS.
+ * usePosSync() — Online/offline detection, outbox sync, sync triggers, and
+ * sync status for the POS sync button.
  *
- * Extracted from pos-page.tsx Phase 1A modularization.
- * Original lines: 194-199 (sync states), 202-224 (time helpers + stale tick),
- *                 632-644 (online/offline detection), 646-650 (unsynced count),
- *                 652-717 (auto-sync effect), 719-753 (initial sync),
- *                 1504-1550 (handleSync), 576-578 (panel states)
+ * PR 3 — Offline POS with Dexie:
+ *   Sync triggers:
+ *     - reconnect (window 'online' event)
+ *     - window focus
+ *     - BroadcastChannel (cross-tab)
+ *     - manual sync
+ *     - lightweight status check (periodic)
+ *   Sync button states: Synced | Syncing | Offline | Failed | Conflict
+ *   Safety:
+ *     - never clear Dexie before successful response
+ *     - failed sync preserves cache + outbox (retryCount++)
+ *     - sync retry is duplicate-safe (eventId idempotency, DEX-007)
  *
- * @phase 1A — Move code without changing meaning
  * @boundary COCKPIT only — no engine imports
- * @preserve BUG-04 (sync race condition) will be fixed in Phase 1B
  */
 
 'use client'
@@ -18,49 +23,27 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { toast } from 'sonner'
 import { useLiveQuery } from 'dexie-react-hooks'
-import { localDB } from '@/lib/local-db'
-import { syncAllData, getAllSyncTimes, syncSettingsFromServer } from '@/lib/sync-service'
+import { tryGetPosDB } from '@/lib/pos/pos-db'
+import { syncOutboxTracked } from './use-pos-checkout'
 
-// ==================== INTERFACES ====================
+// ==================== TYPES ====================
 
-interface SyncTimes {
-  products: number | null
-  categories: number | null
-  customers: number | null
-  promos: number | null
-}
-
-// ==================== HOOK OPTIONS ====================
+export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'failed' | 'conflict'
 
 interface UsePosSyncOptions {
-  /** Callbacks for refreshing data after sync (from other hooks) */
   onRefreshProducts?: () => void
   onRefreshCustomers?: () => void
   onRefreshCategories?: () => void
 }
 
-// ==================== HOOK RETURN ====================
-
 interface UsePosSyncReturn {
-  // State
   isOnline: boolean
   syncing: boolean
-  dataSyncing: boolean
-  lastSyncTimes: SyncTimes
+  syncStatus: SyncStatus
   unsyncedCount: number
   pendingListOpen: boolean
   offlineListOpen: boolean
-
-  // Derived
-  isSyncStale: boolean
-  syncAgeSec: number
-
-  // Refs (exposed for coordination with checkout)
-  syncingRef: React.RefObject<boolean>
-  checkoutSyncRef: React.RefObject<boolean>
-  initialSyncDone: React.RefObject<boolean>
-
-  // Actions
+  lastSyncAt: number | null
   setPendingListOpen: (open: boolean) => void
   setOfflineListOpen: (open: boolean) => void
   handleSync: () => Promise<void>
@@ -72,48 +55,102 @@ interface UsePosSyncReturn {
 export function usePosSync(options?: UsePosSyncOptions): UsePosSyncReturn {
   const { onRefreshProducts, onRefreshCustomers, onRefreshCategories } = options || {}
 
-  // ── Core State (originally lines 194-199, 576-578) ──
   const [isOnline, setIsOnline] = useState(true)
   const [syncing, setSyncing] = useState(false)
-  const [dataSyncing, setDataSyncing] = useState(false)
-  const [lastSyncTimes, setLastSyncTimes] = useState<SyncTimes>({ products: null, categories: null, customers: null, promos: null })
-  const [syncAgeSec, setSyncAgeSec] = useState(0)
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>('synced')
   const [pendingListOpen, setPendingListOpen] = useState(false)
   const [offlineListOpen, setOfflineListOpen] = useState(false)
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(null)
 
-  // ── Refs for coordination (originally lines 187-189) ──
   const syncingRef = useRef(false)
-  const checkoutSyncRef = useRef(false)
-  const initialSyncDone = useRef(false)
+  const broadcastRef = useRef<BroadcastChannel | null>(null)
 
-  // ── Relative time formatter (originally lines 202-212) ──
+  // ── Live query for unsynced outbox count (transactionOutbox PENDING/FAILED) ──
+  const unsyncedCount = useLiveQuery(async () => {
+    const db = tryGetPosDB()
+    if (!db) return 0
+    const pending = await db.transactionOutbox.where('status').equals('PENDING').count()
+    const failed = await db.transactionOutbox.where('status').equals('FAILED').count()
+    return pending + failed
+  }, []) ?? 0
+
+  // ── Time formatter (full readable Indonesian) ──
   const timeAgo = useCallback((ts: number | null): string | null => {
     if (!ts) return null
     const sec = Math.floor((Date.now() - ts) / 1000)
-    if (sec < 60) return 'baru'
+    if (sec < 60) return 'Baru saja'
     const min = Math.floor(sec / 60)
-    if (min < 60) return `${min}m`
+    if (min < 60) return `${min} menit lalu`
     const hrs = Math.floor(min / 60)
-    if (hrs < 24) return `${hrs}j`
-    const days = Math.floor(hrs / 24)
-    return `${days}h`
+    if (hrs < 24) return `${hrs} jam lalu`
+    return `${Math.floor(hrs / 24)} hari lalu`
   }, [])
 
-  // ── Whether product sync is considered stale (> 10 min) (originally lines 215-218) ──
-  const isSyncStale = !lastSyncTimes.products || dataSyncing
-    ? false
-    : (Date.now() - lastSyncTimes.products) > 10 * 60 * 1000
-
-  // ── Tick every 30s to recompute stale state (originally lines 221-224) ──
+  // ── Compute sync status from unsyncedCount + isOnline + syncing ──
   useEffect(() => {
-    const iv = setInterval(() => setSyncAgeSec(s => s + 1), 30_000)
-    return () => clearInterval(iv)
-  }, [])
+    if (!isOnline) { setSyncStatus('offline'); return }
+    if (syncing) { setSyncStatus('syncing'); return }
+    if (unsyncedCount > 0) { setSyncStatus('failed'); return }
+    setSyncStatus('synced')
+  }, [isOnline, syncing, unsyncedCount])
 
-  // ── Online/offline detection (originally lines 632-644) ──
+  // ── Run sync (customerOutbox → resolve → transactionOutbox) ──
+  //
+  // OUTBOX CONTRADICTION FIX (toast discipline):
+  //   - Success is SILENT when this run JOINED an in-flight sync that the
+  //     checkout started (initiated === false). The checkout shows its own
+  //     "Pembayaran berhasil" toast; a redundant "N tersinkron" would confuse.
+  //   - Duplicate resolutions (DEX-007) are ALWAYS silent — they are background
+  //     confirmations of already-committed transactions, not new events.
+  //   - Genuine failures (failed > 0) always surface so the cashier can act.
+  //   - Abandoned rows (exceeded retry cap) always surface as a warning.
+  const runSync = useCallback(async (): Promise<{ synced: number; failed: number; duplicateResolved: number; abandoned: number }> => {
+    if (syncingRef.current) return { synced: 0, failed: 0, duplicateResolved: 0, abandoned: 0 }
+    syncingRef.current = true
+    setSyncing(true)
+    try {
+      const { result, initiated } = await syncOutboxTracked()
+      setLastSyncAt(Date.now())
+      // Success toast: only when THIS call initiated the sync AND there were
+      // genuinely new syncs (not just duplicate resolutions). Duplicates are
+      // silent per the outbox contradiction fix.
+      if (initiated && result.synced > 0 && result.synced > result.duplicateResolved) {
+        toast.success(`${result.synced} transaksi tersinkron`)
+        onRefreshProducts?.()
+        onRefreshCustomers?.()
+      } else if (initiated && result.synced > 0) {
+        // All synced rows were duplicate resolutions — refresh data but stay silent.
+        onRefreshProducts?.()
+        onRefreshCustomers?.()
+      }
+      if (result.abandoned > 0) {
+        toast.warning(
+          `${result.abandoned} transaksi ditinggalkan`,
+          { description: `Melebihi batas retry — periksa manual di outbox.` },
+        )
+      }
+      if (result.failed > 0) {
+        toast.error(`${result.failed} transaksi gagal sync`, { description: 'Periksa koneksi atau stok.' })
+      }
+      // Broadcast to other tabs
+      try { broadcastRef.current?.postMessage({ type: 'sync-complete', synced: result.synced }) } catch {}
+      return result
+    } catch {
+      return { synced: 0, failed: 0, duplicateResolved: 0, abandoned: 0 }
+    } finally {
+      syncingRef.current = false
+      setSyncing(false)
+    }
+  }, [onRefreshProducts, onRefreshCustomers])
+
+  // ── Online/offline detection ──
   useEffect(() => {
     setIsOnline(navigator.onLine)
-    const handleOnline = () => setIsOnline(true)
+    const handleOnline = () => {
+      setIsOnline(true)
+      // PR 3: auto-sync on reconnect
+      setTimeout(() => { runSync() }, 500)
+    }
     const handleOffline = () => setIsOnline(false)
     window.addEventListener('online', handleOnline)
     window.addEventListener('offline', handleOffline)
@@ -121,187 +158,96 @@ export function usePosSync(options?: UsePosSyncOptions): UsePosSyncReturn {
       window.removeEventListener('online', handleOnline)
       window.removeEventListener('offline', handleOffline)
     }
-  }, [])
+  }, [runSync])
 
-  // ── Live query for unsynced transactions (originally lines 646-650) ──
-  const unsyncedCount = useLiveQuery(
-    () => localDB.transactions.where('isSynced').equals(0).count(),
-    []
-  ) ?? 0
-
-  // ── Auto-sync when coming back online (originally lines 652-717) ──
-  // NOTE: BUG-04 (race condition between auto-sync and manual sync) preserved as-is
-  //       Will be fixed in Phase 1B
+  // ── PR 3: Window focus trigger ──
+  // UX FIX 2026-07-24: also trigger when there are FAILED rows (below retry
+  // cap) so stale entries can resolve via DEX-007 on focus.
   useEffect(() => {
-    if (isOnline && initialSyncDone.current && !syncingRef.current && !checkoutSyncRef.current) {
-      syncingRef.current = true
-      const timer = setTimeout(async () => {
-        try {
-          const pending = await localDB.transactions.where('isSynced').equals(0).toArray()
-          if (pending.length > 0) {
-            const res = await fetch('/api/transactions/sync', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ transactions: pending }),
-            })
-            const data = await res.json()
-            if (res.ok) {
-              let synced = 0
-              for (const result of data.results || []) {
-                if (result.success) {
-                  await localDB.transactions.update(result.localId, {
-                    isSynced: 1,
-                    syncedAt: Date.now(),
-                    invoiceNumber: result.invoiceNumber,
-                    serverTransactionId: result.serverId,
-                  })
-                  synced++
-                } else {
-                  const existing = await localDB.transactions.get(result.localId)
-                  await localDB.transactions.update(result.localId, {
-                    retryCount: (existing?.retryCount || 0) + 1,
-                    lastError: result.error,
-                  })
-                }
-              }
-              if (synced > 0) {
-                toast.success(`${synced} transaction(s) auto-synced!`)
-                onRefreshProducts?.()
-                onRefreshCustomers?.()
-              }
-              if (data.failed > 0) {
-                toast.warning(`${data.failed} transaksi gagal sync`, { description: 'Buka menu "Offline" untuk detail.' })
-              }
-            }
-          }
-
-          setDataSyncing(true)
-          const result = await syncAllData()
-          syncSettingsFromServer() // cache settings for offline (fire-and-forget)
-          onRefreshProducts?.()
-          onRefreshCategories?.()
-          onRefreshCustomers?.()
-          const times = await getAllSyncTimes()
-          setLastSyncTimes(times)
-          setSyncAgeSec(0)
-          setDataSyncing(false)
-        } catch {
-          setDataSyncing(false)
-        } finally {
-          syncingRef.current = false
-        }
-      }, 2000)
-      return () => { clearTimeout(timer); syncingRef.current = false }
-    }
-  }, [isOnline, onRefreshProducts, onRefreshCustomers, onRefreshCategories])
-
-  // ── Initial sync on mount (originally lines 719-753) ──
-  useEffect(() => {
-    if (isOnline && !initialSyncDone.current) {
-      initialSyncDone.current = true
-      const doInitialSync = async () => {
-        setDataSyncing(true)
-        try {
-          const result = await syncAllData()
-          syncSettingsFromServer() // cache settings for offline (fire-and-forget)
-          onRefreshProducts?.()
-          onRefreshCategories?.()
-          onRefreshCustomers?.()
-          const times = await getAllSyncTimes()
-          setLastSyncTimes(times)
-          setSyncAgeSec(0)
-          if (result.products.count > 0 || result.customers.count > 0) {
-            toast.success(`Data synced: ${result.products.count} produk, ${result.categories.count} kategori, ${result.customers.count} customer`)
-          }
-        } catch {
-          onRefreshProducts?.()
-          onRefreshCategories?.()
-          onRefreshCustomers?.()
-        } finally {
-          setDataSyncing(false)
+    const handleFocus = () => {
+      if (navigator.onLine && !syncingRef.current) {
+        const db = tryGetPosDB()
+        if (db) {
+          db.transactionOutbox.where('status').anyOf('PENDING', 'FAILED').count().then(count => {
+            if (count > 0) runSync()
+          })
         }
       }
-      doInitialSync()
-    } else if (!isOnline && !initialSyncDone.current) {
-      initialSyncDone.current = true
-      onRefreshProducts?.()
-      onRefreshCategories?.()
-      onRefreshCustomers?.()
-      getAllSyncTimes().then(setLastSyncTimes)
     }
-  }, [isOnline, onRefreshProducts, onRefreshCategories, onRefreshCustomers])
+    window.addEventListener('focus', handleFocus)
+    return () => window.removeEventListener('focus', handleFocus)
+  }, [runSync])
 
-  // ── Manual sync handler (originally lines 1506-1550) ──
-  // NOTE: BUG-04 preserved — uses separate `syncing` state instead of `syncingRef`
+  // ── PR 3: BroadcastChannel (cross-tab sync trigger) ──
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return
+    const bc = new BroadcastChannel('aetherpos-sync')
+    broadcastRef.current = bc
+    bc.onmessage = (e) => {
+      if (e.data?.type === 'sync-complete' && navigator.onLine) {
+        onRefreshProducts?.()
+        onRefreshCustomers?.()
+      }
+      if (e.data?.type === 'sync-request' && navigator.onLine && !syncingRef.current) {
+        runSync()
+      }
+    }
+    return () => { bc.close(); broadcastRef.current = null }
+  }, [runSync, onRefreshProducts, onRefreshCustomers])
+
+  // ── PR 3: Lightweight periodic status check (every 60s) ──
+  // UX FIX 2026-07-24: also check FAILED rows so they auto-retry.
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (navigator.onLine && !syncingRef.current) {
+        const db = tryGetPosDB()
+        if (db) {
+          db.transactionOutbox.where('status').anyOf('PENDING', 'FAILED').count().then(count => {
+            if (count > 0) runSync()
+          })
+        }
+      }
+    }, 60_000)
+    return () => clearInterval(iv)
+  }, [runSync])
+
+  // ── Initial sync on mount (if online + retryable) ──
+  // UX FIX 2026-07-24: also fire when there are FAILED rows so stale entries
+  // from a prior session can resolve via DEX-007 immediately on page load.
+  useEffect(() => {
+    if (navigator.onLine) {
+      const db = tryGetPosDB()
+      if (db) {
+        db.transactionOutbox.where('status').anyOf('PENDING', 'FAILED').count().then(count => {
+          if (count > 0) setTimeout(() => runSync(), 1000)
+        })
+      }
+    }
+  }, [runSync])
+
+  // ── Manual sync handler ──
+  // When there are pending/failed outbox rows, push them.
+  // When there's nothing to push, treat the click as a manual refresh:
+  // pull fresh products/customers/categories from server + update
+  // lastSyncAt so the "Terakhir sync" label reflects the user's action.
   const handleSync = useCallback(async () => {
-    if (syncing || unsyncedCount === 0) return
-    setSyncing(true)
-    try {
-      const pending = await localDB.transactions.where('isSynced').equals(0).toArray()
-      if (pending.length === 0) { toast.info('Tidak ada transaksi pending'); return }
-
-      const res = await fetch('/api/transactions/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transactions: pending }),
-      })
-      const data = await res.json()
-
-      if (res.ok) {
-        for (const result of data.results || []) {
-          if (result.success) {
-            await localDB.transactions.update(result.localId, {
-              isSynced: 1, syncedAt: Date.now(),
-              invoiceNumber: result.invoiceNumber, serverTransactionId: result.serverId,
-            })
-          } else {
-            const existing = await localDB.transactions.get(result.localId)
-            await localDB.transactions.update(result.localId, {
-              retryCount: (existing?.retryCount || 0) + 1, lastError: result.error,
-            })
-          }
-        }
-        if (data.synced > 0) {
-          toast.success(`${data.synced} transaksi berhasil disync!`)
-          onRefreshProducts?.()
-          onRefreshCustomers?.()
-        }
-        if (data.failed > 0) {
-          toast.error(`${data.failed} transaksi gagal sync`, { description: 'Periksa stok produk.' })
-        }
-      } else {
-        toast.error('Sync gagal — server error')
-      }
-    } catch {
-      toast.error('Sync gagal — tidak ada koneksi internet')
-    } finally {
-      setSyncing(false)
+    if (!navigator.onLine) { toast.info('Tidak ada koneksi internet'); return }
+    if (unsyncedCount === 0) {
+      // Nothing to push — refresh local cache from server + stamp timestamp.
+      setLastSyncAt(Date.now())
+      onRefreshProducts?.()
+      onRefreshCustomers?.()
+      onRefreshCategories?.()
+      broadcastRef.current?.postMessage({ type: 'sync-complete' })
+      toast.success('Data diperbarui')
+      return
     }
-  }, [syncing, unsyncedCount, onRefreshProducts, onRefreshCustomers])
+    await runSync()
+  }, [unsyncedCount, runSync, onRefreshProducts, onRefreshCustomers, onRefreshCategories])
 
   return {
-    // State
-    isOnline,
-    syncing,
-    dataSyncing,
-    lastSyncTimes,
-    unsyncedCount,
-    pendingListOpen,
-    offlineListOpen,
-
-    // Derived
-    isSyncStale,
-    syncAgeSec,
-
-    // Refs
-    syncingRef,
-    checkoutSyncRef,
-    initialSyncDone,
-
-    // Actions
-    setPendingListOpen,
-    setOfflineListOpen,
-    handleSync,
-    timeAgo,
+    isOnline, syncing, syncStatus, unsyncedCount,
+    pendingListOpen, offlineListOpen, lastSyncAt,
+    setPendingListOpen, setOfflineListOpen, handleSync, timeAgo,
   }
 }
