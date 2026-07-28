@@ -140,16 +140,14 @@ function MobileCartItem({
         <ProductImage src={item.product.image} alt={item.product.name} size="mobile" />
         <div className="flex-1 min-w-0 overflow-hidden">
           <p
-            className="text-[14px] font-semibold text-white leading-tight truncate"
+            className="text-[14px] font-semibold text-white leading-tight line-clamp-2 [overflow-wrap:anywhere]"
             title={item.product.name}
           >
             {item.product.name}
           </p>
           {item.variant && (
-            <span className="block max-w-full mt-0.5">
-              <span className="inline-flex max-w-full items-center px-1.5 py-0.5 rounded-md bg-violet-500/10 border border-violet-500/15">
-                <span className="text-[10px] font-medium text-violet-400 truncate">{item.variant.name}</span>
-              </span>
+            <span className="inline-flex max-w-full items-center px-1.5 py-0.5 rounded-md bg-violet-500/10 border border-violet-500/15 mt-1 align-top">
+              <span className="text-[10px] font-medium text-violet-400 truncate">{item.variant.name}</span>
             </span>
           )}
           <BatchExpiryBadge
@@ -279,16 +277,14 @@ function CompactCartItem({
       {/* Product Info */}
       <div className="flex-1 min-w-0 overflow-hidden">
         <p
-          className={cn('font-semibold text-white leading-tight truncate', props.compact ? 'text-[13px]' : 'text-xs')}
+          className={cn('font-semibold text-white leading-tight line-clamp-2 [overflow-wrap:anywhere]', props.compact ? 'text-[13px]' : 'text-xs')}
           title={item.product.name}
         >
           {item.product.name}
         </p>
         {item.variant && (
-          <span className="block max-w-full mt-0.5">
-            <span className="inline-flex max-w-full items-center gap-1 px-1.5 py-0.5 rounded-md bg-violet-500/10 border border-violet-500/15">
-              <span className="text-[9px] font-medium text-violet-400 leading-tight truncate">{item.variant.name}</span>
-            </span>
+          <span className="inline-flex max-w-full items-center gap-1 mt-0.5 px-1.5 py-0.5 rounded-md bg-violet-500/10 border border-violet-500/15 align-top">
+            <span className="text-[9px] font-medium text-violet-400 leading-tight truncate">{item.variant.name}</span>
           </span>
         )}
         <BatchExpiryBadge
