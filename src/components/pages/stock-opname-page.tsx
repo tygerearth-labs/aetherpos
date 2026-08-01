@@ -1,24 +1,39 @@
 'use client'
 
 /**
- * StockOpnamePage.tsx
- * 
- * Physical stock count (Stock Opname) page.
- * Uses Dexie as transient workspace - server is source of truth.
- * 
- * Workflow:
- *   DRAFT → COUNTING → REVIEW → COMPLETED
+ * StockOpnamePage.tsx — V3
+ *
+ * Full workflow redesign with compact operational UX.
+ *
+ * Flow: DRAFT → COUNTING → REVIEW → COMPLETED
+ *   (+ PAUSED: client-side UI state for "Tunda Sesi")
+ *
+ * V3 changes:
+ *   - Start page: 3 mode cards (ALL/CATEGORY/SELECTED) + active panel + summary
+ *   - Counting: compact session header with chips (no oversized cards),
+ *     scan bar, compact QuickCountWidget with [−][input][+], filter toolbar,
+ *     compact table, mobile bottom action bar
+ *   - No play/pause icons — explicit labels everywhere
+ *   - Tunda Sesi (pause) → PAUSED status → resume card on start page
+ *   - Batalkan Sesi (cancel) in overflow menu, not standalone trash button
+ *   - Review: compact summary + differences-default
+ *   - Complete: immutable completionSummary, "Terapkan N Penyesuaian" or
+ *     "Selesaikan Tanpa Penyesuaian" (zero-adjustment case)
+ *
+ * Controller owns all state + actions. Presentational sub-components live in
+ * src/components/stock-opname/. This is NOT the SO-V2-DEBT-1 full refactor.
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { toast } from 'sonner'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
+import { Progress } from '@/components/ui/progress'
 import {
   Table,
   TableBody,
@@ -28,14 +43,6 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import {
-  ResponsiveDialog,
-  ResponsiveDialogContent,
-  ResponsiveDialogHeader,
-  ResponsiveDialogTitle,
-  ResponsiveDialogDescription,
-  ResponsiveDialogFooter,
-} from '@/components/ui/responsive-dialog'
-import {
   Select,
   SelectContent,
   SelectItem,
@@ -43,124 +50,161 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from '@/components/ui/dropdown-menu'
+import { usePageStore } from '@/hooks/use-page-store'
+import { useIsMobile } from '@/hooks/use-mobile'
+import {
   ClipboardCheck,
-  ClipboardList,
   Search,
-  Package,
   AlertTriangle,
   CheckCircle2,
-  XCircle,
-  Play,
-  Pause,
-  RotateCcw,
   Save,
   Camera,
-  Zap,
+  ScanLine,
+  MoreVertical,
+  Trash2,
+  Pause,
   ArrowRight,
   Loader2,
   FileText,
-  Trash2,
-  RefreshCw,
+  WifiOff,
+  Wifi,
+  PlusCircle,
+  MinusCircle,
+  History,
+  Filter,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import {
   startOpname,
   completeOpname,
   cancelOpname,
+  pauseOpname,
+  resumePausedOpname,
   resumeOpname,
   getAllSnapshots,
   updateCount,
   findByScan,
   getOpnameSession,
+  setReviewing,
+  previewOpname,
+  buildCompletionSummary,
+  getOpnameCategories,
   type OpnameStatus,
+  type OpnameScope,
   type SnapshotItem,
   type OpnameSession,
   type CompleteResult,
+  type CompletionSummary,
+  type OpnameCategory,
 } from '@/lib/stock-opname/service'
+import {
+  VARIANCE_EPSILON,
+  fmtTime,
+  fmtDateTime,
+  fmtQty,
+  fmtSignedDelta,
+  varianceOf,
+  isMatched,
+  isDifference,
+  impactText,
+  STATUS_FILTER_OPTIONS,
+  SORT_OPTIONS,
+  type CountingFilter,
+  type SortMode,
+} from '@/components/stock-opname/types'
+import {
+  StockOpnameModeSelector,
+  AllItemsModePanel,
+  CategoryModePanel,
+  SelectedItemsModePanel,
+  StockOpnameSessionSummary,
+} from '@/components/stock-opname/mode-selector'
+import { StockOpnameQuickCountWidget } from '@/components/stock-opname/quick-count-widget'
+import {
+  StockOpnameStartDialog,
+  StockOpnamePauseDialog,
+  StockOpnameCancelDialog,
+  StockOpnameCompleteDialog,
+} from '@/components/stock-opname/dialogs'
 
-// ==================== STATUS CONFIG ====================
-const STATUS_CONFIG: Record<OpnameStatus, {
-  label: string
-  color: string
-  bgColor: string
-  icon: React.ReactNode
-  description: string
-}> = {
-  DRAFT: {
-    label: 'Draft',
-    color: 'text-gray-400',
-    bgColor: 'bg-gray-500/10',
-    icon: <ClipboardList className="h-4 w-4" />,
-    description: 'Siap memulai stock opname',
-  },
-  COUNTING: {
-    label: 'Sedang Menghitung',
-    color: 'text-blue-400',
-    bgColor: 'bg-blue-500/10',
-    icon: <Search className="h-4 w-4 animate-pulse" />,
-    description: 'Hitung stok fisik untuk setiap item',
-  },
-  REVIEW: {
-    label: 'Review',
-    color: 'text-amber-400',
-    bgColor: 'bg-amber-500/10',
-    icon: <AlertTriangle className="h-4 w-4" />,
-    description: 'Periksa selisih sebelum menyimpan',
-  },
-  COMPLETING: {
-    label: 'Menyimpan...',
-    color: 'text-emerald-400',
-    bgColor: 'bg-emerald-500/10',
-    icon: <Loader2 className="h-4 w-4 animate-spin" />,
-    description: 'Menerapkan penyesuaian ke server',
-  },
-}
+// ════════════════════════════════════════════════════════════
+// Main component
+// ════════════════════════════════════════════════════════════
 
 export default function StockOpnamePage() {
-  // ════════════════════════════════════════════════════════════
-  // State
-  // ════════════════════════════════════════════════════════════
-  
-  const [status, setStatus] = useState<OpnameStatus | null>(null)
+  // ── Navigation ──
+  const { setCurrentPage } = usePageStore()
+
+  // ── Page-level state ──
+  const [status, setStatus] = useState<OpnameStatus | 'COMPLETED' | null>(null)
   const [session, setSession] = useState<OpnameSession | null>(null)
   const [snapshots, setSnapshots] = useState<SnapshotItem[]>([])
   const [loading, setLoading] = useState(false)
-  const [searchQuery, setSearchQuery] = useState('')
+  const [isOnline, setIsOnline] = useState(true)
+  const [lastSavedAt, setLastSavedAt] = useState<string | null>(null)
+  const [bootstrapping, setBootstrapping] = useState(true)
+
+  // ── Start page state ──
+  const [mode, setMode] = useState<OpnameScope>('ALL_ITEMS')
+  const [includeZeroStock, setIncludeZeroStock] = useState(true)
+  const [selectedCategoryIds, setSelectedCategoryIds] = useState<string[]>([])
+  const [selectedItemIds, setSelectedItemIds] = useState<string[]>([])
+  const [preview, setPreview] = useState<{
+    itemCount: number
+    categoryCount: number
+    categories: OpnameCategory[]
+    snapshotAt: string
+  } | null>(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+
+  // ── Counting state ──
   const [scanInput, setScanInput] = useState('')
   const scanInputRef = useRef<HTMLInputElement>(null)
-  
-  // Filter states
-  const [filterVariance, setFilterVariance] = useState<'all' | 'variance' | 'uncounted'>('all')
+  const [focusedSnapshot, setFocusedSnapshot] = useState<SnapshotItem | null>(null)
+  const [filterMode, setFilterMode] = useState<CountingFilter>('ALL')
   const [filterCategory, setFilterCategory] = useState<string>('all')
-  
-  // Dialogs
-  const [showStartDialog, setShowStartDialog] = useState(false)
-  const [showCompleteDialog, setShowCompleteDialog] = useState(false)
-  const [showCancelDialog, setShowCancelDialog] = useState(false)
-  const [showResultDialog, setShowResultDialog] = useState(false)
-  const [completeResult, setCompleteResult] = useState<CompleteResult | null>(null)
-  
-  // Notes
+  const [sortMode, setSortMode] = useState<SortMode>('NAME')
+  const [categories, setCategories] = useState<OpnameCategory[]>([])
+
+  // ── Responsive: mobile uses a Dialog for counting; desktop uses floating card ──
+  const isMobile = useIsMobile()
+
+  // ── Review state ──
+  const [reviewFilter, setReviewFilter] = useState<'DIFFERENCE' | 'ALL'>('DIFFERENCE')
   const [notes, setNotes] = useState('')
-  
-  // Editing state
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [editValue, setEditValue] = useState<string>('')
-  
-  // Stats
-  const [stats, setStats] = useState({
-    total: 0,
-    counted: 0,
-    uncounted: 0,
-    variance: 0,
-  })
+
+  // ── Complete state (immutable) ──
+  const [completionSummary, setCompletionSummary] = useState<CompletionSummary | null>(null)
+  const [showCompleteDialog, setShowCompleteDialog] = useState(false)
+  const [completeResult, setCompleteResult] = useState<CompleteResult | null>(null)
+
+  // ── Dialogs ──
+  const [showStartDialog, setShowStartDialog] = useState(false)
+  const [showPauseDialog, setShowPauseDialog] = useState(false)
+  const [showCancelDialog, setShowCancelDialog] = useState(false)
 
   // ════════════════════════════════════════════════════════════
-  // Initialize / Resume
+  // Init: online/offline + resume existing session
   // ════════════════════════════════════════════════════════════
-  
   useEffect(() => {
-    checkExistingSession()
+    const on = () => setIsOnline(true)
+    const off = () => setIsOnline(false)
+    setIsOnline(navigator.onLine)
+    window.addEventListener('online', on)
+    window.addEventListener('offline', off)
+    return () => {
+      window.removeEventListener('online', on)
+      window.removeEventListener('offline', off)
+    }
+  }, [])
+
+  useEffect(() => {
+    checkExistingSession().finally(() => setBootstrapping(false))
   }, [])
 
   const checkExistingSession = async () => {
@@ -169,9 +213,14 @@ export default function StockOpnamePage() {
       if (existing) {
         setStatus(existing.status)
         setSession(existing)
-        const snaps = await getAllSnapshots()
-        setSnapshots(snaps)
-        recalculateStats(snaps)
+        if (existing.status !== 'PAUSED') {
+          const snaps = await getAllSnapshots()
+          setSnapshots(snaps)
+          const cats = await getOpnameCategories()
+          setCategories(cats)
+        }
+        setNotes(existing.notes || '')
+        setLastSavedAt(new Date().toISOString())
       }
     } catch (error) {
       console.error('[StockOpname] Resume error:', error)
@@ -179,24 +228,71 @@ export default function StockOpnamePage() {
   }
 
   // ════════════════════════════════════════════════════════════
-  // Actions
+  // Preview (start page)
   // ════════════════════════════════════════════════════════════
+  useEffect(() => {
+    if (status !== null) return
+    let cancelled = false
+    setPreviewLoading(true)
+    previewOpname('current', {
+      scope: mode,
+      categoryIds: mode === 'CATEGORY' ? selectedCategoryIds : undefined,
+      selectedItemIds: mode === 'SELECTED_ITEMS' ? selectedItemIds : undefined,
+      includeZeroStock,
+    })
+      .then((p) => {
+        if (!cancelled) setPreview(p)
+      })
+      .catch((err) => {
+        console.error('[StockOpname] Preview error:', err)
+        if (!cancelled) setPreview(null)
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [status, mode, includeZeroStock, selectedCategoryIds, selectedItemIds])
 
-  const handleStart = async (options?: { includeZeroStock: boolean }) => {
+  // ════════════════════════════════════════════════════════════
+  // Derived stats — canonical
+  // ════════════════════════════════════════════════════════════
+  const stats = useMemo(() => {
+    const itemSnapshots = snapshots.filter((s) => s.batchId === null)
+    const totalItems = session?.totalItems ?? itemSnapshots.length
+    const countedItems = itemSnapshots.filter((s) => s.physicalQty !== null).length
+    const uncountedItems = totalItems - countedItems
+    const matchedItems = itemSnapshots.filter(isMatched).length
+    const differenceItems = itemSnapshots.filter(isDifference).length
+    return { totalItems, countedItems, uncountedItems, matchedItems, differenceItems }
+  }, [snapshots, session])
+
+  // ════════════════════════════════════════════════════════════
+  // Actions: start
+  // ════════════════════════════════════════════════════════════
+  const handleStartConfirm = async () => {
     setLoading(true)
     try {
       const result = await startOpname('current', {
-        includeZeroStock: !options?.includeZeroStock,
+        scope: mode,
+        categoryIds: mode === 'CATEGORY' ? selectedCategoryIds : undefined,
+        selectedItemIds: mode === 'SELECTED_ITEMS' ? selectedItemIds : undefined,
+        includeZeroStock,
       })
-      
+      const newSession = await getOpnameSession()
       setStatus('COUNTING')
-      setSession(await getOpnameSession())
+      setSession(newSession)
       const snaps = await getAllSnapshots()
       setSnapshots(snaps)
-      recalculateStats(snaps)
-      
-      toast.success(`Stock opname dimulai! ${result.totalItems} item siap dihitung`)
+      const cats = await getOpnameCategories()
+      setCategories(cats)
+      setLastSavedAt(new Date().toISOString())
       setShowStartDialog(false)
+      toast.success('Stock opname dimulai', {
+        description: `${result.totalItems} item siap dihitung`,
+      })
+      setTimeout(() => scanInputRef.current?.focus(), 100)
     } catch (error) {
       toast.error('Gagal memulai stock opname')
       console.error(error)
@@ -205,77 +301,124 @@ export default function StockOpnamePage() {
     }
   }
 
-  const handleScan = async () => {
-    if (!scanInput.trim()) return
-    
-    const found = await findByScan(scanInput.trim())
-    
+  // ════════════════════════════════════════════════════════════
+  // Actions: scan
+  // ════════════════════════════════════════════════════════════
+  const handleScan = useCallback(async () => {
+    const value = scanInput.trim()
+    if (!value) return
+    const found = await findByScan(value)
     if (found) {
-      // Auto-focus to edit this item's quantity
-      setEditingId(found.id)
-      setEditValue('')
-      
-      // Scroll to item
-      const element = document.getElementById(`snap-${found.id}`)
-      element?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-      
-      toast.success(`Ditemukan: ${found.itemName}`, {
-        description: `System: ${found.systemQty} ${found.itemUnit}`,
-      })
+      setFocusedSnapshot(found)
+      setScanInput('')
     } else {
       toast.error('Item tidak ditemukan', {
-        description: `"${scanInput}" tidak cocok dengan nama/SKU/batch`,
+        description: `"${value}" tidak cocok dengan SKU / nama / batch`,
       })
+      setScanInput('')
+      scanInputRef.current?.focus()
     }
-    
-    setScanInput('')
-    scanInputRef.current?.focus()
-  }
+  }, [scanInput])
 
-  const handleUpdateCount = async (snapshotId: string, qty: number) => {
+  // ════════════════════════════════════════════════════════════
+  // Actions: save physical count (from QuickCountWidget)
+  // ════════════════════════════════════════════════════════════
+  const handleSaveCount = async (snapshotId: string, qty: number) => {
     try {
       await updateCount(snapshotId, qty)
-      
-      setSnapshots(prev => prev.map(s => 
-        s.id === snapshotId 
-          ? { ...s, physicalQty: qty, isCounted: true, updatedAt: new Date().toISOString() }
-          : s
-      ))
-      
-      setEditingId(null)
-      recalculateStats(snapshots.map(s => s.id === snapshotId ? { ...s, physicalQty: qty, isCounted: true } : s))
+      setSnapshots((prev) =>
+        prev.map((s) =>
+          s.id === snapshotId
+            ? { ...s, physicalQty: qty, isCounted: true, updatedAt: new Date().toISOString() }
+            : s
+        )
+      )
+      setLastSavedAt(new Date().toISOString())
+      // Select next uncounted item if available
+      const itemSnapshots = snapshots.filter((s) => s.batchId === null)
+      const currentIdx = itemSnapshots.findIndex((s) => s.id === snapshotId)
+      const nextUncounted = itemSnapshots
+        .slice(currentIdx + 1)
+        .find((s) => s.physicalQty === null && s.id !== snapshotId)
+      if (nextUncounted) {
+        setFocusedSnapshot(nextUncounted)
+      } else {
+        setFocusedSnapshot(null)
+        setTimeout(() => scanInputRef.current?.focus(), 50)
+      }
     } catch (error) {
-      toast.error('Gagal menyimpan count')
+      toast.error('Gagal menyimpan hitungan')
+      console.error(error)
     }
   }
 
-  const handleSetReview = async () => {
-    const { setReviewing } = await import('@/lib/stock-opname/service')
-    await setReviewing(notes)
-    setStatus('REVIEW')
-    setSession(prev => prev ? { ...prev, status: 'REVIEW', notes: notes || null } : null)
-    toast.success('Masuk ke mode Review')
+  const handleSkipCount = () => {
+    // Skip to next uncounted item
+    const itemSnapshots = snapshots.filter((s) => s.batchId === null)
+    if (!focusedSnapshot) return
+    const currentIdx = itemSnapshots.findIndex((s) => s.id === focusedSnapshot.id)
+    const nextUncounted = itemSnapshots
+      .slice(currentIdx + 1)
+      .find((s) => s.physicalQty === null)
+    if (nextUncounted) {
+      setFocusedSnapshot(nextUncounted)
+    } else {
+      setFocusedSnapshot(null)
+      setTimeout(() => scanInputRef.current?.focus(), 50)
+    }
   }
 
-  const handleComplete = async () => {
-    setLoading(true)
+  // Minimize the counting widget (mobile): dismiss the dialog and surface the
+  // "Stock Opname Berjalan" pill. The pill re-opens the dialog via the
+  // `so-resume-counting` event below.
+  const handleMinimizeCount = useCallback(() => {
+    setFocusedSnapshot(null)
+    setTimeout(() => scanInputRef.current?.focus(), 50)
+  }, [])
+
+  // Listen for the "so-resume-counting" custom event dispatched by the global
+  // Stock Opname pill when tapped on the SO page (mobile, counting minimized).
+  // Re-focus the next uncounted item, or the first item if all are counted.
+  useEffect(() => {
+    const onResume = () => {
+      const itemSnapshots = snapshots.filter((s) => s.batchId === null)
+      const nextUncounted = itemSnapshots.find((s) => s.physicalQty === null)
+      setFocusedSnapshot(nextUncounted ?? itemSnapshots[0] ?? null)
+    }
+    window.addEventListener('so-resume-counting', onResume)
+    return () => window.removeEventListener('so-resume-counting', onResume)
+  }, [snapshots])
+
+  // ════════════════════════════════════════════════════════════
+  // Actions: pause / resume / cancel
+  // ════════════════════════════════════════════════════════════
+  const handlePause = async () => {
     try {
-      const result = await completeOpname()
-      setCompleteResult(result)
-      setShowCompleteDialog(false)
-      setShowResultDialog(true)
-      setStatus(null)
-      setSession(null)
-      setSnapshots([])
-      
-      toast.success('Stock opname berhasil diselesaikan!', {
-        description: `${result.summary.adjustmentsMade} penyesuaian diterapkan`,
+      await pauseOpname()
+      setStatus('PAUSED')
+      setSession((prev) => (prev ? { ...prev, status: 'PAUSED' } : null))
+      setShowPauseDialog(false)
+      setFocusedSnapshot(null)
+      toast.info('Sesi ditunda', {
+        description: 'Progres tersimpan di perangkat. Klik Lanjutkan untuk melanjutkan.',
       })
     } catch (error) {
-      toast.error('Gagal menyelesaikan stock opname')
+      toast.error('Gagal menunda sesi')
       console.error(error)
-    } finally {
-      setLoading(false)
+    }
+  }
+
+  const handleResume = async () => {
+    try {
+      await resumePausedOpname()
+      const snaps = await getAllSnapshots()
+      setSnapshots(snaps)
+      setStatus('COUNTING')
+      setSession((prev) => (prev ? { ...prev, status: 'COUNTING' } : null))
+      setTimeout(() => scanInputRef.current?.focus(), 100)
+    } catch (error) {
+      toast.error('Gagal melanjutkan sesi')
+      console.error(error)
     }
   }
 
@@ -285,6 +428,8 @@ export default function StockOpnamePage() {
       setStatus(null)
       setSession(null)
       setSnapshots([])
+      setCompletionSummary(null)
+      setCompleteResult(null)
       setShowCancelDialog(false)
       toast.info('Stock opname dibatalkan')
     } catch (error) {
@@ -293,594 +438,1107 @@ export default function StockOpnamePage() {
   }
 
   // ════════════════════════════════════════════════════════════
-  // Helpers
+  // Actions: review / complete
   // ════════════════════════════════════════════════════════════
-
-  const recalculateStats = (snaps: SnapshotItem[]) => {
-    const total = snaps.filter(s => s.batchId === null).length // Item-level only
-    const counted = snaps.filter(s => s.physicalQty !== null && s.batchId === null).length
-    const uncounted = total - counted
-    const variance = snaps.filter(s => 
-      s.physicalQty !== null && 
-      s.batchId === null &&
-      Math.abs((s.physicalQty ?? 0) - s.systemQty) > 0.001
-    ).length
-    
-    setStats({ total, counted, uncounted, variance })
+  const handleEnterReview = async () => {
+    await setReviewing(notes)
+    setStatus('REVIEW')
+    setSession((prev) => (prev ? { ...prev, status: 'REVIEW', notes: notes || null } : null))
+    toast.success('Masuk mode Review')
   }
 
-  const getFilteredSnapshots = (): SnapshotItem[] => {
-    let filtered = snapshots.filter(s => s.batchId === null) // Show item-level only
-    
-    // Search filter
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase()
-      filtered = filtered.filter(s =>
-        s.itemName.toLowerCase().includes(q) ||
-        s.itemSku?.toLowerCase().includes(q)
-      )
+  const handleOpenCompleteDialog = async () => {
+    try {
+      const summary = await buildCompletionSummary()
+      setCompletionSummary(summary)
+      setShowCompleteDialog(true)
+    } catch (error) {
+      console.error('[StockOpname] buildCompletionSummary error:', error)
+      toast.error('Gagal menyiapkan ringkasan penyelesaian')
     }
-    
-    // Variance filter
-    if (filterVariance === 'variance') {
-      filtered = filtered.filter(s =>
-        s.physicalQty !== null && Math.abs((s.physicalQty ?? 0) - s.systemQty) > 0.001
-      )
-    } else if (filterVariance === 'uncounted') {
-      filtered = filtered.filter(s => s.physicalQty === null)
+  }
+
+  const handleComplete = async () => {
+    if (!completionSummary) return
+    setLoading(true)
+    try {
+      const result = await completeOpname()
+      setCompleteResult(result)
+      setShowCompleteDialog(false)
+      setStatus('COMPLETED')
+      setSnapshots([])
+      setSession(null)
+      toast.success('Stock opname berhasil diselesaikan!', {
+        description: `${result.summary.adjustmentsMade} penyesuaian diterapkan`,
+      })
+    } catch (error) {
+      toast.error('Gagal menyelesaikan stock opname', {
+        description: error instanceof Error ? error.message : undefined,
+      })
+      console.error(error)
+    } finally {
+      setLoading(false)
     }
-    
-    return filtered
   }
 
-  const getVarianceColor = (snapshot: SnapshotItem): string => {
-    if (snapshot.physicalQty === null) return 'text-gray-400'
-    const diff = snapshot.physicalQty - snapshot.systemQty
-    if (Math.abs(diff) < 0.001) return 'text-emerald-400'
-    return diff > 0 ? 'text-blue-400' : 'text-red-400'
+  const handleNewSession = () => {
+    setStatus(null)
+    setCompletionSummary(null)
+    setCompleteResult(null)
+    setNotes('')
+    setMode('ALL_ITEMS')
+    setIncludeZeroStock(true)
+    setSelectedCategoryIds([])
+    setSelectedItemIds([])
   }
 
-  const formatVariance = (snapshot: SnapshotItem): string => {
-    if (snapshot.physicalQty === null) return '-'
-    const diff = snapshot.physicalQty - snapshot.systemQty
-    if (Math.abs(diff) < 0.001) return '0'
-    return (diff > 0 ? '+' : '') + diff.toFixed(2)
-  }
+  // ════════════════════════════════════════════════════════════
+  // Filtered + sorted snapshots (COUNTING page)
+  // ════════════════════════════════════════════════════════════
+  const filteredSnapshots = useMemo(() => {
+    let list = snapshots.filter((s) => s.batchId === null)
+
+    if (filterCategory !== 'all') {
+      list = list.filter((s) => (s.categoryId || '__none__') === filterCategory)
+    }
+
+    switch (filterMode) {
+      case 'UNCOUNTED':
+        list = list.filter((s) => s.physicalQty === null)
+        break
+      case 'COUNTED':
+        list = list.filter((s) => s.physicalQty !== null)
+        break
+      case 'MATCHED':
+        list = list.filter(isMatched)
+        break
+      case 'DIFFERENCE':
+        list = list.filter(isDifference)
+        break
+    }
+
+    list = [...list]
+    switch (sortMode) {
+      case 'NAME':
+        list.sort((a, b) => a.itemName.localeCompare(b.itemName))
+        break
+      case 'SKU':
+        list.sort((a, b) => (a.itemSku || '').localeCompare(b.itemSku || ''))
+        break
+      case 'CATEGORY':
+        list.sort(
+          (a, b) =>
+            (a.categoryName || 'Tanpa Kategori').localeCompare(
+              b.categoryName || 'Tanpa Kategori'
+            ) || a.itemName.localeCompare(b.itemName)
+        )
+        break
+      case 'LAST_COUNTED':
+        list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+        break
+    }
+    return list
+  }, [snapshots, filterCategory, filterMode, sortMode])
+
+  // ════════════════════════════════════════════════════════════
+  // Review table rows
+  // ════════════════════════════════════════════════════════════
+  const reviewRows = useMemo(() => {
+    const list = snapshots.filter((s) => s.batchId === null)
+    if (reviewFilter === 'DIFFERENCE') return list.filter(isDifference)
+    return list.filter((s) => s.physicalQty !== null)
+  }, [snapshots, reviewFilter])
+
+  // ════════════════════════════════════════════════════════════
+  // Selected items for SELECTED_ITEMS mode (resolved from IDs)
+  // ════════════════════════════════════════════════════════════
+  const fetchPickerItems = useCallback(async () => {
+    const res = await fetch('/api/inventory/stock-opname?outletId=current')
+    const data = await res.json()
+    let list = (data.items as any[]).map((i) => ({
+      inventoryItemId: i.inventoryItemId,
+      itemName: i.itemName,
+      itemSku: i.itemSku,
+      categoryName: i.categoryName,
+      systemQty: i.systemQty,
+      itemUnit: i.itemUnit,
+    }))
+    if (!includeZeroStock) list = list.filter((i) => i.systemQty > 0)
+    list.sort((a, b) => a.itemName.localeCompare(b.itemName))
+    return list
+  }, [includeZeroStock])
 
   // ════════════════════════════════════════════════════════════
   // Render
   // ════════════════════════════════════════════════════════════
-
-  const filteredSnapshots = getFilteredSnapshots()
-  const statusConfig = status ? STATUS_CONFIG[status] : null
+  if (bootstrapping) {
+    return (
+      <div className="min-h-screen flex flex-col bg-background">
+        <main className="flex-1 max-w-4xl mx-auto w-full px-4 py-6">
+          <Skeleton className="h-12 w-48 mb-4" />
+          <Skeleton className="h-32 w-full mb-4" />
+          <Skeleton className="h-64 w-full" />
+        </main>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-screen flex flex-col bg-background">
-      {/* Header */}
-      <div className="border-b bg-card sticky top-0 z-30">
-        <div className="max-w-7xl mx-auto px-4 py-4">
-          <div className="flex items-center justify-between">
+      {/* Lightweight page header — icon + title + subtitle, no heavy banner */}
+      <div className="max-w-5xl mx-auto w-full px-4 pt-5 pb-1">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-amber-500/10 flex items-center justify-center shrink-0">
+              <ClipboardCheck className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+            </div>
             <div>
-              <h1 className="text-xl font-bold flex items-center gap-2">
-                <ClipboardCheck className="h-5 w-5 text-primary" />
-                Stock Opname
-              </h1>
-              <p className="text-sm text-muted-foreground mt-1">
+              <h1 className="text-base font-semibold leading-tight">Stock Opname</h1>
+              <p className="text-xs text-muted-foreground mt-0.5">
                 Hitung stok fisik & sesuaikan dengan sistem
               </p>
             </div>
-            
-            {/* Status Badge */}
-            {statusConfig && (
-              <Badge className={cn('gap-1.5 px-3 py-1', statusConfig.bgColor, statusConfig.color)}>
-                {statusConfig.icon}
-                {statusConfig.label}
-              </Badge>
-            )}
           </div>
-          
-          {/* Status Description */}
-          {statusConfig && (
-            <motion.div
-              initial={{ opacity: 0, y: -10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className={cn('mt-3 p-2 rounded-md text-sm', statusConfig.bgColor)}
-            >
-              {statusConfig.description}
-            </motion.div>
+          {session?.scopeLabel && (
+            <Badge variant="outline" className="gap-1.5 px-2.5 py-1 text-xs shrink-0">
+              <History className="h-3 w-3" />
+              {session.scopeLabel}
+            </Badge>
           )}
         </div>
       </div>
 
       {/* Main Content */}
-      <main className="flex-1 max-w-7xl mx-auto w-full px-4 py-6">
-        {!status ? (
-          /* ════════════════════════════════════════════════
-           * IDLE STATE - Start new opname
-           * ════════════════════════════════════════════════ */
-          <div className="flex items-center justify-center min-h-[60vh]">
-            <Card className="w-full max-w-lg">
-              <CardHeader className="text-center">
-                <div className="mx-auto w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mb-4">
-                  <ClipboardCheck className="h-8 w-8 text-primary" />
-                </div>
-                <CardTitle>Mulai Stock Opname</CardTitle>
-                <p className="text-sm text-muted-foreground mt-2">
-                  Hitung stok fisik dan buat penyesuaian jika ada selisih
-                </p>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="grid grid-cols-2 gap-4 text-sm">
-                  <div className="p-3 rounded-lg bg-muted">
-                    <Package className="h-4 w-4 text-muted-foreground mb-1" />
-                    <div className="font-medium">Snapshot</div>
-                    <div className="text-xs text-muted-foreground">Stok dibekukan saat mulai</div>
-                  </div>
-                  <div className="p-3 rounded-lg bg-muted">
-                    <Zap className="h-4 w-4 text-muted-foreground mb-1" />
-                    <div className="font-medium">Cepat</div>
-                    <div className="text-xs text-muted-foreground">Support barcode scanner</div>
-                  </div>
-                  <div className="p-3 rounded-lg bg-muted">
-                    <AlertTriangle className="h-4 w-4 text-muted-foreground mb-1" />
-                    <div className="font-medium">Aman</div>
-                    <div className="text-xs text-muted-foreground">Transaksi selama opname aman</div>
-                  </div>
-                  <div className="p-3 rounded-lg bg-muted">
-                    <FileText className="h-4 w-4 text-muted-foreground mb-1" />
-                    <div className="font-medium">Audit Trail</div>
-                    <div className="text-xs text-muted-foreground">Semua perubahan terekam</div>
-                  </div>
-                </div>
-                
-                <Button 
-                  className="w-full" 
-                  size="lg"
-                  onClick={() => setShowStartDialog(true)}
-                >
-                  <Play className="h-4 w-4 mr-2" />
-                  Mulai Stock Opname Baru
-                </Button>
-              </CardContent>
-            </Card>
-          </div>
-        ) : (
-          /* ════════════════════════════════════════════════
-           * ACTIVE STATE - Counting / Review
-           * ════════════════════════════════════════════════ */
-          <div className="space-y-4">
-            {/* Stats Cards */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              <Card className="p-3">
-                <div className="text-xs text-muted-foreground">Total Item</div>
-                <div className="text-2xl font-bold">{stats.total}</div>
-              </Card>
-              <Card className={cn("p-3", stats.counted > 0 && "border-emerald-500/30 bg-emerald-500/5")}>
-                <div className="text-xs text-muted-foreground">Sudah Dihitung</div>
-                <div className="text-2xl font-bold text-emerald-400">{stats.counted}</div>
-              </Card>
-              <Card className={cn("p-3", stats.uncounted > 0 && "border-amber-500/30 bg-amber-500/5")}>
-                <div className="text-xs text-muted-foreground">Belum Dihitung</div>
-                <div className="text-2xl font-bold text-amber-400">{stats.uncounted}</div>
-              </Card>
-              <Card className={cn("p-3", stats.variance > 0 && "border-red-500/30 bg-red-500/5")}>
-                <div className="text-xs text-muted-foreground">Ada Selisih</div>
-                <div className="text-2xl font-bold text-red-400">{stats.variance}</div>
-              </Card>
-            </div>
+      <main className="flex-1 max-w-4xl mx-auto w-full px-4 py-4">
+        <AnimatePresence mode="wait">
+          {/* ════════════════════════════════════════════════════
+           * RESUME CARD (PAUSED session exists)
+           * ════════════════════════════════════════════════════ */}
+          {status === 'PAUSED' && session && (
+            <motion.div
+              key="resume"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+            >
+              <ResumeCard
+                session={session}
+                countedItems={snapshots.filter((s) => s.batchId === null && s.physicalQty !== null).length}
+                lastSavedAt={lastSavedAt}
+                onResume={handleResume}
+                onCancel={() => setShowCancelDialog(true)}
+              />
+            </motion.div>
+          )}
 
-            {/* Toolbar */}
-            <Card className="p-4">
-              <div className="flex flex-col sm:flex-row gap-3">
-                {/* Search/Scanner */}
-                <div className="flex-1 flex gap-2">
-                  <div className="relative flex-1">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                    <Input
-                      ref={scanInputRef}
-                      placeholder="Scan barcode atau ketik nama/SKU..."
-                      value={scanInput}
-                      onChange={(e) => setScanInput(e.target.value)}
-                      onKeyDown={(e) => e.key === 'Enter' && handleScan()}
-                      className="pl-9 pr-10"
+          {/* ════════════════════════════════════════════════════
+           * START PAGE (idle, no session)
+           * V3.1 — focused central panel, Purchase-style mode cards,
+           * single compact summary, sticky footer with Batal + CTA.
+           * ════════════════════════════════════════════════════ */}
+          {status === null && (
+            <motion.div
+              key="start"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="max-w-[980px] mx-auto"
+            >
+              <Card>
+                <CardContent className="p-0">
+                  {/* Panel title + helper */}
+                  <div className="px-5 pt-5 pb-3">
+                    <h2 className="text-base font-semibold">Mulai Sesi Baru</h2>
+                    <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                      Pilih metode hitung stok sesuai kebutuhan operasional toko.
+                    </p>
+                  </div>
+
+                  {/* Mode cards */}
+                  <div className="px-5">
+                    <StockOpnameModeSelector mode={mode} onChange={setMode} />
+                  </div>
+
+                  {/* Active mode configuration */}
+                  <div className="px-5 pt-4 mt-4 border-t">
+                    <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-2.5">
+                      Konfigurasi
+                    </div>
+                    {mode === 'ALL_ITEMS' && (
+                      <AllItemsModePanel
+                        includeZeroStock={includeZeroStock}
+                        onIncludeZeroStockChange={setIncludeZeroStock}
+                      />
+                    )}
+                    {mode === 'CATEGORY' && (
+                      <CategoryModePanel
+                        categories={preview?.categories ?? []}
+                        selectedIds={selectedCategoryIds}
+                        onSelectedIdsChange={setSelectedCategoryIds}
+                        includeZeroStock={includeZeroStock}
+                        onIncludeZeroStockChange={setIncludeZeroStock}
+                        loading={previewLoading}
+                      />
+                    )}
+                    {mode === 'SELECTED_ITEMS' && (
+                      <SelectedItemsModePanel
+                        // Parent only tracks IDs — the panel resolves the
+                        // full PickerItem[] from its own fetched `allItems`.
+                        selectedIds={selectedItemIds}
+                        onSelectedIdsChange={setSelectedItemIds}
+                        includeZeroStock={includeZeroStock}
+                        onIncludeZeroStockChange={setIncludeZeroStock}
+                        fetchItems={fetchPickerItems}
+                      />
+                    )}
+                  </div>
+
+                  {/* Single compact session summary */}
+                  <div className="px-5 pt-4">
+                    <StockOpnameSessionSummary
+                      mode={mode}
+                      itemCount={preview?.itemCount ?? 0}
+                      categoryCount={selectedCategoryIds.length}
+                      includeZeroStock={includeZeroStock}
+                      loading={previewLoading}
                     />
+                  </div>
+
+                  {/* Concise information notice */}
+                  <div className="px-5 pt-3">
+                    <div className="flex items-start gap-2 p-2.5 rounded-lg bg-muted/30 border border-border">
+                      <AlertTriangle className="h-3.5 w-3.5 text-amber-500 shrink-0 mt-0.5" />
+                      <p className="text-[11px] text-muted-foreground leading-relaxed">
+                        Penjualan tetap dapat berjalan. Hindari pembelian, transfer, atau
+                        adjustment manual pada item yang sedang dihitung agar review lebih mudah.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Footer action — left Batal, right primary CTA.
+                      Sticky so the CTA stays visible while the category/item
+                      lists scroll. On mobile, sticks at bottom-14 (56px) to
+                      clear the global mobile bottom nav (~56px, z-50); on
+                      desktop, sticks at bottom-0. rounded-b-xl matches the
+                      Card's rounded corners (Card has no overflow-hidden so
+                      sticky works against the viewport). */}
+                  <div className="sticky bottom-14 md:bottom-0 mt-4 px-5 py-3 border-t bg-card/95 backdrop-blur flex items-center gap-2 rounded-b-xl">
                     <Button
                       variant="ghost"
-                      size="sm"
-                      className="absolute right-1 top-1/2 -translate-y-1/2 h-7 px-2"
-                      onClick={handleScan}
+                      className="flex-1 sm:flex-none sm:px-6"
+                      onClick={() => setCurrentPage('dashboard')}
+                      disabled={loading}
                     >
-                      <Camera className="h-4 w-4" />
+                      Batal
                     </Button>
+                    <Button
+                      className="flex-[2] sm:flex-1"
+                      onClick={() => setShowStartDialog(true)}
+                      disabled={
+                        loading ||
+                        !preview ||
+                        preview.itemCount === 0 ||
+                        (mode === 'CATEGORY' && selectedCategoryIds.length === 0) ||
+                        (mode === 'SELECTED_ITEMS' && selectedItemIds.length === 0)
+                      }
+                    >
+                      Mulai Stock Opname
+                      {preview && preview.itemCount > 0 && (
+                        <span className="ml-1.5 opacity-80 tabular-nums">
+                          · {preview.itemCount} Item
+                        </span>
+                      )}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </motion.div>
+          )}
+
+          {/* ════════════════════════════════════════════════════
+           * COUNTING PAGE
+           * ════════════════════════════════════════════════════ */}
+          {status === 'COUNTING' && session && (
+            <motion.div
+              key="counting"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="space-y-3 pb-32 sm:pb-0"
+            >
+              {/* Compact session header */}
+              <div className="rounded-lg border bg-card p-3">
+                <div className="flex items-start justify-between gap-2 mb-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold">Stock Opname Berjalan</div>
+                    <div className="text-xs text-muted-foreground mt-0.5">
+                      {session.scopeLabel || 'Semua Item'} · Mulai {fmtTime(session.startedAt)}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <AutosaveBadge isOnline={isOnline} lastSavedAt={lastSavedAt} />
+                    {/* Desktop actions */}
+                    <div className="hidden sm:flex items-center gap-1.5">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setShowPauseDialog(true)}
+                      >
+                        <Pause className="h-3.5 w-3.5 mr-1.5" />
+                        Tunda Sesi
+                      </Button>
+                      <Button
+                        size="sm"
+                        onClick={handleEnterReview}
+                        disabled={stats.countedItems === 0}
+                      >
+                        Review ({stats.countedItems})
+                      </Button>
+                    </div>
+                    {/* Overflow menu (mobile + desktop cancel) */}
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button size="sm" variant="ghost" className="h-8 w-8 p-0">
+                          <MoreVertical className="h-4 w-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive sm:hidden"
+                          onClick={() => setShowPauseDialog(true)}
+                        >
+                          <Pause className="h-4 w-4 mr-2" />
+                          Tunda Sesi
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive"
+                          onClick={() => setShowCancelDialog(true)}
+                        >
+                          <Trash2 className="h-4 w-4 mr-2" />
+                          Batalkan Sesi
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
                 </div>
 
-                {/* Filters */}
-                <Select value={filterVariance} onValueChange={(v: any) => setFilterVariance(v)}>
-                  <SelectTrigger className="w-[150px]">
-                    <SelectValue placeholder="Filter" />
+                {/* Progress */}
+                <div className="flex items-center gap-2.5">
+                  <div className="text-sm font-semibold tabular-nums shrink-0">
+                    {stats.countedItems} dari {stats.totalItems} item
+                  </div>
+                  <Progress
+                    value={
+                      stats.totalItems > 0
+                        ? (stats.countedItems / stats.totalItems) * 100
+                        : 0
+                    }
+                    className="flex-1 h-1.5"
+                  />
+                  <div className="text-xs text-muted-foreground tabular-nums w-9 text-right shrink-0">
+                    {stats.totalItems > 0
+                      ? Math.round((stats.countedItems / stats.totalItems) * 100)
+                      : 0}
+                    %
+                  </div>
+                </div>
+
+                {/* Compact status chips (not oversized cards) */}
+                <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                  <Badge variant="outline" className="text-xs gap-1">
+                    <CheckCircle2 className="h-3 w-3 text-emerald-500" />
+                    Dihitung {stats.countedItems}
+                  </Badge>
+                  <Badge variant="outline" className="text-xs gap-1">
+                    Belum {stats.uncountedItems}
+                  </Badge>
+                  {stats.differenceItems > 0 && (
+                    <Badge variant="outline" className="text-xs gap-1 text-amber-600 border-amber-500/30">
+                      <AlertTriangle className="h-3 w-3" />
+                      Selisih {stats.differenceItems}
+                    </Badge>
+                  )}
+                </div>
+              </div>
+
+              {/* Scan / Search bar */}
+              <div className="relative">
+                <ScanLine className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-primary" />
+                <Input
+                  ref={scanInputRef}
+                  placeholder="Scan barcode atau cari nama/SKU..."
+                  value={scanInput}
+                  onChange={(e) => setScanInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      handleScan()
+                    }
+                  }}
+                  className="pl-9 pr-10 h-10"
+                  autoFocus
+                />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="absolute right-1 top-1/2 -translate-y-1/2 h-8 px-2"
+                  onClick={handleScan}
+                >
+                  <Camera className="h-4 w-4" />
+                </Button>
+              </div>
+
+              {/* Filter + sort toolbar */}
+              <div className="flex flex-col sm:flex-row gap-2">
+                <Select value={filterMode} onValueChange={(v) => setFilterMode(v as CountingFilter)}>
+                  <SelectTrigger className="w-full sm:w-[150px] h-9">
+                    <Filter className="h-3.5 w-3.5 mr-1.5 text-muted-foreground" />
+                    <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">Semua</SelectItem>
-                    <SelectItem value="uncounted">Belum Dihitung</SelectItem>
-                    <SelectItem value="variance">Ada Selisih</SelectItem>
+                    {STATUS_FILTER_OPTIONS.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
-
-                {/* Actions */}
-                <div className="flex gap-2">
-                  {(status === 'COUNTING') && (
-                    <>
-                      <Button 
-                        variant="outline" 
-                        onClick={handleSetReview}
-                        disabled={stats.counted === 0}
-                      >
-                        <Pause className="h-4 w-4 mr-1" />
-                        Review
-                      </Button>
-                      <Button 
-                        variant="destructive" 
-                        onClick={() => setShowCancelDialog(true)}
-                      >
-                        <Trash2 className="h-4 w-4 mr-1" />
-                        Batal
-                      </Button>
-                    </>
-                  )}
-                  
-                  {status === 'REVIEW' && (
-                    <>
-                      <Button 
-                        variant="outline" 
-                        onClick={() => setStatus('COUNTING')}
-                      >
-                        <RotateCcw className="h-4 w-4 mr-1" />
-                        Lanjut Hitung
-                      </Button>
-                      <Button 
-                        onClick={() => setShowCompleteDialog(true)}
-                        disabled={loading}
-                      >
-                        {loading ? (
-                          <Loader2 className="h-4 w-4 mr-1 animate-spin" />
-                        ) : (
-                          <Save className="h-4 w-4 mr-1" />
-                        )}
-                        Selesaikan
-                      </Button>
-                    </>
-                  )}
-                </div>
+                <Select value={filterCategory} onValueChange={setFilterCategory}>
+                  <SelectTrigger className="w-full sm:w-[150px] h-9">
+                    <SelectValue placeholder="Kategori" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Semua Kategori</SelectItem>
+                    {categories.map((c) => (
+                      <SelectItem key={c.id} value={c.id}>
+                        {c.name} ({c.itemCount})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select value={sortMode} onValueChange={(v) => setSortMode(v as SortMode)}>
+                  <SelectTrigger className="w-full sm:w-[130px] h-9">
+                    <SelectValue placeholder="Urutkan" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {SORT_OPTIONS.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
-            </Card>
 
-            {/* Snapshots Table */}
-            <Card>
-              <CardContent className="p-0">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="w-[40px]">#</TableHead>
-                      <TableHead>Nama Item</TableHead>
-                      <TableHead>SKU</TableHead>
-                      <TableHead className="text-right">System Qty</TableHead>
-                      <TableHead className="text-right">Physical Qty</TableHead>
-                      <TableHead className="text-right">Selisih</TableHead>
-                      <TableHead>Status</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {filteredSnapshots.length === 0 ? (
-                      <TableRow>
-                        <TableCell colSpan={7} className="text-center py-8 text-muted-foreground">
-                          {searchQuery ? 'Tidak ditemukan' : 'Tidak ada data'}
-                        </TableCell>
-                      </TableRow>
-                    ) : (
-                      filteredSnapshots.map((snap, idx) => (
-                        <TableRow 
-                          key={snap.id}
-                          id={`snap-${snap.id}`}
-                          className={cn(
-                            editingId === snap.id && "bg-primary/5",
-                            snap.isCounted && "opacity-90"
-                          )}
-                          onClick={() => {
-                            if (editingId !== snap.id) {
-                              setEditingId(snap.id)
-                              setEditValue(snap.physicalQty?.toString() || '')
-                            }
-                          }}
-                        >
-                          <TableCell className="text-muted-foreground text-sm">
-                            {idx + 1}
-                          </TableCell>
-                          <TableCell className="font-medium">
-                            {snap.itemName}
-                            {snap.batchNumber && (
-                              <Badge variant="outline" className="ml-2 text-xs">
-                                {snap.batchNumber}
-                              </Badge>
-                            )}
-                          </TableCell>
-                          <TableCell className="text-muted-foreground text-sm">
-                            {snap.itemSku || '-'}
-                          </TableCell>
-                          <TableCell className="text-right font-mono">
-                            {snap.systemQty.toFixed(2)}
-                            <span className="text-xs text-muted-foreground ml-1">
-                              {snap.itemUnit}
-                            </span>
-                          </TableCell>
-                          <TableCell className="text-right">
-                            {editingId === snap.id ? (
-                              <Input
-                                type="number"
-                                step="0.01"
-                                value={editValue}
-                                onChange={(e) => setEditValue(e.target.value)}
-                                onBlur={() => {
-                                  const val = parseFloat(editValue)
-                                  if (!isNaN(val) && val >= 0) {
-                                    handleUpdateCount(snap.id, val)
-                                  }
-                                }}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') {
-                                    const val = parseFloat(editValue)
-                                    if (!isNaN(val) && val >= 0) {
-                                      handleUpdateCount(snap.id, val)
-                                    }
-                                  }
-                                  if (e.key === 'Escape') setEditingId(null)
-                                }}
-                                className="w-24 h-8 text-right"
-                                autoFocus
-                              />
-                            ) : (
-                              <span className={cn(
-                                "font-mono",
-                                snap.physicalQty !== null ? "font-semibold" : "text-muted-foreground"
-                              )}>
-                                {snap.physicalQty !== null 
-                                  ? snap.physicalQty.toFixed(2)
-                                  : '-'
-                                }
-                              </span>
-                            )}
-                          </TableCell>
-                          <TableCell className={cn(
-                            "text-right font-mono font-semibold",
-                            getVarianceColor(snap)
-                          )}>
-                            {formatVariance(snap)}
-                          </TableCell>
-                          <TableCell>
-                            {snap.physicalQty === null ? (
-                              <Badge variant="outline" className="text-xs">
-                                Belum
-                              </Badge>
-                            ) : Math.abs((snap.physicalQty ?? 0) - snap.systemQty) < 0.001 ? (
-                              <Badge className="bg-emerald-500/10 text-emerald-400 border-0 text-xs">
-                                <CheckCircle2 className="h-3 w-3 mr-1" />
-                                Sesuai
-                              </Badge>
-                            ) : (
-                              <Badge className="bg-amber-500/10 text-amber-400 border-0 text-xs">
-                                <AlertTriangle className="h-3 w-3 mr-1" />
-                                Selisih
-                              </Badge>
-                            )}
-                          </TableCell>
-                        </TableRow>
-                      ))
-                    )}
-                  </TableBody>
-                </Table>
-              </CardContent>
-            </Card>
-
-            {/* Notes (optional) */}
-            <Card className="p-4">
-              <label className="text-sm font-medium mb-2 block">Catatan (opsional)</label>
-              <Textarea
-                placeholder="Tambahkan catatan untuk stock opname ini..."
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                rows={2}
-              />
-            </Card>
-          </div>
-        )}
-      </main>
-
-      {/* ════════════════════════════════════════════════════════════
-       * DIALOGS
-       * ════════════════════════════════════════════════════════════ */}
-
-      {/* Start Dialog */}
-      <ResponsiveDialog open={showStartDialog} onOpenChange={setShowStartDialog}>
-        <ResponsiveDialogContent>
-          <ResponsiveDialogHeader>
-            <ResponsiveDialogTitle>Mulai Stock Opname Baru?</ResponsiveDialogTitle>
-            <ResponsiveDialogDescription>
-              Stok saat ini akan dibekukan (snapshot). Transaksi yang terjadi selama proses opname tetap aman.
-            </ResponsiveDialogDescription>
-          </ResponsiveDialogHeader>
-          
-          <div className="py-4 space-y-4">
-            <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/20">
-              <p className="text-sm text-amber-400">
-                ⚠️ Pastikan tidak ada transaksi penjualan/pembelian yang sedang berlangsung saat melakukan stock opname untuk hasil yang akurat.
-              </p>
-            </div>
-            
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Opsi:</label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" defaultChecked className="rounded" />
-                <span className="text-sm">Sertakan item dengan stok 0</span>
-              </label>
-            </div>
-          </div>
-          
-          <ResponsiveDialogFooter>
-            <Button variant="outline" onClick={() => setShowStartDialog(false)}>
-              Batal
-            </Button>
-            <Button onClick={() => handleStart()} disabled={loading}>
-              {loading && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-              Mulai Sekarang
-            </Button>
-          </ResponsiveDialogFooter>
-        </ResponsiveDialogContent>
-      </ResponsiveDialog>
-
-      {/* Complete Dialog */}
-      <ResponsiveDialog open={showCompleteDialog} onOpenChange={setShowCompleteDialog}>
-        <ResponsiveDialogContent>
-          <ResponsiveDialogHeader>
-            <ResponsiveDialogTitle>Selesaikan Stock Opname?</ResponsiveDialogTitle>
-            <ResponsiveDialogDescription>
-              Penyesuaian akan diterapkan ke server. Stok akan diupdate berdasarkan selisih dari snapshot.
-            </ResponsiveDialogDescription>
-          </ResponsiveDialogHeader>
-          
-          <div className="py-4 space-y-3">
-            <div className="grid grid-cols-2 gap-3 text-sm">
-              <div className="p-2 rounded bg-muted">
-                <div className="text-muted-foreground">Total Item</div>
-                <div className="font-bold text-lg">{session?.countedItems || 0}</div>
-              </div>
-              <div className="p-2 rounded bg-muted">
-                <div className="text-muted-foreground">Ada Selisih</div>
-                <div className="font-bold text-lg text-amber-400">{session?.varianceItems || 0}</div>
-              </div>
-            </div>
-            
-            {session && session.varianceItems > 0 && (
-              <div className="p-3 rounded-lg bg-blue-500/10 border border-blue-500/20">
-                <p className="text-sm text-blue-400">
-                  ℹ️ Delta dihitung: <strong>physicalQty - systemQty (snapshot)</strong><br/>
-                   Server akan menambahkan delta ke stok terbaru, sehingga transaksi selama counting tetap aman.
-                </p>
-              </div>
-            )}
-          </div>
-          
-          <ResponsiveDialogFooter>
-            <Button variant="outline" onClick={() => setShowCompleteDialog(false)}>
-              Kembali ke Review
-            </Button>
-            <Button onClick={handleComplete} disabled={loading}>
-              {loading && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-              Ya, Selesaikan
-            </Button>
-          </ResponsiveDialogFooter>
-        </ResponsiveDialogContent>
-      </ResponsiveDialog>
-
-      {/* Cancel Dialog */}
-      <ResponsiveDialog open={showCancelDialog} onOpenChange={setShowCancelDialog}>
-        <ResponsiveDialogContent>
-          <ResponsiveDialogHeader>
-            <ResponsiveDialogTitle>Batalkan Stock Opname?</ResponsiveDialogTitle>
-            <ResponsiveDialogDescription>
-              Semua data counting yang belum disimpan akan hilang. Tindakan ini tidak dapat dibatalkan.
-            </ResponsiveDialogDescription>
-          </ResponsiveDialogHeader>
-          
-          <ResponsiveDialogFooter>
-            <Button variant="outline" onClick={() => setShowCancelDialog(false)}>
-              Lanjutkan
-            </Button>
-            <Button variant="destructive" onClick={handleCancel}>
-              Ya, Batalkan
-            </Button>
-          </ResponsiveDialogFooter>
-        </ResponsiveDialogContent>
-      </ResponsiveDialog>
-
-      {/* Result Dialog */}
-      <ResponsiveDialog open={showResultDialog} onOpenChange={setShowResultDialog}>
-        <ResponsiveDialogContent className="max-w-lg">
-          <ResponsiveDialogHeader>
-            <ResponsiveDialogTitle className="flex items-center gap-2">
-              <CheckCircle2 className="h-5 w-5 text-emerald-400" />
-              Stock Opname Berhasil!
-            </ResponsiveDialogTitle>
-            <ResponsiveDialogDescription>
-              Semua penyesuaian telah diterapkan ke server
-            </ResponsiveDialogDescription>
-          </ResponsiveDialogHeader>
-          
-          {completeResult && (
-            <div className="py-4 space-y-4">
-              <div className="grid grid-cols-2 gap-3 text-sm">
-                <div className="p-3 rounded-lg bg-emerald-500/10">
-                  <div className="text-muted-foreground">Penyesuaian</div>
-                  <div className="font-bold text-xl text-emerald-400">{completeResult.summary.adjustmentsMade}</div>
-                </div>
-                <div className="p-3 rounded-lg bg-blue-500/10">
-                  <div className="text-muted-foreground">Batch Update</div>
-                  <div className="font-bold text-xl text-blue-400">{completeResult.summary.batchUpdates}</div>
-                </div>
-                <div className="p-3 rounded-lg bg-amber-500/10">
-                  <div className="text-muted-foreground">Item Selisih</div>
-                  <div className="font-bold text-xl text-amber-400">{completeResult.summary.varianceItems}</div>
-                </div>
-                <div className="p-3 rounded-lg bg-muted">
-                  <div className="text-muted-foreground">Nilai Variance</div>
-                  <div className="font-bold text-xl">Rp {completeResult.summary.totalVarianceValue.toLocaleString('id-ID')}</div>
-                </div>
-              </div>
-              
-              {/* Adjustment Details */}
-              {completeResult.adjustments.length > 0 && (
-                <div className="max-h-48 overflow-y-auto rounded border">
+              {/* Compact table */}
+              <div className="rounded-lg border overflow-hidden">
+                <div className="max-h-[50vh] overflow-y-auto">
                   <Table>
-                    <TableHeader>
+                    <TableHeader className="sticky top-0 bg-card z-10">
                       <TableRow>
+                        <TableHead className="w-[35px]">#</TableHead>
                         <TableHead>Item</TableHead>
-                        <TableHead className="text-right">System</TableHead>
+                        <TableHead className="text-right">Snapshot</TableHead>
                         <TableHead className="text-right">Fisik</TableHead>
-                        <TableHead className="text-right">Delta</TableHead>
+                        <TableHead className="text-right">Selisih</TableHead>
+                        <TableHead>Status</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {completeResult.adjustments.slice(0, 10).map((adj, i) => (
-                        <TableRow key={i}>
-                          <TableCell className="text-sm">{adj.itemName}</TableCell>
-                          <TableCell className="text-right font-mono text-sm">{adj.systemQty}</TableCell>
-                          <TableCell className="text-right font-mono text-sm">{adj.physicalQty}</TableCell>
-                          <TableCell className={cn(
-                            "text-right font-mono text-sm font-semibold",
-                            adj.delta > 0 ? "text-blue-400" : adj.delta < 0 ? "text-red-400" : ""
-                          )}>
-                            {adj.delta > 0 ? '+' : ''}{adj.delta}
+                      {filteredSnapshots.length === 0 ? (
+                        <TableRow>
+                          <TableCell colSpan={6} className="text-center py-6 text-muted-foreground text-sm">
+                            Tidak ada item yang cocok dengan filter
                           </TableCell>
                         </TableRow>
-                      ))}
+                      ) : (
+                        filteredSnapshots.map((snap, idx) => {
+                          const diff = varianceOf(snap)
+                          const matched = isMatched(snap)
+                          return (
+                            <TableRow
+                              key={snap.id}
+                              id={`snap-${snap.id}`}
+                              className={cn(
+                                'cursor-pointer hover:bg-muted/50',
+                                focusedSnapshot?.id === snap.id && 'bg-amber-500/5'
+                              )}
+                              onClick={() => setFocusedSnapshot(snap)}
+                            >
+                              <TableCell className="text-muted-foreground text-xs tabular-nums">
+                                {idx + 1}
+                              </TableCell>
+                              <TableCell>
+                                <div className="font-medium text-sm truncate max-w-[180px]">
+                                  {snap.itemName}
+                                </div>
+                                <div className="text-xs text-muted-foreground">
+                                  {snap.itemSku || '-'}
+                                </div>
+                              </TableCell>
+                              <TableCell className="text-right font-mono text-xs tabular-nums">
+                                {fmtQty(snap.systemQty)}
+                              </TableCell>
+                              <TableCell className="text-right font-mono text-xs tabular-nums">
+                                {snap.physicalQty !== null ? (
+                                  <span className="font-semibold">{fmtQty(snap.physicalQty)}</span>
+                                ) : (
+                                  <span className="text-muted-foreground">—</span>
+                                )}
+                              </TableCell>
+                              <TableCell
+                                className={cn(
+                                  'text-right font-mono text-xs font-semibold tabular-nums',
+                                  snap.physicalQty === null
+                                    ? 'text-muted-foreground'
+                                    : matched
+                                      ? 'text-emerald-600 dark:text-emerald-400'
+                                      : diff > 0
+                                        ? 'text-blue-600 dark:text-blue-400'
+                                        : 'text-red-600 dark:text-red-400'
+                                )}
+                              >
+                                {snap.physicalQty === null
+                                  ? '—'
+                                  : fmtSignedDelta(diff)}
+                              </TableCell>
+                              <TableCell>
+                                {snap.physicalQty === null ? (
+                                  <Badge variant="outline" className="text-xs text-amber-600 border-amber-500/30">
+                                    Belum dihitung
+                                  </Badge>
+                                ) : matched ? (
+                                  <Badge className="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-0 text-xs">
+                                    Sesuai
+                                  </Badge>
+                                ) : (
+                                  <Badge className="bg-amber-500/10 text-amber-600 dark:text-amber-400 border-0 text-xs">
+                                    Selisih
+                                  </Badge>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          )
+                        })
+                      )}
                     </TableBody>
                   </Table>
-                  {completeResult.adjustments.length > 10 && (
-                    <div className="p-2 text-center text-xs text-muted-foreground">
-                      ...dan {completeResult.adjustments.length - 10} lainnya
+                </div>
+              </div>
+
+              {/* Notes */}
+              <Textarea
+                placeholder="Catatan (opsional)..."
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                rows={2}
+                className="text-sm"
+              />
+
+              {/* Mobile bottom action bar — sits ABOVE the global sidebar
+                  mobile nav (which is ~56px tall at z-50) so the SO actions
+                  stay tappable. Counting content has `pb-32 sm:pb-0` below
+                  to keep the last table row clear of this bar. */}
+              <div className="sm:hidden fixed bottom-14 left-0 right-0 z-40 bg-card border-t px-4 py-2.5 flex gap-2 safe-area-pb">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => setShowPauseDialog(true)}
+                >
+                  Tunda
+                </Button>
+                <Button
+                  className="flex-[1.5]"
+                  onClick={handleEnterReview}
+                  disabled={stats.countedItems === 0}
+                >
+                  Review {stats.countedItems}
+                </Button>
+              </div>
+              {/* Spacer so content isn't hidden behind mobile bar */}
+              <div className="sm:hidden h-14" />
+            </motion.div>
+          )}
+
+          {/* ════════════════════════════════════════════════════
+           * REVIEW PAGE
+           * ════════════════════════════════════════════════════ */}
+          {status === 'REVIEW' && session && (
+            <motion.div
+              key="review"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="space-y-3 pb-32 sm:pb-0"
+            >
+              <div className="rounded-lg border bg-card p-3">
+                <div className="text-sm font-semibold">Review Stock Opname</div>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Periksa item yang memiliki selisih sebelum menerapkan penyesuaian.
+                </p>
+              </div>
+
+              {/* Compact summary chips */}
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <Badge variant="outline" className="text-xs gap-1">
+                  <CheckCircle2 className="h-3 w-3 text-emerald-500" />
+                  Dihitung {stats.countedItems}
+                </Badge>
+                <Badge variant="outline" className="text-xs gap-1">
+                  Sesuai {stats.matchedItems}
+                </Badge>
+                {stats.differenceItems > 0 && (
+                  <Badge variant="outline" className="text-xs gap-1 text-amber-600 border-amber-500/30">
+                    <AlertTriangle className="h-3 w-3" />
+                    Ada Selisih {stats.differenceItems}
+                  </Badge>
+                )}
+                <Badge variant="outline" className="text-xs gap-1 text-muted-foreground">
+                  Belum {stats.uncountedItems}
+                </Badge>
+              </div>
+
+              {/* Partial-completion notice */}
+              <div className="p-3 rounded-lg bg-amber-500/5 border border-amber-500/20">
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Hanya item yang sudah dihitung yang akan diproses.{' '}
+                  {stats.uncountedItems > 0 && (
+                    <span className="font-medium">
+                      {stats.uncountedItems} item belum dihitung
+                    </span>
+                  )}{' '}
+                  dan tidak akan berubah.
+                </p>
+              </div>
+
+              {/* Filter toggle */}
+              <div className="flex gap-1.5">
+                <Button
+                  size="sm"
+                  variant={reviewFilter === 'DIFFERENCE' ? 'default' : 'outline'}
+                  onClick={() => setReviewFilter('DIFFERENCE')}
+                >
+                  Ada Selisih ({stats.differenceItems})
+                </Button>
+                <Button
+                  size="sm"
+                  variant={reviewFilter === 'ALL' ? 'default' : 'outline'}
+                  onClick={() => setReviewFilter('ALL')}
+                >
+                  Semua Dihitung ({stats.countedItems})
+                </Button>
+              </div>
+
+              {/* Differences table */}
+              <div className="rounded-lg border overflow-hidden">
+                <div className="max-h-[50vh] overflow-y-auto">
+                  <Table>
+                    <TableHeader className="sticky top-0 bg-card z-10">
+                      <TableRow>
+                        <TableHead>Item</TableHead>
+                        <TableHead className="text-right">Snapshot</TableHead>
+                        <TableHead className="text-right">Fisik</TableHead>
+                        <TableHead className="text-right">Selisih</TableHead>
+                        <TableHead>Dampak</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {reviewRows.length === 0 ? (
+                        <TableRow>
+                          <TableCell colSpan={5} className="text-center py-6 text-muted-foreground text-sm">
+                            {reviewFilter === 'DIFFERENCE'
+                              ? 'Tidak ada selisih. Semua item yang dihitung sesuai.'
+                              : 'Belum ada item yang dihitung.'}
+                          </TableCell>
+                        </TableRow>
+                      ) : (
+                        reviewRows.map((snap) => {
+                          const diff = varianceOf(snap)
+                          const matched = isMatched(snap)
+                          return (
+                            <TableRow key={snap.id}>
+                              <TableCell>
+                                <div className="font-medium text-sm">{snap.itemName}</div>
+                                <div className="text-xs text-muted-foreground">
+                                  {snap.itemSku || '-'}
+                                </div>
+                              </TableCell>
+                              <TableCell className="text-right font-mono text-xs tabular-nums">
+                                {fmtQty(snap.systemQty)}
+                              </TableCell>
+                              <TableCell className="text-right font-mono text-xs font-semibold tabular-nums">
+                                {fmtQty(snap.physicalQty ?? 0)}
+                              </TableCell>
+                              <TableCell
+                                className={cn(
+                                  'text-right font-mono text-xs font-semibold tabular-nums',
+                                  matched
+                                    ? 'text-emerald-600 dark:text-emerald-400'
+                                    : diff > 0
+                                      ? 'text-blue-600 dark:text-blue-400'
+                                      : 'text-red-600 dark:text-red-400'
+                                )}
+                              >
+                                {fmtSignedDelta(diff)}
+                              </TableCell>
+                              <TableCell className="text-xs text-muted-foreground">
+                                {impactText(snap)}
+                              </TableCell>
+                            </TableRow>
+                          )
+                        })
+                      )}
+                    </TableBody>
+                  </Table>
+                </div>
+              </div>
+
+              {/* Desktop actions */}
+              <div className="hidden sm:flex gap-2">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => setStatus('COUNTING')}
+                >
+                  Lanjut Hitung
+                </Button>
+                <Button
+                  className="flex-1"
+                  onClick={handleOpenCompleteDialog}
+                  disabled={loading || stats.countedItems === 0}
+                >
+                  Selesaikan {stats.countedItems} Item
+                </Button>
+              </div>
+
+              {/* Mobile bottom action bar — sits ABOVE the global sidebar
+                  mobile nav (which is ~56px tall at z-50) so the SO actions
+                  stay tappable. Review content has `pb-32 sm:pb-0` below
+                  to keep the last review row clear of this bar. */}
+              <div className="sm:hidden fixed bottom-14 left-0 right-0 z-40 bg-card border-t px-4 py-2.5 flex gap-2 safe-area-pb">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => setStatus('COUNTING')}
+                >
+                  Lanjut Hitung
+                </Button>
+                <Button
+                  className="flex-[1.5]"
+                  onClick={handleOpenCompleteDialog}
+                  disabled={loading || stats.countedItems === 0}
+                >
+                  Selesaikan {stats.countedItems}
+                </Button>
+              </div>
+              <div className="sm:hidden h-14" />
+            </motion.div>
+          )}
+
+          {/* ════════════════════════════════════════════════════
+           * COMPLETED RESULT
+           * ════════════════════════════════════════════════════ */}
+          {status === 'COMPLETED' && completionSummary && (
+            <motion.div
+              key="completed"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="max-w-lg mx-auto"
+            >
+              <Card>
+                <CardContent className="p-5 space-y-4 text-center">
+                  <div className="mx-auto w-14 h-14 rounded-full bg-emerald-500/10 flex items-center justify-center">
+                    <CheckCircle2 className="h-7 w-7 text-emerald-500" />
+                  </div>
+                  <div>
+                    <div className="text-lg font-bold">Stock Opname Selesai</div>
+                    <div className="text-xs text-muted-foreground mt-1">
+                      {fmtDateTime(new Date().toISOString())}
+                    </div>
+                  </div>
+
+                  {/* Summary grid */}
+                  <div className="grid grid-cols-2 gap-2 text-left">
+                    <div className="p-2.5 rounded-lg bg-muted/30 border border-border">
+                      <div className="text-xs text-muted-foreground">Item dihitung</div>
+                      <div className="text-xl font-bold tabular-nums">
+                        {completionSummary.countedItems}
+                      </div>
+                    </div>
+                    <div className="p-2.5 rounded-lg bg-amber-500/5 border border-amber-500/20">
+                      <div className="text-xs text-muted-foreground">Item disesuaikan</div>
+                      <div className="text-xl font-bold text-amber-600 dark:text-amber-400 tabular-nums">
+                        {completionSummary.adjustedItems}
+                      </div>
+                    </div>
+                    <div className="p-2.5 rounded-lg bg-muted/30 border border-border">
+                      <div className="text-xs text-muted-foreground">Item tidak diubah</div>
+                      <div className="text-xl font-bold tabular-nums">
+                        {completionSummary.uncountedItems}
+                      </div>
+                    </div>
+                    <div className="p-2.5 rounded-lg bg-muted/30 border border-border">
+                      <div className="text-xs text-muted-foreground">Item sesuai</div>
+                      <div className="text-xl font-bold tabular-nums">
+                        {completionSummary.matchedItems}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Stock impact */}
+                  <div className="p-3 rounded-lg bg-muted/30 border border-border">
+                    <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-2">
+                      Dampak Stok
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="flex items-center gap-2">
+                        <PlusCircle className="h-4 w-4 text-blue-500" />
+                        <div className="text-left">
+                          <div className="text-xs text-muted-foreground">Bertambah</div>
+                          <div className="text-base font-bold text-blue-600 dark:text-blue-400 tabular-nums">
+                            +{fmtQty(completionSummary.totalPositiveDelta)}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <MinusCircle className="h-4 w-4 text-red-500" />
+                        <div className="text-left">
+                          <div className="text-xs text-muted-foreground">Berkurang</div>
+                          <div className="text-base font-bold text-red-600 dark:text-red-400 tabular-nums">
+                            −{fmtQty(completionSummary.totalNegativeDelta)}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Adjusted-items list — Name + SKU + Snapshot→Fisik + Selisih */}
+                  {completionSummary.adjustments.length > 0 && (
+                    <div className="rounded-lg border border-border overflow-hidden text-left">
+                      <div className="px-3 py-2 bg-muted/40 text-xs font-medium text-muted-foreground">
+                        Item yang Disesuaikan ({completionSummary.adjustments.length})
+                      </div>
+                      <div className="max-h-56 overflow-y-auto divide-y divide-border">
+                        {completionSummary.adjustments.map((adj) => (
+                          <div key={adj.snapshotId} className="px-3 py-2 space-y-0.5">
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0 flex-1">
+                                <div className="text-sm font-medium truncate">{adj.itemName}</div>
+                                <div className="text-xs text-muted-foreground">
+                                  {adj.itemSku || 'Tanpa SKU'}
+                                  {adj.categoryName && ` · ${adj.categoryName}`}
+                                </div>
+                              </div>
+                              <div
+                                className={cn(
+                                  'text-sm font-semibold tabular-nums shrink-0',
+                                  adj.delta > 0
+                                    ? 'text-blue-600 dark:text-blue-400'
+                                    : 'text-red-600 dark:text-red-400'
+                                )}
+                              >
+                                {fmtSignedDelta(adj.delta)} {adj.itemUnit}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1.5 text-xs text-muted-foreground tabular-nums">
+                              <span>Snapshot {fmtQty(adj.systemQty)}</span>
+                              <ArrowRight className="h-3 w-3 text-muted-foreground/50" />
+                              <span>Fisik {fmtQty(adj.physicalQty)}</span>
+                              <span className="text-muted-foreground/50">·</span>
+                              <span>{adj.itemUnit}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   )}
-                </div>
-              )}
-            </div>
+
+                  {completeResult && (
+                    <div className="text-xs text-muted-foreground">
+                      {completeResult.summary.adjustmentsMade} penyesuaian diterapkan ·{' '}
+                      {completeResult.summary.batchUpdates} batch diperbarui
+                    </div>
+                  )}
+
+                  {/* CTAs — explicit labels, no play icons */}
+                  <div className="flex gap-2 pt-1">
+                    <Button
+                      variant="outline"
+                      className="flex-1"
+                      onClick={() => setCurrentPage('audit-log')}
+                    >
+                      <FileText className="h-4 w-4 mr-2" />
+                      Lihat Audit Log
+                    </Button>
+                    <Button className="flex-1" onClick={handleNewSession}>
+                      Mulai Opname Baru
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </motion.div>
           )}
-          
-          <ResponsiveDialogFooter>
-            <Button onClick={() => setShowResultDialog(false)}>
-              Tutup
-            </Button>
-          </ResponsiveDialogFooter>
-        </ResponsiveDialogContent>
-      </ResponsiveDialog>
+        </AnimatePresence>
+      </main>
+
+      {/* ════════════════════════════════════════════════════════
+       * COUNTING WIDGET
+       * ── Responsive: mobile renders a centered Dialog (with Minimize →
+       *    "Stock Opname Berjalan" pill), desktop renders a floating
+       *    bottom-right card. Key forces remount when the focused snapshot
+       *    changes.
+       * ════════════════════════════════════════════════════════ */}
+      <AnimatePresence>
+        {status === 'COUNTING' && focusedSnapshot && (
+          <StockOpnameQuickCountWidget
+            key={focusedSnapshot.id}
+            snapshot={focusedSnapshot}
+            onSave={handleSaveCount}
+            onSkip={handleSkipCount}
+            onClose={() => {
+              setFocusedSnapshot(null)
+              setTimeout(() => scanInputRef.current?.focus(), 50)
+            }}
+            onMinimize={handleMinimizeCount}
+            variant={isMobile ? 'dialog' : 'floating'}
+            onNext={() => {}}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* ════════════════════════════════════════════════════════
+       * DIALOGS
+       * ════════════════════════════════════════════════════════ */}
+      <StockOpnameStartDialog
+        open={showStartDialog}
+        onOpenChange={setShowStartDialog}
+        mode={mode}
+        itemCount={preview?.itemCount ?? 0}
+        categoryCount={selectedCategoryIds.length}
+        includeZeroStock={includeZeroStock}
+        loading={loading}
+        onConfirm={handleStartConfirm}
+      />
+
+      <StockOpnamePauseDialog
+        open={showPauseDialog}
+        onOpenChange={setShowPauseDialog}
+        countedItems={stats.countedItems}
+        totalItems={stats.totalItems}
+        lastSavedAt={lastSavedAt}
+        onConfirm={handlePause}
+      />
+
+      <StockOpnameCancelDialog
+        open={showCancelDialog}
+        onOpenChange={setShowCancelDialog}
+        countedItems={stats.countedItems}
+        totalItems={stats.totalItems}
+        lastSavedAt={lastSavedAt}
+        onConfirm={handleCancel}
+      />
+
+      <StockOpnameCompleteDialog
+        open={showCompleteDialog}
+        onOpenChange={setShowCompleteDialog}
+        summary={completionSummary}
+        loading={loading}
+        onConfirm={handleComplete}
+      />
     </div>
+  )
+}
+
+// ════════════════════════════════════════════════════════════
+// Sub-components (kept inline — simple enough not to extract)
+// ════════════════════════════════════════════════════════════
+
+function AutosaveBadge({
+  isOnline,
+  lastSavedAt,
+}: {
+  isOnline: boolean
+  lastSavedAt: string | null
+}) {
+  if (!isOnline) {
+    return (
+      <Badge variant="outline" className="gap-1 text-xs text-amber-600 border-amber-500/30 px-1.5 py-0">
+        <WifiOff className="h-3 w-3" />
+        Offline
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="outline" className="gap-1 text-xs text-emerald-600 border-emerald-500/30 px-1.5 py-0">
+      <Wifi className="h-3 w-3" />
+      {lastSavedAt ? fmtTime(lastSavedAt) : 'Tersimpan'}
+    </Badge>
+  )
+}
+
+function ResumeCard({
+  session,
+  countedItems,
+  lastSavedAt,
+  onResume,
+  onCancel,
+}: {
+  session: OpnameSession
+  countedItems: number
+  lastSavedAt: string | null
+  onResume: () => void
+  onCancel: () => void
+}) {
+  return (
+    <Card>
+      <CardContent className="p-5 space-y-4">
+        <div className="flex items-start gap-3">
+          <div className="w-10 h-10 rounded-full bg-amber-500/10 flex items-center justify-center shrink-0">
+            <Pause className="h-5 w-5 text-amber-600" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="text-base font-semibold">Stock Opname Belum Selesai</div>
+            <div className="text-sm text-muted-foreground mt-0.5">
+              <span className="font-medium tabular-nums">{countedItems}</span> dari{' '}
+              <span className="tabular-nums">{session.totalItems}</span> item dihitung
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-y-1.5 text-sm">
+          <div className="text-muted-foreground">Terakhir disimpan</div>
+          <div className="font-medium">
+            {lastSavedAt ? new Date(lastSavedAt).toLocaleString('id-ID') : 'Baru saja'}
+          </div>
+          <div className="text-muted-foreground">Mode</div>
+          <div className="font-medium">{session.scopeLabel || 'Semua Item'}</div>
+          <div className="text-muted-foreground">Dimulai</div>
+          <div className="font-medium">{fmtDateTime(session.startedAt)}</div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Button className="flex-1" onClick={onResume}>
+            Lanjutkan
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="icon">
+                <MoreVertical className="h-4 w-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                className="text-destructive focus:text-destructive"
+                onClick={onCancel}
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                Batalkan Sesi
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
