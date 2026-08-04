@@ -58,6 +58,14 @@ import {
   PopoverContent,
 } from '@/components/ui/popover'
 import { Pagination } from '@/components/shared/pagination'
+import { SortableTableHead, nextSortState } from '@/components/shared/sortable-header'
+import { SameDayBadge } from '@/components/shared/same-day-badge'
+import { StatusIconPopover, PopoverContentBody } from '@/components/shared/status-icon-popover'
+import { RowActionsMenu } from '@/components/shared/row-actions-menu'
+import { StockStatusBadge, stockValueColorClass } from '@/components/shared/stock-status-badge'
+import { useRowHighlight } from '@/hooks/use-row-highlight'
+import { BarcodeScannerDialog, type LookupResult } from '@/components/shared/barcode-scanner-dialog'
+import { formatRelativeDateTime, getSameDayBadge } from '@/lib/relative-date'
 import {
   Table,
   TableBody,
@@ -148,6 +156,9 @@ interface Product {
   hasComposition?: boolean
   _variantCount?: number
   _maxPrice?: number
+  _lastChangedAt?: string  // ISO timestamp = max(updatedAt, latestVariantUpdatedAt)
+  createdAt?: string
+  updatedAt?: string
   variants?: Array<{
     id: string
     name: string
@@ -156,6 +167,7 @@ interface Product {
     price: number
     hpp: number
     stock: number
+    updatedAt?: string
   }>
 }
 
@@ -174,6 +186,12 @@ interface ProductListResponse {
 }
 
 type SortOption = 'newest' | 'best-selling' | 'low-stock' | 'most-stock'
+
+// Column-sort state for the new sortable table headers.
+// sortBy = null means "use the legacy `sort` Select dropdown".
+// When sortBy is set, it overrides `sort` and the Select is hidden.
+type ColumnSortBy = 'name' | 'category' | 'sku' | 'hpp' | 'price' | 'stock' | 'lastChangedAt'
+type ColumnSortOrder = 'asc' | 'desc'
 
 interface MovementLog {
   id: string
@@ -482,6 +500,11 @@ export default function ProductsPage() {
   const [totalPages, setTotalPages] = useState(1)
   const [search, setSearch] = useState('')
   const [sort, setSort] = useState<SortOption>('newest')
+  // New column-sort state. Default = lastChangedAt desc (most recent on top).
+  // This overrides the legacy `sort` Select when set.
+  const [columnSortBy, setColumnSortBy] = useState<ColumnSortBy>('lastChangedAt')
+  const [columnSortOrder, setColumnSortOrder] = useState<ColumnSortOrder>('desc')
+  const [scannerOpen, setScannerOpen] = useState(false)
   const [formOpen, setFormOpen] = useState(false)
   const [editProduct, setEditProduct] = useState<Product | null>(null)
   const [deleteId, setDeleteId] = useState<string | null>(null)
@@ -508,6 +531,11 @@ export default function ProductsPage() {
   const [detailPage, setDetailPage] = useState(1)
   const [movementFilter, setMovementFilter] = useState<MovementFilterTab>('all')
 
+  // Variant-focus state — set when a barcode scan resolves to a specific
+  // variant. Highlights (ring) and scrolls the matched variant row into view
+  // inside the detail sheet. Cleared when the detail sheet closes.
+  const [focusedVariantId, setFocusedVariantId] = useState<string | null>(null)
+
   // Bulk edit state
   const [bulkMode, setBulkMode] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
@@ -517,6 +545,9 @@ export default function ProductsPage() {
   const [bulkPriceValue, setBulkPriceValue] = useState('')
   const [bulkPriceQuick, setBulkPriceQuick] = useState('')
   const [bulkPriceSubmitting, setBulkPriceSubmitting] = useState(false)
+  // Temporary row highlight for scan/create/edit/sync results (spec point 3 + 6).
+  // Auto-fades after 2.5s. Pure UI — no backend interaction.
+  const rowHighlight = useRowHighlight<string>({ durationMs: 2500 })
 
   const [bulkStockOpen, setBulkStockOpen] = useState(false)
   const [bulkStockType, setBulkStockType] = useState<'add' | 'subtract' | 'set'>('add')
@@ -660,7 +691,14 @@ export default function ProductsPage() {
     try {
       const params = new URLSearchParams({ page: String(page), limit: '20' })
       if (search) params.set('search', search)
-      if (sort !== 'newest') params.set('sort', sort)
+      // Column-sort API overrides the legacy `sort` Select when active.
+      // (columnSortBy is always set — defaults to 'lastChangedAt'.)
+      if (columnSortBy) {
+        params.set('sortBy', columnSortBy)
+        params.set('sortOrder', columnSortOrder)
+      } else if (sort !== 'newest') {
+        params.set('sort', sort)
+      }
       if (activeCategoryId) params.set('categoryId', activeCategoryId)
       // Cache-busting: unique param forces browser to skip HTTP cache
       if (bustCache) params.set('_t', Date.now().toString())
@@ -680,7 +718,7 @@ export default function ProductsPage() {
     } finally {
       setLoading(false)
     }
-  }, [page, search, sort, activeCategoryId])
+  }, [page, search, sort, activeCategoryId, columnSortBy, columnSortOrder])
 
   useEffect(() => {
      
@@ -692,7 +730,15 @@ export default function ProductsPage() {
       setPage(1)
     }, 300)
     return () => clearTimeout(timer)
-  }, [search, sort, activeCategoryId])
+  }, [search, sort, activeCategoryId, columnSortBy, columnSortOrder])
+
+  // Sort header click handler — toggle asc/desc when same column, else asc.
+  const handleColumnSort = useCallback((columnId: string) => {
+    const next = nextSortState(columnSortBy, columnSortOrder, columnId)
+    setColumnSortBy(next.sortBy as ColumnSortBy)
+    setColumnSortOrder(next.sortOrder)
+    setPage(1)
+  }, [columnSortBy, columnSortOrder])
 
   const fetchDetail = useCallback(async (product: Product, pageNum: number) => {
     setDetailLoading(true)
@@ -740,6 +786,139 @@ export default function ProductsPage() {
       void fetchDetail(detailProduct, detailPage)
     }
   }, [detailOpen, detailProduct, detailPage, fetchDetail])
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Barcode scanner — full-pipeline mode (Task ID: 3-product).
+  //
+  // Flow: scan product/variant barcode → resolve via /api/pos/products/lookup
+  // → on FOUND, fetch full product detail → open detail sheet → if a variant
+  // was matched, focus (ring + scrollIntoView) that variant row. closeOnSuccess
+  // is true so the scanner auto-closes ONLY on a successful open-detail action.
+  // NOT_FOUND / lookup error / action error keeps the scanner open so the
+  // operator can re-scan.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // Wrap the Sheet's onOpenChange so closing the detail clears the variant
+  // focus highlight (prevents a stale highlight if the same variant is
+  // scanned again later).
+  const handleDetailOpenChange = useCallback((open: boolean) => {
+    setDetailOpen(open)
+    if (!open) {
+      setFocusedVariantId(null)
+    }
+  }, [])
+
+  // Resolver: maps a barcode/SKU string to a LookupResult. Reuses the same
+  // /api/pos/products/lookup endpoint as the POS (exact-match priority:
+  // variant barcode → product barcode → variant SKU → product SKU).
+  const resolveBarcode = useCallback(async (code: string): Promise<LookupResult> => {
+    const trimmed = code.trim()
+    if (!trimmed) return { status: 'NOT_FOUND', barcode: code }
+    try {
+      const res = await fetch(`/api/pos/products/lookup?code=${encodeURIComponent(trimmed)}`)
+      if (res.ok) {
+        const data = await res.json()
+        if (data && data.product && data.product.id) {
+          const matchedVariantId: string | null =
+            typeof data.matchedVariantId === 'string' && data.matchedVariantId
+              ? data.matchedVariantId
+              : null
+          return {
+            status: 'FOUND',
+            entityType: matchedVariantId ? 'VARIANT' : 'PRODUCT',
+            productId: data.product.id as string,
+            variantId: matchedVariantId ?? undefined,
+            barcode: trimmed,
+          }
+        }
+      }
+    } catch {
+      // Swallow — fall through to NOT_FOUND so the dialog shows its
+      // standard "Barcode ... terbaca, tetapi belum terdaftar." toast and
+      // stays open for re-scan.
+    }
+    return { status: 'NOT_FOUND', barcode: trimmed }
+  }, [])
+
+  // Context-action: takes a FOUND LookupResult → opens the product detail
+  // sheet (and focuses the matched variant if any). Returns true on success
+  // so the scanner auto-closes (closeOnSuccess is set). Returns false on
+  // NOT_FOUND / fetch error so the scanner stays open.
+  const handleScanContextAction = useCallback(async (lookup: LookupResult): Promise<boolean> => {
+    if (lookup.status !== 'FOUND' || !lookup.productId) {
+      // NOT_FOUND — the dialog already shows the "belum terdaftar" toast.
+      return false
+    }
+    try {
+      // Fetch the FULL product (with variants + category) for the detail
+      // sheet. The lookup endpoint returns a PosProduct (POS-shape); the
+      // detail sheet needs a Product (catalog-shape) including variants.
+      // GET /api/products/[id] returns the product directly.
+      const res = await fetch(`/api/products/${lookup.productId}`)
+      if (!res.ok) {
+        toast.error('Gagal memuat detail produk')
+        return false
+      }
+      const data = await res.json()
+      const product = data as Product
+      if (!product || !product.id) {
+        toast.error('Produk tidak ditemukan')
+        return false
+      }
+
+      // Clear the search box so the product grid isn't filtered when the
+      // detail sheet closes — the operator just scanned a specific item
+      // and we want the grid to remain in its default state afterwards.
+      setSearch('')
+      setPage(1)
+
+      // Set the variant focus BEFORE opening the detail so the highlight
+      // is applied as soon as the variant list renders. The scroll-into-
+      // view effect (below) handles the actual scroll once detailData
+      // arrives from /api/products/[id]/movement.
+      setFocusedVariantId(lookup.variantId ?? null)
+
+      openDetail(product)
+
+      // Temporary row highlight for scan result (spec point 3 + 6).
+      rowHighlight.highlight(product.id)
+
+      toast.success(`${product.name} ditemukan`)
+      return true
+    } catch (err) {
+      console.error('[products-page] scan context action error:', err)
+      toast.error('Gagal membuka detail produk')
+      return false
+    }
+    // openDetail is a stable closure that only calls state setters — it does
+    // not need to be a dep (and omitting it avoids a TDZ issue since it is
+    // defined just above this useCallback).
+  }, [])
+
+  // Minimal onResult fallback — only used if the resolver is somehow not
+  // wired. With the resolver wired, the dialog's full-pipeline path calls
+  // onContextAction and does NOT call onResult. Returning false keeps the
+  // dialog open (safe default for the no-resolver edge case).
+  const handleScanResult = useCallback((_value: string): false => {
+    return false
+  }, [])
+
+  // Scroll-into-view for the focused variant. Fires when focusedVariantId
+  // is set, the detail sheet is open, and detailData has loaded (so the
+  // variant list is rendered). Uses a data-attribute selector.
+  useEffect(() => {
+    if (!focusedVariantId || !detailOpen || !detailData) return
+    // Small delay so the variant list DOM is committed before measuring.
+    const t = setTimeout(() => {
+      const el = document.querySelector(
+        `[data-variant-id="${focusedVariantId}"]`,
+      ) as HTMLElement | null
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+    }, 250)
+    return () => clearTimeout(t)
+  }, [focusedVariantId, detailOpen, detailData])
 
   const handleEdit = (product: Product) => {
     setEditProduct(product)
@@ -793,6 +972,7 @@ export default function ProductsPage() {
           if (detailOpen && detailProduct?.id === restockProduct.id) {
             fetchDetail(restockProduct, detailPage)
           }
+          rowHighlight.highlight(restockProduct.id) // spec point 6: selesai sync
           setRestockOpen(false)
           setRestockQty('')
           setRestockProduct(null)
@@ -821,6 +1001,7 @@ export default function ProductsPage() {
           if (detailOpen && detailProduct?.id === restockProduct.id) {
             fetchDetail({ ...restockProduct, stock: restockProduct.stock + Number(restockQty) }, detailPage)
           }
+          rowHighlight.highlight(restockProduct.id) // spec point 6: selesai sync
           setRestockOpen(false)
           setRestockQty('')
           setRestockProduct(null)
@@ -863,6 +1044,7 @@ export default function ProductsPage() {
           if (detailOpen && detailProduct?.id === adjustProduct.id) {
             fetchDetail(detailProduct, detailPage)
           }
+          rowHighlight.highlight(adjustProduct.id) // spec point 6: selesai sync
         } else {
           const data = await res.json().catch(() => ({}))
           toast.error(data.error || 'Gagal menyesuaikan stok varian')
@@ -897,6 +1079,7 @@ export default function ProductsPage() {
           if (detailOpen && detailProduct?.id === adjustProduct.id) {
             fetchDetail({ ...adjustProduct, stock: newStock }, detailPage)
           }
+          rowHighlight.highlight(adjustProduct.id) // spec point 6: selesai sync
         } else {
           const errData = await res.json().catch(() => ({}))
           toast.error(errData.error || 'Gagal menyesuaikan stok')
@@ -1952,34 +2135,29 @@ export default function ProductsPage() {
             placeholder="Cari nama, SKU, barcode, kategori, varian..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="pl-9 pr-8 h-9 text-xs bg-white/[0.04] border-white/[0.04] text-white placeholder:text-slate-500 rounded-lg focus-visible:ring-white/[0.06]"
+            className="pl-9 pr-20 h-9 text-xs bg-white/[0.04] border-white/[0.04] text-white placeholder:text-slate-500 rounded-lg focus-visible:ring-white/[0.06]"
           />
-          {search && (
-            <button
-              onClick={() => setSearch('')}
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white transition-colors"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          )}
-        </div>
-        <Select value={sort} onValueChange={(val) => setSort(val as SortOption)}>
-          <SelectTrigger className="w-full sm:w-[180px] h-9 text-xs bg-white/[0.04] border-white/[0.04] text-white rounded-lg">
-            <ArrowUpDown className="mr-2 h-3.5 w-3.5 text-slate-500" />
-            <SelectValue placeholder="Urutkan" />
-          </SelectTrigger>
-          <SelectContent className="bg-white/[0.04] border-white/[0.04]">
-            {SORT_OPTIONS.map((option) => (
-              <SelectItem
-                key={option.value}
-                value={option.value}
-                className="text-slate-200 focus:bg-white/[0.04] focus:text-white"
+          <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5">
+            {search && (
+              <button
+                onClick={() => setSearch('')}
+                className="w-6 h-6 flex items-center justify-center text-slate-500 hover:text-white transition-colors"
+                aria-label="Hapus pencarian"
               >
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+            <button
+              onClick={() => setScannerOpen(true)}
+              className="h-6 px-1.5 rounded-md flex items-center gap-1 text-[10px] font-semibold text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10 transition-colors"
+              title="Scan barcode dengan kamera"
+              aria-label="Scan barcode"
+            >
+              <ScanBarcode className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Scan</span>
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Desktop Table */}
@@ -2009,43 +2187,77 @@ export default function ProductsPage() {
                       />
                     </TableHead>
                   )}
-                  <TableHead
-                    className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider cursor-pointer select-none hover:text-slate-300 transition-colors"
-                    onClick={() => setSort(prev => prev === 'newest' ? 'newest' : 'newest')}
+                  <SortableTableHead
+                    activeSortBy={columnSortBy}
+                    activeSortOrder={columnSortOrder}
+                    columnId="name"
+                    onSort={handleColumnSort}
+                    className="min-w-[220px]"
                   >
-                    <span className="inline-flex items-center gap-1">Nama</span>
-                  </TableHead>
-                  <TableHead className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider">Kategori</TableHead>
-                  <TableHead className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider">SKU</TableHead>
-                  <TableHead className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider">Satuan</TableHead>
+                    Nama
+                  </SortableTableHead>
+                  <SortableTableHead
+                    activeSortBy={columnSortBy}
+                    activeSortOrder={columnSortOrder}
+                    columnId="category"
+                    onSort={handleColumnSort}
+                    className="w-[140px]"
+                  >
+                    Kategori
+                  </SortableTableHead>
+                  <SortableTableHead
+                    activeSortBy={columnSortBy}
+                    activeSortOrder={columnSortOrder}
+                    columnId="sku"
+                    onSort={handleColumnSort}
+                    className="w-[120px]"
+                  >
+                    SKU
+                  </SortableTableHead>
+                  <TableHead className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider w-[80px]">Satuan</TableHead>
                   {isOwner && (
-                    <TableHead className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider text-right">HPP</TableHead>
+                    <SortableTableHead
+                      activeSortBy={columnSortBy}
+                      activeSortOrder={columnSortOrder}
+                      columnId="hpp"
+                      onSort={handleColumnSort}
+                      align="right"
+                      className="w-[120px]"
+                    >
+                      HPP
+                    </SortableTableHead>
                   )}
-                  <TableHead
-                    className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider text-right cursor-pointer select-none hover:text-slate-300 transition-colors"
-                    onClick={() => setSort(prev => prev === 'most-stock' ? 'newest' : 'most-stock')}
+                  <SortableTableHead
+                    activeSortBy={columnSortBy}
+                    activeSortOrder={columnSortOrder}
+                    columnId="price"
+                    onSort={handleColumnSort}
+                    align="right"
+                    className="w-[140px]"
                   >
-                    <span className="inline-flex items-center gap-1">Harga</span>
-                  </TableHead>
-                  <TableHead
-                    className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider text-right cursor-pointer select-none hover:text-slate-300 transition-colors"
-                    onClick={() => setSort(prev => prev === 'low-stock' ? 'most-stock' : 'low-stock')}
+                    Harga
+                  </SortableTableHead>
+                  <SortableTableHead
+                    activeSortBy={columnSortBy}
+                    activeSortOrder={columnSortOrder}
+                    columnId="stock"
+                    onSort={handleColumnSort}
+                    align="right"
+                    className="w-[100px]"
                   >
-                    <span className="inline-flex items-center gap-1">
-                      Stok
-                      {sort === 'low-stock' && <span className="theme-text">↑</span>}
-                      {sort === 'most-stock' && <span className="text-amber-400">↓</span>}
-                    </span>
-                  </TableHead>
-                  <TableHead
-                    className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider text-right w-[130px] cursor-pointer select-none hover:text-slate-300 transition-colors"
-                    onClick={() => setSort(prev => prev === 'best-selling' ? 'newest' : 'best-selling')}
+                    Stok
+                  </SortableTableHead>
+                  <SortableTableHead
+                    activeSortBy={columnSortBy}
+                    activeSortOrder={columnSortOrder}
+                    columnId="lastChangedAt"
+                    onSort={handleColumnSort}
+                    align="right"
+                    className="w-[140px]"
                   >
-                    <span className="inline-flex items-center gap-1">
-                      Aksi
-                      {sort === 'best-selling' && <span className="theme-text">🔥</span>}
-                    </span>
-                  </TableHead>
+                    Terakhir Diubah
+                  </SortableTableHead>
+                  <TableHead className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider text-right w-[96px]">Aksi</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -2053,15 +2265,21 @@ export default function ProductsPage() {
                   const isOutOfStock = product.stock === 0
                   const isLowStock = product.stock > 0 && product.stock <= product.lowStockAlert
                   const isSelected = selectedIds.has(product.id)
+                  // Same-day highlight: priority 1 = created today, 2 = changed today.
+                  const sameDayBadge = getSameDayBadge(product.createdAt ?? product._lastChangedAt, product._lastChangedAt)
 
-                  let rowClass = 'border-white/[0.06] hover:bg-white/[0.03] transition-colors'
-                  if (isPro) {
-                    if (isOutOfStock) {
-                      rowClass = 'border-white/[0.06] bg-red-500/[0.03] hover:bg-red-500/[0.06] transition-colors'
-                    } else if (isLowStock) {
-                      rowClass = 'border-white/[0.06] bg-amber-500/[0.03] hover:bg-amber-500/[0.06] transition-colors'
-                    }
-                  }
+                  // CANONICAL ROW STRUCTURE (spec point 1 + 3):
+                  // - Every row uses the SAME base class — no conditional tints.
+                  // - No left vertical accent bars.
+                  // - No full-row warning backgrounds.
+                  // - Stock state is communicated ONLY via:
+                  //     1. The numeric stock value's color (red/amber/slate)
+                  //     2. A compact StockStatusBadge in the Stok cell
+                  // - Temporary emerald tint (from useRowHighlight) for scan/create/edit/sync.
+                  const rowClass = cn(
+                    'border-white/[0.06] hover:bg-white/[0.03] transition-colors duration-300',
+                    rowHighlight.classNameFor(product.id),
+                  )
 
                   return (
                     <TableRow key={product.id} className={rowClass}>
@@ -2085,32 +2303,53 @@ export default function ProductsPage() {
                               <Package className="h-3.5 w-3.5 text-slate-600" />
                             </div>
                           )}
-                          <div className="flex flex-col gap-0.5">
-                            <span className="flex items-center gap-1.5">
-                              {isPro && isOutOfStock && (
-                                <span className="relative flex h-1.5 w-1.5">
-                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
-                                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-red-500" />
-                                </span>
-                              )}
-                              {isPro && isLowStock && !isOutOfStock && (
-                                <span className="relative flex h-1.5 w-1.5">
-                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
-                                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-amber-500" />
-                                </span>
-                              )}
-                              {product.name}
+                          <div className="flex flex-col gap-0.5 min-w-0">
+                            {/* Nama dominan + inline status icons (spec point 2 + 5).
+                                "Update" badge removed — "Terakhir Diubah" column already shows it.
+                                "Baru" (created today) badge kept as text — it's high-signal for new items.
+                                Max 3 visible status icons enforced by conditional rendering below. */}
+                            <span className="flex items-center gap-1 flex-wrap">
+                              <span className="truncate max-w-[200px]">{product.name}</span>
+                              {sameDayBadge === 'new' && <SameDayBadge variant="new" />}
                               {product.hasVariants && product._variantCount != null && product._variantCount > 0 && (
-                                <Badge className="bg-violet-500/10 border-violet-500/20 text-violet-400 text-[10px] px-1.5 py-0 ml-1.5 inline-flex items-center gap-0.5">
-                                  <Layers className="h-2.5 w-2.5" />
-                                  {product._variantCount} varian
-                                </Badge>
+                                <StatusIconPopover
+                                  ariaLabel={`${product._variantCount} varian`}
+                                  icon={<Layers className="h-3 w-3" />}
+                                  tooltip={`${product._variantCount} varian`}
+                                  popoverContent={
+                                    <PopoverContentBody title={`${product._variantCount} Varian`}>
+                                      Produk ini memiliki {product._variantCount} varian dengan harga/stok terpisah.
+                                    </PopoverContentBody>
+                                  }
+                                  trailing={<span className="text-[10px] font-semibold tabular-nums">{product._variantCount}</span>}
+                                  tone="violet"
+                                />
                               )}
                               {product.hasComposition && (
-                                <Badge className="bg-sky-500/10 border-sky-500/20 text-sky-400 text-[10px] px-1.5 py-0 ml-1.5 inline-flex items-center gap-0.5">
-                                  <Beaker className="h-2.5 w-2.5" />
-                                  Komposisi
-                                </Badge>
+                                <>
+                                  <StatusIconPopover
+                                    ariaLabel="Komposisi"
+                                    icon={<Beaker className="h-3 w-3" />}
+                                    tooltip="Komposisi"
+                                    popoverContent={
+                                      <PopoverContentBody title="Komposisi">
+                                        Produk menggunakan inventory sebagai bahan.
+                                      </PopoverContentBody>
+                                    }
+                                    tone="sky"
+                                  />
+                                  <StatusIconPopover
+                                    ariaLabel="Stok otomatis"
+                                    icon={<RefreshCw className="h-3 w-3" />}
+                                    tooltip="Stok Otomatis"
+                                    popoverContent={
+                                      <PopoverContentBody title="Stok Otomatis">
+                                        Stok dihitung otomatis dari inventory. Restock manual dinonaktifkan.
+                                      </PopoverContentBody>
+                                    }
+                                    tone="emerald"
+                                  />
+                                </>
                               )}
                             </span>
                           </div>
@@ -2125,7 +2364,7 @@ export default function ProductsPage() {
                             </span>
                           </div>
                         ) : (
-                          <span className="text-[11px] text-slate-600">-</span>
+                          <span className="text-[11px] text-slate-600 italic">Tanpa kategori</span>
                         )}
                       </TableCell>
                       <TableCell className="text-xs text-slate-500 font-mono py-3 px-3">{product.sku || '-'}</TableCell>
@@ -2135,85 +2374,79 @@ export default function ProductsPage() {
                         </Badge>
                       </TableCell>
                       {isOwner && (
-                        <TableCell className="text-xs text-slate-400 text-right py-3 px-3">{formatCurrency(product.hpp)}</TableCell>
+                        <TableCell className="text-xs text-slate-400 text-right py-3 px-3 tabular-nums">{formatCurrency(product.hpp)}</TableCell>
                       )}
-                      <TableCell className="text-xs text-white font-medium text-right py-3 px-3">
+                      <TableCell className="text-xs text-white font-medium text-right py-3 px-3 tabular-nums">
                         {product.hasVariants && product._maxPrice && product._maxPrice !== product.price
                           ? <>{formatCurrency(product.price)}<span className="text-slate-500"> ~ </span>{formatCurrency(product._maxPrice)}</>
                           : formatCurrency(product.price)
                         }
                       </TableCell>
                       <TableCell className="text-xs text-right py-3 px-3">
-                        {isPro ? (
-                          <div className="flex items-center justify-end gap-1.5">
-                            {isOutOfStock ? (
-                              <Badge className="bg-red-500/10 border-red-500/20 text-red-400 text-[10px] px-2 py-0.5">
-                                <PackageX className="mr-0.5 h-2.5 w-2.5" />
-                                HABIS
-                              </Badge>
-                            ) : isLowStock ? (
-                              <Badge className="bg-amber-500/10 border-amber-500/20 text-amber-400 text-[10px] px-2 py-0.5">
-                                {formatNumber(product.stock)}
-                              </Badge>
-                            ) : (
-                              <span className="text-slate-200">{formatNumber(product.stock)}</span>
-                            )}
-                          </div>
-                        ) : product.stock <= product.lowStockAlert ? (
-                          <Badge className="bg-red-500/10 border-red-500/20 text-red-400 text-[10px] px-2 py-0.5">
+                        {/* Stok cell: numeric value (colored by status) + compact StockStatusBadge.
+                            NO "Tersedia"/"Aman" badge (spec point 2). */}
+                        <div className="flex items-center justify-end gap-1.5">
+                          <span className={cn('tabular-nums font-medium', stockValueColorClass(product.stock, product.lowStockAlert))}>
                             {formatNumber(product.stock)}
-                          </Badge>
-                        ) : (
-                          <span className="text-slate-200">{formatNumber(product.stock)}</span>
-                        )}
+                          </span>
+                          <StockStatusBadge stock={product.stock} lowThreshold={product.lowStockAlert} />
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-[11px] text-slate-400 text-right py-3 px-3 tabular-nums whitespace-nowrap">
+                        {formatRelativeDateTime(product._lastChangedAt)}
                       </TableCell>
                       <TableCell className="text-right py-3 px-3">
-                        <div className="flex items-center justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 text-slate-500 hover:text-sky-400 hover:bg-sky-500/10 rounded-lg"
-                            onClick={() => openDetail(product)}
-                          >
-                            <Eye className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 rounded-lg text-slate-500 hover:theme-text hover:theme-bg-very-light"
-                            onClick={() => {
-                              setRestockProduct(product)
-                              setRestockQty('')
-                              setVariantRestocks([])
-                              setRestockOpen(true)
+                        <div className="flex items-center justify-end opacity-60 group-hover:opacity-100 transition-opacity">
+                          <RowActionsMenu
+                            size="sm"
+                            primaryAction={{
+                              label: 'Lihat Detail',
+                              icon: <Eye className="h-3.5 w-3.5" />,
+                              onClick: () => openDetail(product),
                             }}
-                          >
-                            <RefreshCw className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 text-slate-500 hover:text-orange-400 hover:bg-orange-500/10 rounded-lg"
-                            onClick={() => openAdjustDialog(product)}
-                          >
-                            <FilePenLine className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 text-slate-500 hover:text-white hover:bg-white/[0.04] rounded-lg"
-                            onClick={() => handleEdit(product)}
-                          >
-                            <Edit className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg"
-                            onClick={() => setDeleteId(product.id)}
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </Button>
+                            items={[
+                              {
+                                label: 'Edit',
+                                icon: <Edit className="h-3.5 w-3.5" />,
+                                onClick: () => handleEdit(product),
+                              },
+                              {
+                                label: 'Restock',
+                                icon: <RefreshCw className="h-3.5 w-3.5" />,
+                                onClick: () => {
+                                  setRestockProduct(product)
+                                  setRestockQty('')
+                                  setVariantRestocks([])
+                                  setRestockOpen(true)
+                                },
+                                disabled: product.hasComposition,
+                                title: product.hasComposition
+                                  ? 'Stok dihitung otomatis dari inventory'
+                                  : undefined,
+                              },
+                              {
+                                label: 'Sync / Adjust Stok',
+                                icon: <FilePenLine className="h-3.5 w-3.5" />,
+                                onClick: () => openAdjustDialog(product),
+                                disabled: product.hasComposition,
+                                title: product.hasComposition
+                                  ? 'Stok dihitung otomatis dari inventory'
+                                  : undefined,
+                              },
+                              {
+                                label: 'Lihat / Cetak Barcode',
+                                icon: <ScanBarcode className="h-3.5 w-3.5" />,
+                                onClick: () => setBatchBarcodeOpen(true),
+                              },
+                            ]}
+                            dangerItems={[
+                              {
+                                label: 'Hapus',
+                                icon: <Trash2 className="h-3.5 w-3.5" />,
+                                onClick: () => setDeleteId(product.id),
+                              },
+                            ]}
+                          />
                         </div>
                       </TableCell>
                     </TableRow>
@@ -2307,39 +2540,34 @@ export default function ProductsPage() {
               const isOutOfStock = product.stock === 0
               const isLowStock = product.stock > 0 && product.stock <= product.lowStockAlert
               const isSelected = selectedIds.has(product.id)
+              // Same-day highlight (spec point 4) — was missing on mobile.
+              const sameDayBadge = getSameDayBadge(product.createdAt ?? product._lastChangedAt, product._lastChangedAt)
 
-              // Stock status color config
-              const stockStatusColor = isOutOfStock ? 'red' : isLowStock ? 'amber' : null
-              
-              // Base card styling
-              let cardBorder = 'border-white/[0.06]'
-              let cardBg = 'bg-nebula'
-              
-              if (isPro) {
-                if (isOutOfStock) {
-                  cardBorder = 'border-red-500/25'
-                  cardBg = 'bg-red-500/[0.03]'
-                } else if (isLowStock) {
-                  cardBorder = 'border-amber-500/25'
-                  cardBg = 'bg-amber-500/[0.03]'
-                }
-              }
-              
-              // Selected state override
-              if (isSelected) {
-                cardBorder = 'border-emerald-500/40 ring-1 ring-emerald-500/15'
-                cardBg = 'bg-emerald-500/[0.02]'
-              }
+              // CANONICAL CARD STRUCTURE (spec point 1 + 3):
+              // - Same border + bg for all cards — no stock-state tints.
+              // - No left accent bars.
+              // - Selected state keeps its emerald ring (selection is a user action, not a status).
+              // - Temporary emerald tint for scan/create/edit/sync.
+              const cardBorder = isSelected
+                ? 'border-emerald-500/40 ring-1 ring-emerald-500/15'
+                : 'border-white/[0.06]'
+              const cardBg = isSelected
+                ? 'bg-emerald-500/[0.02]'
+                : rowHighlight.highlightedId === product.id
+                  ? 'bg-emerald-500/[0.06]'
+                  : 'bg-nebula'
 
               return (
                 <div
                   key={product.id}
-                  className={`relative rounded-xl ${cardBg} border ${cardBorder} p-4 transition-all duration-200 active:bg-white/${isSelected ? '[0.05]' : '[0.04]'} ${isSelected ? 'shadow-sm shadow-emerald-500/5' : ''}`}
-                >
-                  {/* Left accent bar for selection or stock status */}
-                  {(stockStatusColor || isSelected) && (
-                    <div className={`absolute left-0 top-0 bottom-0 w-1 rounded-l-xl bg-gradient-to-b ${isSelected ? 'from-emerald-500 to-emerald-500/40' : stockStatusColor === 'red' ? 'from-red-500 to-red-500/40' : 'from-amber-500 to-amber-500/40'}`} />
+                  className={cn(
+                    'relative rounded-xl border p-4 transition-colors duration-300',
+                    cardBg,
+                    cardBorder,
+                    isSelected ? 'shadow-sm shadow-emerald-500/5' : '',
+                    'active:bg-white/[0.04]',
                   )}
+                >
                   {/* Main: Image + Info row */}
                   <div className="flex items-start gap-3 mb-3">
                     {/* Left side: Checkbox or Thumbnail */}
@@ -2382,42 +2610,56 @@ export default function ProductsPage() {
                           <span className="text-[15px] font-semibold text-white truncate leading-snug block">
                             {product.name}
                           </span>
-                          {/* Variant & Composition Badges */}
-                          <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                          {/* Inline status icons (spec point 2 + 5).
+                              "Update" badge removed — "Terakhir Diubah" column already shows it.
+                              "Baru" (created today) badge kept as text — high-signal for new items.
+                              NO stock badge here (stock badge renders in the right-side compact slot). */}
+                          <div className="flex items-center gap-1 mt-1 flex-wrap">
+                            {sameDayBadge === 'new' && <SameDayBadge variant="new" />}
                             {product.hasVariants && product._variantCount != null && product._variantCount > 0 && (
-                              <Badge className="bg-violet-500/10 border-violet-500/20 text-violet-400 text-[10px] px-2 py-0.5 rounded-full inline-flex items-center gap-1">
-                                <Layers className="h-2.5 w-2.5" />
-                                {product._variantCount} varian
-                              </Badge>
+                              <StatusIconPopover
+                                ariaLabel={`${product._variantCount} varian`}
+                                icon={<Layers className="h-3.5 w-3.5" />}
+                                tooltip={`${product._variantCount} varian`}
+                                popoverContent={
+                                  <PopoverContentBody title={`${product._variantCount} Varian`}>
+                                    Produk ini memiliki {product._variantCount} varian dengan harga/stok terpisah.
+                                  </PopoverContentBody>
+                                }
+                                trailing={<span className="text-[11px] font-semibold tabular-nums">{product._variantCount}</span>}
+                                tone="violet"
+                              />
                             )}
                             {product.hasComposition && (
-                              <Badge className="bg-sky-500/10 border-sky-500/20 text-sky-400 text-[10px] px-2 py-0.5 rounded-full inline-flex items-center gap-1">
-                                <Beaker className="h-2.5 w-2.5" />
-                                Komposisi
-                              </Badge>
+                              <>
+                                <StatusIconPopover
+                                  ariaLabel="Komposisi"
+                                  icon={<Beaker className="h-3.5 w-3.5" />}
+                                  tooltip="Komposisi"
+                                  popoverContent={
+                                    <PopoverContentBody title="Komposisi">
+                                      Produk menggunakan inventory sebagai bahan.
+                                    </PopoverContentBody>
+                                  }
+                                  tone="sky"
+                                />
+                                <StatusIconPopover
+                                  ariaLabel="Stok otomatis"
+                                  icon={<RefreshCw className="h-3.5 w-3.5" />}
+                                  tooltip="Stok Otomatis"
+                                  popoverContent={
+                                    <PopoverContentBody title="Stok Otomatis">
+                                      Stok dihitung otomatis dari inventory. Restock manual dinonaktifkan.
+                                    </PopoverContentBody>
+                                  }
+                                  tone="emerald"
+                                />
+                              </>
                             )}
                           </div>
                         </div>
-                        {/* Stock Status Badge - Prominent */}
-                        {isPro && (
-                          <div className="flex-shrink-0 ml-2">
-                            {isOutOfStock ? (
-                              <Badge className="bg-red-500/15 border border-red-500/30 text-red-400 text-[11px] px-2.5 py-1 rounded-lg font-semibold gap-1">
-                                <PackageX className="h-3.5 w-3.5" />
-                                HABIS
-                              </Badge>
-                            ) : isLowStock ? (
-                              <Badge className="bg-amber-500/15 border border-amber-500/30 text-amber-400 text-[11px] px-2.5 py-1 rounded-lg font-semibold gap-1">
-                                <AlertTriangle className="h-3.5 w-3.5" />
-                                Stok Rendah
-                              </Badge>
-                            ) : (
-                              <Badge className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[11px] px-2.5 py-1 rounded-lg font-medium">
-                                Tersedia
-                              </Badge>
-                            )}
-                          </div>
-                        )}
+                        {/* Compact StockStatusBadge (spec point 2) — NO "Tersedia"/"Aman" */}
+                        <StockStatusBadge stock={product.stock} lowThreshold={product.lowStockAlert} className="ml-2 !text-[10px] !px-2 !py-0.5" />
                       </div>
                       {/* Category + SKU + Unit Row */}
                       <div className="flex items-center gap-2 mt-1">
@@ -2428,7 +2670,9 @@ export default function ProductsPage() {
                               {product.category.name}
                             </span>
                           </div>
-                        ) : null}
+                        ) : (
+                          <span className="text-[11px] text-slate-600 italic">Tanpa kategori</span>
+                        )}
                         {product.sku && (
                           <span className="text-[11px] text-slate-500 font-mono bg-white/[0.02] rounded-lg px-2 py-1">{product.sku}</span>
                         )}
@@ -2456,19 +2700,11 @@ export default function ProductsPage() {
                           }
                         </span>
                       </div>
-                      {/* Stock Display - More Prominent */}
+                      {/* Stock Display — colored number per status (spec point 3). No background tint. */}
                       <div className="flex items-center gap-2">
                         <div className={cn(
-                          "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-semibold text-sm tabular-nums",
-                          isPro
-                            ? isOutOfStock
-                              ? "bg-red-500/10 text-red-400"
-                              : isLowStock
-                                ? "bg-amber-500/10 text-amber-400"
-                                : "bg-white/[0.04] text-slate-300"
-                            : product.stock <= product.lowStockAlert
-                              ? "bg-red-500/10 text-red-400"
-                              : "bg-white/[0.04] text-slate-300"
+                          "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-semibold text-sm tabular-nums bg-white/[0.04]",
+                          stockValueColorClass(product.stock, product.lowStockAlert),
                         )}>
                           <Package className="h-3.5 w-3.5" />
                           {formatNumber(product.stock)}
@@ -2477,58 +2713,57 @@ export default function ProductsPage() {
                       </div>
                     </div>
                     
-                    {/* Action Buttons - Larger touch targets */}
-                    <div className="flex items-center gap-1 bg-white/[0.03] rounded-xl p-1">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-9 w-9 text-slate-500 hover:text-sky-400 hover:bg-sky-500/10 rounded-lg transition-colors"
-                        onClick={() => openDetail(product)}
-                        title="Detail"
-                      >
-                        <Eye className="h-4 w-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-9 w-9 text-slate-500 hover:theme-text hover:theme-bg-very-light rounded-lg transition-colors"
-                        onClick={() => {
-                          setRestockProduct(product)
-                          setRestockQty('')
-                          setVariantRestocks([])
+                    {/* Action Menu - Slim pattern: primary View + kebab dropdown */}
+                    <RowActionsMenu
+                      size="md"
+                      primaryAction={{
+                        label: 'Lihat Detail',
+                        icon: <Eye className="h-4 w-4" />,
+                        onClick: () => openDetail(product),
+                      }}
+                      items={[
+                        {
+                          label: 'Edit',
+                          icon: <Edit className="h-3.5 w-3.5" />,
+                          onClick: () => handleEdit(product),
+                        },
+                        {
+                          label: 'Restock',
+                          icon: <RefreshCw className="h-3.5 w-3.5" />,
+                          onClick: () => {
+                            setRestockProduct(product)
+                            setRestockQty('')
+                            setVariantRestocks([])
                             setRestockOpen(true)
-                          }}
-                      >
-                        <RefreshCw className="h-3.5 w-3.5" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-9 w-9 text-slate-500 hover:text-orange-400 hover:bg-orange-500/10 rounded-lg transition-colors"
-                        onClick={() => openAdjustDialog(product)}
-                        title="Penyesuaian Stok"
-                      >
-                        <FilePenLine className="h-4 w-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-9 w-9 text-slate-500 hover:text-white hover:bg-white/[0.06] rounded-lg transition-colors"
-                        onClick={() => handleEdit(product)}
-                        title="Edit"
-                      >
-                        <Edit className="h-4 w-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-9 w-9 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
-                        onClick={() => setDeleteId(product.id)}
-                        title="Hapus"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
+                          },
+                          disabled: product.hasComposition,
+                          title: product.hasComposition
+                            ? 'Stok dihitung otomatis dari inventory'
+                            : undefined,
+                        },
+                        {
+                          label: 'Sync / Adjust Stok',
+                          icon: <FilePenLine className="h-3.5 w-3.5" />,
+                          onClick: () => openAdjustDialog(product),
+                          disabled: product.hasComposition,
+                          title: product.hasComposition
+                            ? 'Stok dihitung otomatis dari inventory'
+                            : undefined,
+                        },
+                        {
+                          label: 'Lihat / Cetak Barcode',
+                          icon: <ScanBarcode className="h-3.5 w-3.5" />,
+                          onClick: () => setBatchBarcodeOpen(true),
+                        },
+                      ]}
+                      dangerItems={[
+                        {
+                          label: 'Hapus',
+                          icon: <Trash2 className="h-3.5 w-3.5" />,
+                          onClick: () => setDeleteId(product.id),
+                        },
+                      ]}
+                    />
                   </div>
                 </div>
               )
@@ -2621,6 +2856,11 @@ export default function ProductsPage() {
           if (detailOpen && detailProduct) {
             fetchDetail(detailProduct, detailPage)
           }
+          // spec point 6: selesai create / selesai edit
+          // (For edit, we know the id. For create, the new product appears at
+          // the top of the list with a "Baru" badge that already serves as a
+          // visual cue, so we don't need to highlight a specific row.)
+          if (editProduct?.id) rowHighlight.highlight(editProduct.id)
         }}
       />
 
@@ -3791,7 +4031,7 @@ export default function ProductsPage() {
       </ResponsiveDialog>
 
       {/* Product Detail Sheet */}
-      <Sheet open={detailOpen} onOpenChange={setDetailOpen}>
+      <Sheet open={detailOpen} onOpenChange={handleDetailOpenChange}>
         <SheetContent
           side="right"
           className="w-full sm:max-w-lg bg-nebula border-white/[0.06] p-0 overflow-hidden"
@@ -3842,40 +4082,54 @@ export default function ProductsPage() {
                                 : 'text-slate-200'
                             }>
                               {formatNumber(detailData.product.stock)}
+                              {detailData.product.hasComposition && (
+                                <span className="ml-1.5 inline-flex items-center gap-0.5 text-[9px] text-emerald-400 align-middle">
+                                  <RefreshCw className="h-2 w-2" /> auto
+                                </span>
+                              )}
                             </p>
                           </div>
-                          <div className="col-span-2 flex gap-1.5 mt-0.5">
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-6 text-[10px] px-2 theme-bg-very-light theme-text border theme-border-light hover:theme-bg-subtle"
-                              onClick={() => {
-                                setRestockProduct(detailData.product as unknown as Product)
-                                setRestockQty('')
-                                setVariantRestocks([])
-                                setRestockOpen(true)
-                              }}
-                            >
-                              <RefreshCw className="h-2.5 w-2.5 mr-0.5" /> Restock
-                            </Button>
-                            {(
+                          {detailData.product.hasComposition ? (
+                            <div className="col-span-2 mt-0.5 flex items-center gap-1.5 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-2 py-1.5">
+                              <RefreshCw className="h-3 w-3 text-emerald-400 flex-shrink-0" />
+                              <span className="text-[10px] text-emerald-300 leading-tight">
+                                Stok dihitung otomatis dari inventory. Restock & Penyesuaian dinonaktifkan — ubah stok inventory item terkait.
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="col-span-2 flex gap-1.5 mt-0.5">
                               <Button
                                 size="sm"
                                 variant="ghost"
-                                className="h-6 text-[10px] px-2 bg-orange-500/10 text-orange-400 border border-orange-500/20 hover:bg-orange-500/20"
+                                className="h-6 text-[10px] px-2 theme-bg-very-light theme-text border theme-border-light hover:theme-bg-subtle"
                                 onClick={() => {
-                                  // Use detailData.product as the base since it has fresh variants data
-                                  const productForAdjust = detailProduct ? {
-                                    ...detailProduct,
-                                    variants: detailData?.product.variants || detailProduct.variants
-                                  } : detailData.product as unknown as Product
-                                  openAdjustDialog(productForAdjust, detailData?.product.variants)
+                                  setRestockProduct(detailData.product as unknown as Product)
+                                  setRestockQty('')
+                                  setVariantRestocks([])
+                                  setRestockOpen(true)
                                 }}
                               >
-                                <FilePenLine className="h-2.5 w-2.5 mr-0.5" /> Penyesuaian
+                                <RefreshCw className="h-2.5 w-2.5 mr-0.5" /> Restock
                               </Button>
-                            )}
-                          </div>
+                              {(
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-6 text-[10px] px-2 bg-orange-500/10 text-orange-400 border border-orange-500/20 hover:bg-orange-500/20"
+                                  onClick={() => {
+                                    // Use detailData.product as the base since it has fresh variants data
+                                    const productForAdjust = detailProduct ? {
+                                      ...detailProduct,
+                                      variants: detailData?.product.variants || detailProduct.variants
+                                    } : detailData.product as unknown as Product
+                                    openAdjustDialog(productForAdjust, detailData?.product.variants)
+                                  }}
+                                >
+                                  <FilePenLine className="h-2.5 w-2.5 mr-0.5" /> Penyesuaian
+                                </Button>
+                              )}
+                            </div>
+                          )}
                           {isOwner && (
                             <div>
                               <span className="text-slate-500 text-[11px]">HPP</span>
@@ -3917,6 +4171,12 @@ export default function ProductsPage() {
                             <ScanBarcode className="h-3.5 w-3.5 theme-text" />
                             Barcode
                           </h3>
+                          {/* AETHER BARCODE CONTRACT: Show source indicator */}
+                          <p className="text-[10px] text-slate-400">
+                            {detailData.product.barcode.startsWith('AET-')
+                              ? 'Dibuat otomatis oleh Aether'
+                              : 'Barcode diisi manual'}
+                          </p>
                           <div className="flex justify-center bg-white rounded-lg p-3">
                             <BarcodeDisplay
                               value={detailData.product.barcode}
@@ -3978,8 +4238,18 @@ export default function ProductsPage() {
                             {detailData.product.variants.map((v: any) => {
                               const isOutOfStock = v.stock <= 0
                               const isLowStock = v.stock > 0 && v.stock <= (detailData.product.lowStockAlert || 10)
+                              const isFocused = focusedVariantId === v.id
                               return (
-                                <div key={v.id} className="bg-white/[0.03] rounded-lg px-2.5 py-2">
+                                <div
+                                  key={v.id}
+                                  data-variant-id={v.id}
+                                  className={cn(
+                                    'rounded-lg px-2.5 py-2 transition-all',
+                                    isFocused
+                                      ? 'bg-violet-500/10 ring-2 ring-violet-500/70 shadow-[0_0_0_1px_rgba(139,92,246,0.4)]'
+                                      : 'bg-white/[0.03] ring-1 ring-transparent',
+                                  )}
+                                >
                                   <div className="grid grid-cols-4 gap-1 items-center">
                                     <div className="min-w-0 col-span-1">
                                       <p className="text-xs font-medium text-slate-200 truncate">{v.name}</p>
@@ -4178,6 +4448,23 @@ export default function ProductsPage() {
         open={batchBarcodeOpen}
         onOpenChange={setBatchBarcodeOpen}
         categories={categories}
+      />
+
+      {/* Barcode Scanner Dialog — shared camera scan UI.
+          Full-pipeline mode (Task ID: 3-product): resolver + onContextAction
+          + closeOnSuccess. Scan a product/variant barcode → resolve via
+          /api/pos/products/lookup → on FOUND, open the product detail sheet
+          and focus the matched variant. NOT_FOUND / errors keep the scanner
+          open for re-scan. */}
+      <BarcodeScannerDialog
+        open={scannerOpen}
+        onOpenChange={setScannerOpen}
+        resolver={resolveBarcode}
+        onContextAction={handleScanContextAction}
+        onResult={handleScanResult}
+        closeOnSuccess
+        title="Scan Barcode Produk"
+        inputPlaceholder="Ketik barcode / SKU produk..."
       />
     </div>
   )

@@ -125,6 +125,7 @@ import {
   StockOpnameSessionSummary,
 } from '@/components/stock-opname/mode-selector'
 import { StockOpnameQuickCountWidget } from '@/components/stock-opname/quick-count-widget'
+import { BarcodeScannerDialog } from '@/components/shared/barcode-scanner-dialog'
 import {
   StockOpnameStartDialog,
   StockOpnamePauseDialog,
@@ -166,6 +167,8 @@ export default function StockOpnamePage() {
   const [scanInput, setScanInput] = useState('')
   const scanInputRef = useRef<HTMLInputElement>(null)
   const [focusedSnapshot, setFocusedSnapshot] = useState<SnapshotItem | null>(null)
+  // Camera barcode scanner dialog state (counting search bar camera button)
+  const [scanDialogOpen, setScanDialogOpen] = useState(false)
   const [filterMode, setFilterMode] = useState<CountingFilter>('ALL')
   const [filterCategory, setFilterCategory] = useState<string>('all')
   const [sortMode, setSortMode] = useState<SortMode>('NAME')
@@ -319,6 +322,33 @@ export default function StockOpnamePage() {
       scanInputRef.current?.focus()
     }
   }, [scanInput])
+
+  // Camera scanner result — verifies the scanned code matches a snapshot in
+  // the ACTIVE opname session only (Dexie lookup via findByScan, which never
+  // creates new snapshots). On FOUND: focuses the matched snapshot (opens/
+  // refreshes the QuickCountWidget via key={focusedSnapshot.id}) and returns
+  // true so the scanner auto-closes (closeOnSuccess). On NOT_FOUND: shows an
+  // actionable error and returns false so the scanner stays open for re-scan.
+  // Items outside the active session are NEVER added automatically — findByScan
+  // only searches existing snapshots and never creates new ones (verified in
+  // src/lib/stock-opname/service.ts).
+  const handleScanResult = useCallback(async (code: string): Promise<boolean> => {
+    const trimmed = code.trim()
+    if (!trimmed) return false
+    const found = await findByScan(trimmed)
+    if (found) {
+      setFocusedSnapshot(found)
+      toast.success(`"${found.itemName}" difokuskan`)
+      // QuickCountWidget remounts via key={focusedSnapshot.id} and auto-focuses
+      // its physical-qty input on mount (existing useEffect in
+      // quick-count-widget.tsx) so the operator can type the count immediately.
+      return true
+    }
+    toast.error('Item tidak ditemukan', {
+      description: `"${trimmed}" tidak cocok dengan SKU / nama / batch item di sesi opname aktif. Item di luar sesi tidak ditambahkan otomatis.`,
+    })
+    return false
+  }, [])
 
   // ════════════════════════════════════════════════════════════
   // Actions: save physical count (from QuickCountWidget)
@@ -882,7 +912,9 @@ export default function StockOpnamePage() {
                   variant="ghost"
                   size="sm"
                   className="absolute right-1 top-1/2 -translate-y-1/2 h-8 px-2"
-                  onClick={handleScan}
+                  onClick={() => setScanDialogOpen(true)}
+                  title="Scan barcode dengan kamera"
+                  aria-label="Scan barcode dengan kamera"
                 >
                   <Camera className="h-4 w-4" />
                 </Button>
@@ -1445,6 +1477,22 @@ export default function StockOpnamePage() {
         summary={completionSummary}
         loading={loading}
         onConfirm={handleComplete}
+      />
+
+      {/* Camera barcode scanner (counting search bar camera button).
+          SIMPLE mode (onResult only) — handleScanResult resolves against the
+          active session's Dexie snapshots via findByScan (no resolver wired).
+          closeOnSuccess=true → dialog auto-closes ONLY when handleScanResult
+          returns true (FOUND in active session). NEVER closes on NOT_FOUND or
+          errors so the operator can re-scan. The matched snapshot opens the
+          QuickCountWidget which auto-focuses its physical-qty input on remount. */}
+      <BarcodeScannerDialog
+        open={scanDialogOpen}
+        onOpenChange={setScanDialogOpen}
+        onResult={handleScanResult}
+        closeOnSuccess
+        title="Scan Item Opname"
+        inputPlaceholder="Ketik barcode / SKU / nama item..."
       />
     </div>
   )

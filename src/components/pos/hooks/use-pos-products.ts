@@ -107,6 +107,8 @@ interface UsePosProductsReturn {
   setVariantPicker: (state: VariantPickerState) => void
   handleSearchChange: (value: string) => void
   handleSearchKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => Promise<void>
+  /** Camera/barcode scanner result handler — looks up the code and adds to cart. */
+  handleScanResult: (code: string) => Promise<void>
   handleCategorySelect: (categoryId: string | null) => void
   openVariantPicker: (product: Product) => Promise<void>
   handleVariantSelect: (variant: ProductVariant) => void
@@ -294,23 +296,30 @@ export function usePosProducts(options: UsePosProductsOptions): UsePosProductsRe
       } catch { /* fall through to offline */ }
     }
     // Offline: search cached posProducts + posVariants
+    // Priority per AETHER CAMERA BARCODE SCANNER contract:
+    //   1. Variant.barcode  2. Product.barcode  3. Variant.sku  4. Product.sku
     const db = tryGetPosDB()
     if (db) {
       const cached = await db.posProducts.toArray()
-      // Product-level match
-      const prodMatch = cached.find(p => p.barcode === code || p.sku === code)
-      if (prodMatch) {
-        return { product: fromCachedPosProduct(prodMatch), matchedVariantId: null }
-      }
-      // Variant-level match
       const variants = await db.posVariants.toArray()
-      const vMatch = variants.find(v => v.barcode === code || v.sku === code)
+      // #1: Variant barcode
+      let vMatch = variants.find(v => v.barcode === code)
       if (vMatch) {
         const parent = cached.find(p => p.id === vMatch.productId)
-        if (parent) {
-          return { product: fromCachedPosProduct(parent), matchedVariantId: vMatch.id }
-        }
+        if (parent) return { product: fromCachedPosProduct(parent), matchedVariantId: vMatch.id }
       }
+      // #2: Product barcode
+      let prodMatch = cached.find(p => p.barcode === code)
+      if (prodMatch) return { product: fromCachedPosProduct(prodMatch), matchedVariantId: null }
+      // #3: Variant sku
+      vMatch = variants.find(v => v.sku === code)
+      if (vMatch) {
+        const parent = cached.find(p => p.id === vMatch.productId)
+        if (parent) return { product: fromCachedPosProduct(parent), matchedVariantId: vMatch.id }
+      }
+      // #4: Product sku
+      prodMatch = cached.find(p => p.sku === code)
+      if (prodMatch) return { product: fromCachedPosProduct(prodMatch), matchedVariantId: null }
     }
     return { product: null, matchedVariantId: null }
   }, [isOnline])
@@ -482,13 +491,106 @@ export function usePosProducts(options: UsePosProductsOptions): UsePosProductsRe
     }
   }, [productSearch, productPage, selectedCategoryId, fetchFeatured, fetchSearch])
 
+  // ── Phase 7 resolver: exact barcode/SKU lookup → structured LookupResult ──
+  // Used by BarcodeScannerDialog for telemetry + Phase 8 context-action pipeline.
+  // Returns { status, entityType, productId, variantId?, barcode }.
+  const resolveBarcode = useCallback(async (code: string): Promise<{
+    status: 'FOUND' | 'NOT_FOUND'
+    entityType?: 'PRODUCT' | 'VARIANT'
+    productId?: string
+    variantId?: string
+    barcode: string
+  }> => {
+    const trimmed = code.trim()
+    if (!trimmed) return { status: 'NOT_FOUND', barcode: code }
+    const { product, matchedVariantId } = await lookupProduct(trimmed)
+    if (!product) return { status: 'NOT_FOUND', barcode: trimmed }
+    return {
+      status: 'FOUND',
+      entityType: matchedVariantId ? 'VARIANT' : 'PRODUCT',
+      productId: product.id,
+      variantId: matchedVariantId ?? undefined,
+      barcode: trimmed,
+    }
+  }, [lookupProduct])
+
+  // ── Phase 8 context-action: take a LookupResult → add to cart + toast ──
+  // Used by BarcodeScannerDialog's onContextAction prop. Returns `true` when
+  // the item was added to cart (or the variant picker was opened as a clean
+  // handoff), so the dialog can auto-close on success when `closeOnSuccess`
+  // is set. Returns `false` (without throwing) on out-of-stock / not-found so
+  // the dialog stays open for re-scan.
+  const applyLookupToCart = useCallback(async (lookup: {
+    status: 'FOUND' | 'NOT_FOUND'
+    entityType?: 'PRODUCT' | 'VARIANT'
+    productId?: string
+    variantId?: string
+    barcode: string
+  }): Promise<boolean> => {
+    if (lookup.status !== 'FOUND' || !lookup.productId) return false
+    // Re-fetch the full product (resolver only returned id + entityType).
+    const { product, matchedVariantId } = await lookupProduct(lookup.barcode)
+    if (!product) {
+      // LOOKUP ERROR — keep scanner open.
+      toast.error('Produk tidak ditemukan')
+      return false
+    }
+    const effectiveVariantId = lookup.variantId ?? matchedVariantId
+    if (effectiveVariantId) {
+      const variants = await fetchVariants(product.id)
+      const variant = variants.find(v => v.id === effectiveVariantId)
+      if (variant && variant.stock > 0) {
+        onAddToCart(product, 1, variant)
+        toast.success(`${product.name} - ${variant.name} ditambahkan`)
+        setProductSearch('')
+        return true
+      }
+      // CART ACTION ERROR (out of stock) — keep scanner open.
+      toast.error('Stok varian habis')
+      return false
+    } else if (product.hasVariants) {
+      // No specific variant matched — hand off to the variant picker.
+      // Treated as success for the scanner (clean focus handoff); the
+      // operator completes the add-to-cart in the picker.
+      onOpenVariantPicker(product)
+      setProductSearch('')
+      return true
+    } else if (product.stock > 0) {
+      onAddToCart(product)
+      toast.success(`${product.name} ditambahkan`)
+      setProductSearch('')
+      return true
+    } else {
+      // CART ACTION ERROR (out of stock) — keep scanner open.
+      toast.error('Stok produk habis')
+      return false
+    }
+  }, [lookupProduct, fetchVariants, onAddToCart, onOpenVariantPicker])
+
+  // ── Camera scanner result: exact barcode/SKU lookup → add to cart ──
+  // Legacy path — does the full pipeline inline. Kept for backward compat
+  // (e.g. if a parent wires only onResult without resolver + onContextAction).
+  // POS now uses resolveBarcode + applyLookupToCart via the dialog's full
+  // pipeline mode, but handleScanResult remains the simple-path fallback.
+  const handleScanResult = useCallback(async (code: string) => {
+    const trimmed = code.trim()
+    if (!trimmed) return
+    const lookup = await resolveBarcode(trimmed)
+    await applyLookupToCart(lookup)
+  }, [resolveBarcode, applyLookupToCart])
+
   return {
     products, outOfStockProducts, categories, productSearch, productsLoading, productPage, totalProductPages,
     selectedCategoryId, variantPicker,
     lastInputTimeRef, inputCharCountRef, barcodeDetectedRef,
     setProductSearch, setProductPage, setSelectedCategoryId, setVariantPicker,
-    handleSearchChange, handleSearchKeyDown, handleCategorySelect,
+    handleSearchChange, handleSearchKeyDown, handleScanResult, handleCategorySelect,
     openVariantPicker, handleVariantSelect, fetchFeatured, refreshProducts,
+    // Exposed for BarcodeScannerDialog full-pipeline mode (Phases 7 + 8):
+    //   resolveBarcode → resolver (Phase 7 lookup contract)
+    //   applyLookupToCart → onContextAction (Phase 8 POS adapter)
+    //   lookupProduct → test-mode resolver (Phase 6)
+    resolveBarcode, applyLookupToCart, lookupProduct,
   }
 }
 

@@ -7,6 +7,8 @@ import {
   emitAuditEvent,
   buildPurchaseChangeEvent,
 } from '@/lib/audit-v2'
+import { recalculateAffectedProductStock } from '@/lib/comp-stock'
+import { evaluatePurchaseMutationSafety } from '@/lib/purchase-mutation-safety'
 
 // Helper: recalculate HPP for all products affected by the given inventory item IDs
 async function recalculateHppForAffectedProducts(
@@ -209,6 +211,22 @@ export async function PUT(
       return safeJsonError('Purchase order not found', 404)
     }
 
+    // ── Canonical mutation-safety guard ──
+    // Runs BEFORE opening the $transaction so we don't hold the tx open
+    // during the ~8 safety queries. The existing in-tx stock + FEFO throws
+    // (STEP 1 + STEP 5.5 below) remain as defense-in-depth against races
+    // between this read and the actual mutation.
+    const safety = await evaluatePurchaseMutationSafety(id)
+    if (!safety) {
+      return safeJsonError('Purchase order not found', 404)
+    }
+    if (!safety.canEdit) {
+      return safeJsonError(
+        `Tidak dapat diedit: ${safety.reasons.join('; ')}`,
+        409,
+      )
+    }
+
     // Validate all inventory items
     const itemIds = items.map((i) => i.inventoryItemId)
     const inventoryItems = await db.inventoryItem.findMany({
@@ -254,7 +272,7 @@ export async function PUT(
 
           await tx.inventoryItem.update({
             where: { id: oldItem.inventoryItemId },
-            data: { stock: newStock, avgCost: newAvgCost },
+            data: { stock: newStock, avgCost: newAvgCost, lastBusinessChangeAt: new Date() },
           })
         } else {
           // Item is removed entirely: reverse old stock
@@ -273,7 +291,7 @@ export async function PUT(
 
           await tx.inventoryItem.update({
             where: { id: oldItem.inventoryItemId },
-            data: { stock: newStock, avgCost: newAvgCost },
+            data: { stock: newStock, avgCost: newAvgCost, lastBusinessChangeAt: new Date() },
           })
         }
 
@@ -330,6 +348,7 @@ export async function PUT(
           data: {
             stock: newStock,
             avgCost: newAvgCost,
+            lastBusinessChangeAt: new Date(),
           },
         })
 
@@ -397,9 +416,13 @@ export async function PUT(
         supplierName: orderSupplier?.supplier?.name || null,
       })
 
-      // ── STEP 6: Recalculate HPP ──
+      // ── STEP 6: Recalculate HPP + Product stock auto-sync ──
       const uniqueAffectedIds = [...new Set(affectedInventoryItemIds)]
       await recalculateHppForAffectedProducts(tx, uniqueAffectedIds)
+      // InventoryItem is source of truth — recompute sellable capacity of every
+      // linked Product/Variant inside the same transaction. PUT already reversed
+      // old quantities and re-applied new ones, so InventoryItem.stock is fresh.
+      await recalculateAffectedProductStock(tx, outletId, uniqueAffectedIds)
 
       // V2: emit ONE PURCHASE_CHANGE (updated) audit event inside the tx so
       // it commits atomically with the inventory reversal + re-apply. This
@@ -531,6 +554,21 @@ export async function DELETE(
       return safeJsonError('Purchase order not found', 404)
     }
 
+    // ── Canonical mutation-safety guard ──
+    // Runs BEFORE opening the $transaction (cheaper, no tx held open during
+    // the ~8 safety queries). The existing in-tx stock + FEFO throws below
+    // remain as defense-in-depth against races.
+    const safety = await evaluatePurchaseMutationSafety(id)
+    if (!safety) {
+      return safeJsonError('Purchase order not found', 404)
+    }
+    if (!safety.canDelete) {
+      return safeJsonError(
+        `Tidak dapat dihapus: ${safety.reasons.join('; ')}`,
+        409,
+      )
+    }
+
     // Fetch items separately to handle orphaned inventory items gracefully
     // This avoids Prisma error when inventoryItem is null (deleted)
     const items = await db.purchaseOrderItem.findMany({
@@ -596,6 +634,7 @@ export async function DELETE(
           data: {
             stock: newStock,
             avgCost: newAvgCost,
+            lastBusinessChangeAt: new Date(),
           },
         })
 
@@ -607,8 +646,11 @@ export async function DELETE(
         where: { id },
       })
 
-      // Recalculate HPP for affected products
+      // Recalculate HPP + Product stock auto-sync for affected products.
+      // DELETE already reversed the inventory increments (decrements now),
+      // so InventoryItem.stock reflects the post-delete reality.
       await recalculateHppForAffectedProducts(tx, affectedInventoryItemIds)
+      await recalculateAffectedProductStock(tx, outletId, affectedInventoryItemIds)
 
       // V2: emit ONE PURCHASE_CHANGE (deleted) audit event inside the tx so
       // it commits atomically with the inventory reversal + PO hard-delete.

@@ -45,6 +45,13 @@ import {
   ResponsiveDialogDescription,
 } from '@/components/ui/responsive-dialog'
 import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog'
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -55,6 +62,14 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Pagination } from '@/components/shared/pagination'
+import { SortableTableHead, nextSortState } from '@/components/shared/sortable-header'
+import { SameDayBadge } from '@/components/shared/same-day-badge'
+import { StatusIconPopover, PopoverContentBody } from '@/components/shared/status-icon-popover'
+import { BarcodeScannerDialog } from '@/components/shared/barcode-scanner-dialog'
+import { RowActionsMenu } from '@/components/shared/row-actions-menu'
+import { StockStatusBadge, stockValueColorClass } from '@/components/shared/stock-status-badge'
+import { useRowHighlight } from '@/hooks/use-row-highlight'
+import { formatRelativeDateTime, getSameDayBadge } from '@/lib/relative-date'
 import { Switch } from '@/components/ui/switch'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -133,6 +148,7 @@ import {
   User,
   ClipboardList,
   Calendar,
+  Camera,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useBulkWorker } from '@/components/bulk-engine/bulk-worker-context'
@@ -165,6 +181,26 @@ interface PurchaseOrderItem {
   pricePerItem: string  // harga per unit pembelian (e.g., 72000 per ekor)
   batch: string
   expiredDate: string
+}
+
+// Canonical mutation safety result (mirrors backend PurchaseMutationSafety).
+// Fetched per-PO from /api/purchases/[id]/safety and cached in poSafetyCache.
+interface PurchaseMutationSafety {
+  canEdit: boolean
+  canDelete: boolean
+  canReverse: boolean
+  reasons: string[]
+  blockers: {
+    compositionLinks: number
+    transactionConsumption: number
+    batchConsumption: number
+    batchPartiallyConsumed: number
+    subsequentMovements: number
+    transferLinks: number
+    wasteOrExpiry: number
+    stockOpname: number
+    insufficientStock: number
+  }
 }
 
 interface PurchaseOrder {
@@ -233,6 +269,10 @@ interface InventoryItem {
   lowStockAlert: number
   status?: string // ACTIVE, ARCHIVED
   updatedAt?: string
+  createdAt?: string
+  // Business-meaningful change timestamp (immune to POS-sale FEFO re-sync).
+  // Falls back to updatedAt for legacy rows.
+  lastBusinessChangeAt?: string
   _count?: {
     compositions: number
     purchaseItems: number
@@ -241,6 +281,9 @@ interface InventoryItem {
     consumptionSnapshots: number
   }
 }
+
+// Sortable columns for the Inventory table.
+type InvColumnSortBy = 'name' | 'category' | 'stock' | 'unitCost' | 'value' | 'usage' | 'lastChangedAt'
 
 // Delete Safety Status for inventory items
 interface DeleteSafetyStatus {
@@ -671,6 +714,23 @@ export default function PurchasePage() {
   // Track real business history for consistent edit/disable logic with table
   const [poDetailHasRealBusinessHistory, setPoDetailHasRealBusinessHistory] = useState(false)
 
+  // Canonical purchase mutation safety cache (per-PO, fetched from backend).
+  // Overrides the list-hint flags (hasRealBusinessHistory etc.) with the
+  // authoritative evaluator result from /api/purchases/[id]/safety.
+  const [poSafetyCache, setPoSafetyCache] = useState<Record<string, PurchaseMutationSafety>>({})
+  const fetchPurchaseSafety = useCallback(async (purchaseId: string) => {
+    if (poSafetyCache[purchaseId]) return poSafetyCache[purchaseId]
+    try {
+      const res = await fetch(`/api/purchases/${purchaseId}/safety`)
+      if (res.ok) {
+        const data = await res.json() as PurchaseMutationSafety
+        setPoSafetyCache(prev => ({ ...prev, [purchaseId]: data }))
+        return data
+      }
+    } catch { /* ignore — fall back to list flags */ }
+    return null
+  }, [poSafetyCache])
+
   // Purchase create dialog
   const [poCreateOpen, setPoCreateOpen] = useState(false)
   const [poCreateLoading, setPoCreateLoading] = useState(false)
@@ -694,6 +754,10 @@ export default function PurchasePage() {
   // Track which "Batch & Kedaluwarsa" accordions are expanded (per-item index)
   const [poCreateAdvancedOpen, setPoCreateAdvancedOpen] = useState<Set<number>>(new Set())
   const [poEditAdvancedOpen, setPoEditAdvancedOpen] = useState<Set<number>>(new Set())
+  // Collapsible detail for the Create-PO sticky summary (Dampak + HPP lists).
+  // Default collapsed — keeps the summary compact so the item editor gets the
+  // most modal space. User clicks "Lihat Detail" to expand.
+  const [poSummaryDetailOpen, setPoSummaryDetailOpen] = useState(false)
 
   // Quick add new item from purchase dialog
   const [showQuickAddItem, setShowQuickAddItem] = useState(false)
@@ -754,6 +818,9 @@ export default function PurchasePage() {
   const [bulkCatLoading, setBulkCatLoading] = useState(false)
 
   const smartInputRef = useRef<HTMLInputElement>(null)
+  // Camera scanner for the PO create form — ADDITIVE on top of the existing
+  // hardware-scanner smart input. closeOnSuccess=false (continuous scanning).
+  const [poScanOpen, setPoScanOpen] = useState(false)
 
 
 
@@ -781,7 +848,15 @@ export default function PurchasePage() {
   const [invCategoryFilter, setInvCategoryFilter] = useState<string>('all')
   const [invPage, setInvPage] = useState(1)
   const [invTotalPages, setInvTotalPages] = useState(1)
-  const [invSortBy, setInvSortBy] = useState('name-asc')
+  // New column-sort state — replaces the legacy `invSortBy` chip bar.
+  // Default: lastChangedAt DESC (most recent business change on top).
+  const [invColumnSortBy, setInvColumnSortBy] = useState<InvColumnSortBy>('lastChangedAt')
+  const [invColumnSortOrder, setInvColumnSortOrder] = useState<'asc' | 'desc'>('desc')
+  const [invScannerOpen, setInvScannerOpen] = useState(false)
+  // Picker for the case when a scanned product/variant barcode maps to MULTIPLE
+  // inventory items via ProductComposition. The user picks one to open detail.
+  const [invScanPickerOpen, setInvScanPickerOpen] = useState(false)
+  const [invScanPickerItems, setInvScanPickerItems] = useState<InventoryItem[]>([])
   const invPerPage = 20
   const [invStats, setInvStats] = useState<InventoryStats>({ totalItems: 0, totalValue: 0, lowStockCount: 0 })
 
@@ -804,6 +879,11 @@ export default function PurchasePage() {
   const [invDetailError, setInvDetailError] = useState<string | null>(null)
   const [invDetailTab, setInvDetailTab] = useState('products')
   const [invDetailMovementPage, setInvDetailMovementPage] = useState(1)
+
+  // Temporary row highlight for inventory scan/sync results (spec point 3 + 6).
+  // Auto-fades after 2.5s. Pure UI — no backend interaction.
+  // (Previously also used by Restock/Adjust dialogs — those were removed per UX request.)
+  const invRowHighlight = useRowHighlight<string>({ durationMs: 2500 })
 
   // Batch timeline for inventory detail
   const [batchTimeline, setBatchTimeline] = useState<BatchTimelineEntry[]>([])
@@ -937,6 +1017,39 @@ export default function PurchasePage() {
     if (tab === 'purchase') void fetchPurchaseOrders()
   }, [tab, fetchPurchaseOrders])
 
+  // Bulk-fetch canonical safety for loaded POs (parallel, fire-and-forget).
+  // The list-hint flags (hasRealBusinessHistory etc.) give instant disabled
+  // state; the canonical evaluator overrides them once loaded. Only fetches
+  // POs not already in the cache.
+  useEffect(() => {
+    if (poList.length === 0) return
+    void Promise.all(
+      poList
+        .filter(po => !poSafetyCache[po.id])
+        .map(po => fetchPurchaseSafety(po.id)),
+    )
+  }, [poList, poSafetyCache, fetchPurchaseSafety])
+
+  // Resolve the effective safety for a PO. Falls back to list-hint flags
+  // (instant) when the canonical fetch hasn't landed yet.
+  const resolvePoSafety = useCallback((po: PurchaseOrder): {
+    canEdit: boolean
+    canDelete: boolean
+    reasons: string[]
+    loaded: boolean
+  } => {
+    const cached = poSafetyCache[po.id]
+    if (cached) {
+      return { canEdit: cached.canEdit, canDelete: cached.canDelete, reasons: cached.reasons, loaded: true }
+    }
+    // Fallback: approximate from list flags. hasRealBusinessHistory blocks
+    // both edit + delete; hasUsageHistory blocks delete only. hasProductLinks
+    // is a soft warning (amber) but does NOT block (matches old behavior).
+    const canEdit = !po.hasRealBusinessHistory
+    const canDelete = !po.hasRealBusinessHistory && !po.hasUsageHistory
+    return { canEdit, canDelete, reasons: [], loaded: false }
+  }, [poSafetyCache])
+
   // Debounce search
   useEffect(() => {
     const t = setTimeout(() => setPoDebouncedSearch(poSearch), 300)
@@ -953,31 +1066,24 @@ export default function PurchasePage() {
         search: invDebouncedSearch,
         categoryId: invCategoryFilter === 'all' ? '' : invCategoryFilter,
         activeOnly: String(!showInactiveItems),
+        // Server-side global sort (whitelisted inside the API).
+        sortBy: invColumnSortBy,
+        sortOrder: invColumnSortOrder,
       })
       const res = await fetch(`/api/inventory/items?${params}`)
       if (res.ok) {
         const data = await res.json()
         const allItems: InventoryItem[] = data.items || []
-        // Client-side sort
-        const [sortField, sortDir] = invSortBy.split('-')
-        const sorted = [...allItems].sort((a, b) => {
-          let cmp = 0
-          if (sortField === 'name') cmp = a.name.localeCompare(b.name)
-          else if (sortField === 'stock') cmp = a.stock - b.stock
-          else if (sortField === 'value') cmp = (a.stock * a.avgCost) - (b.stock * b.avgCost)
-          else if (sortField === 'updatedAt') cmp = new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime()
-          return sortDir === 'desc' ? -cmp : cmp
-        })
-        // Client-side pagination
-        const totalItems = sorted.length
+        // Server returns globally sorted list. We only paginate client-side.
+        const totalItems = allItems.length
         const totalPages = Math.max(1, Math.ceil(totalItems / invPerPage))
         const start = (invPage - 1) * invPerPage
-        const pageItems = sorted.slice(start, start + invPerPage)
+        const pageItems = allItems.slice(start, start + invPerPage)
         setInvList(pageItems)
         setInvTotalPages(totalPages)
         // Store all IDs for select-all functionality
-        setAllInvIds(sorted.map(i => i.id))
-        // Client-side stats
+        setAllInvIds(allItems.map(i => i.id))
+        // Client-side stats (computed on the entire filtered+sorted set)
         const totalValue = allItems.reduce((sum, i) => sum + i.stock * i.avgCost, 0)
         const lowStockCount = allItems.filter(i => i.stock <= i.lowStockAlert).length
         setInvStats({ totalItems, totalValue, lowStockCount })
@@ -987,11 +1093,23 @@ export default function PurchasePage() {
     } finally {
       setInvLoading(false)
     }
-  }, [invPage, invDebouncedSearch, invCategoryFilter, showInactiveItems, invSortBy])
+  }, [invPage, invDebouncedSearch, invCategoryFilter, showInactiveItems, invColumnSortBy, invColumnSortOrder])
 
   useEffect(() => {
     if (tab === 'inventory') void fetchInventoryItems()
   }, [tab, fetchInventoryItems])
+
+  // Sort header click handler — toggle asc/desc when same column, else asc.
+  const handleInvColumnSort = useCallback((columnId: string) => {
+    const next = nextSortState(invColumnSortBy, invColumnSortOrder, columnId)
+    setInvColumnSortBy(next.sortBy as InvColumnSortBy)
+    setInvColumnSortOrder(next.sortOrder)
+    setInvPage(1)
+    setSelectedInvIds(new Set())
+  }, [invColumnSortBy, invColumnSortOrder])
+
+  // (handleInvScanResult is defined below — after openInvDetail — to avoid TDZ
+  // on the openInvDetail dep. See "Inventory Scanner Adapter" section.)
 
   // Debounce search
   useEffect(() => {
@@ -1127,6 +1245,8 @@ export default function PurchasePage() {
     setPoDetailHasUsageHistory(!!po.hasUsageHistory)
     // Sync with table logic - use same hasRealBusinessHistory flag
     setPoDetailHasRealBusinessHistory(!!po.hasRealBusinessHistory)
+    // Fetch canonical safety (overrides list-hint flags above once loaded).
+    void fetchPurchaseSafety(po.id)
     try {
       const res = await fetch(`/api/purchases/${po.id}`)
       if (res.ok) {
@@ -1267,6 +1387,8 @@ export default function PurchasePage() {
       if (res.ok) {
         toast.success('Pembelian berhasil diperbarui')
         setPoEditOpen(false)
+        // Invalidate safety cache for edited PO (stock/batches changed).
+        setPoSafetyCache(prev => { const next = { ...prev }; delete next[poEditId]; return next })
         void fetchPurchaseOrders()
         void fetchInventoryItems()
         void fetchPurchaseSummary()
@@ -1425,6 +1547,7 @@ export default function PurchasePage() {
     setShowImportPreview(false)
     setImportPreviewData(null)
     setPoCreateAdvancedOpen(new Set())
+    setPoSummaryDetailOpen(false)
   }
 
   // Fetch suppliers for purchase dialog dropdown
@@ -1526,6 +1649,30 @@ export default function PurchasePage() {
   }
 
   // Apply import preview items to purchase form
+  // Apply import preview items to the canonical purchase form.
+  // FIX (split-state bug): the old mapping left `unit`/`baseUnit` empty when
+  // the Excel file omitted them, which caused `validatePoItem` to flag every
+  // row as invalid → Save button stayed disabled even though the preview
+  // summary showed valid data. The form (poCreateItems) and the preview
+  // (importPreviewData) had different shapes + different validation rules.
+  //
+  // This mapping now:
+  //   1. Fills `baseUnit` with a non-empty default (matched item's unit, or 'pcs').
+  //   2. Fills `unit` (purchase unit) with `baseUnit` when missing → 1:1, no
+  //      conversion needed, so `needsConversion` returns false and conversion
+  //      errors never fire.
+  //   3. Sets `conversionUnit` = `baseUnit` (always unit-compatible with itself).
+  //   4. Sets `baseQty` = '1' when no conversion needed (1 purchase unit = 1 base unit).
+  //   5. Sets `inputMethod='manual'` so the Create-PO dialog shows the FORM,
+  //      not the upload zone (the old code left inputMethod in its prior state).
+  //   6. Carries over `importSupplierId` → `poCreateSupplierId`.
+  //   7. Pre-counts rows needing attention (price=0) and toasts a warning.
+  //
+  // After this, `poCreateValidation` (useMemo) recomputes on the next render
+  // and `poCreateCanSubmit` becomes true if all rows have qty>0, unit, baseUnit,
+  // and price>0. The Save button enables. The user can still edit qty/price/
+  // batch/expiry before submit. Submit uses the normal `handlePoCreateSubmit`
+  // path (same as manual entry) — no split state.
   const handleApplyImport = () => {
     if (!importPreviewData) return
     const newItems: PurchaseOrderItem[] = []
@@ -1533,15 +1680,26 @@ export default function PurchasePage() {
     importPreviewData.forEach((item, idx) => {
       if (item.error) return
       const itemId = item.matchedItemId || `__pending_${item.name}_${item.sku || ''}_${idx}_${Date.now()}`
+      // Resolve base unit: prefer explicit, then matched inventory item's unit, then 'pcs'.
+      const resolvedBaseUnit = item.baseUnit || item.matchedItemUnit || 'pcs'
+      // Resolve purchase unit: prefer explicit, then fall back to base unit (1:1).
+      const resolvedUnit = item.purchaseUnit || resolvedBaseUnit
+      // Conversion needed only when purchase unit !== base unit.
+      const needsConv = resolvedUnit !== resolvedBaseUnit
+      // baseQty: if conversion needed, use the import's baseQty (already in base units).
+      // If no conversion, default to '1' (1 purchase unit = 1 base unit).
+      const resolvedBaseQty = needsConv ? String(item.baseQty || 1) : '1'
+      // conversionUnit: the unit that baseQty is expressed in (= base unit).
+      const resolvedConversionUnit = resolvedBaseUnit
       newItems.push({
         inventoryItemId: itemId,
         inventoryItemName: item.name,
-        inventoryItemSku: item.matchedItemSku || item.sku,
-        baseUnit: item.baseUnit || item.matchedItemUnit || '',
+        inventoryItemSku: item.matchedItemSku || item.sku || null,
+        baseUnit: resolvedBaseUnit,
         qty: String(item.qty || 1),
-        unit: item.purchaseUnit || '',
-        baseQty: String(item.baseQty || 1),
-        conversionUnit: item.baseUnit || item.matchedItemUnit || '',
+        unit: resolvedUnit,
+        baseQty: resolvedBaseQty,
+        conversionUnit: resolvedConversionUnit,
         pricePerItem: String(item.pricePerUnit || 0),
         batch: item.batch || '',
         expiredDate: item.expiredDate || '',
@@ -1552,7 +1710,7 @@ export default function PurchasePage() {
           id: itemId,
           name: item.name,
           sku: item.sku || null,
-          baseUnit: item.baseUnit || item.matchedItemUnit || 'pcs',
+          baseUnit: resolvedBaseUnit,
           stock: 0,
           active: true,
           _isNew: true,
@@ -1564,11 +1722,24 @@ export default function PurchasePage() {
         setPoItemOptions(prev => [...newOptions, ...prev])
       }
       setPoCreateItems(newItems)
+      // CRITICAL: switch to manual mode so the form (not upload zone) renders.
+      setInputMethod('manual')
+      // Carry over supplier from import preview → form.
+      if (importSupplierId) setPoCreateSupplierId(importSupplierId)
       setShowImportPreview(false)
       setImportPreviewData(null)
       setPoCreateOpen(true)
       void fetchSuppliers()
-      toast.success(`${newItems.length} item berhasil ditambahkan ke pembelian`)
+      // Pre-validate: count rows that still need user attention (price = 0).
+      // These rows will block Save until the user fills in a price.
+      const needsAttention = newItems.filter(i => parseFloat(i.pricePerItem) <= 0).length
+      if (needsAttention > 0) {
+        toast.warning(`${newItems.length} item diterapkan ke form. ${needsAttention} item perlu diisi harga sebelum simpan.`)
+      } else {
+        toast.success(`${newItems.length} item berhasil ditambahkan ke pembelian — siap disimpan`)
+      }
+    } else {
+      toast.error('Tidak ada item valid untuk diterapkan')
     }
   }
 
@@ -1820,6 +1991,106 @@ export default function PurchasePage() {
       toast.success('Item baru ditambahkan (pending)')
     }
   }
+
+  // ══════════════════════════════════════════════════════════
+  // PO CAMERA SCANNER ADAPTER (Adapter B — closeOnSuccess = FALSE)
+  // ══════════════════════════════════════════════════════════
+  // ADDITIVE on top of the existing hardware-scanner smart input — does NOT
+  // replace it. Scans an INVENTORY barcode (matches an InventoryItem by
+  // sku/name) → adds to poCreateItems (+1 qty if already present) → focuses
+  // the qty input of the affected row. Dialog stays OPEN for continuous scan.
+  //
+  // Lookup priority: poItemOptions (preloaded when the PO dialog opens) first,
+  // then fall back to a fresh GET /api/inventory/items?search=... query.
+
+  const findInventoryItemByBarcode = useCallback(async (code: string): Promise<InventoryItemOption | null> => {
+    const query = code.trim().toLowerCase()
+    if (!query) return null
+
+    // 1. Try preloaded poItemOptions (faster, no network).
+    const fromCache = poItemOptions.find(i => !i._isNew && i.sku && i.sku.toLowerCase() === query)
+      || poItemOptions.find(i => i.name.toLowerCase() === query)
+    if (fromCache) return fromCache
+
+    // 2. Fallback: query the API directly.
+    try {
+      const res = await fetch(`/api/inventory/items?search=${encodeURIComponent(code)}&activeOnly=false`)
+      if (!res.ok) return null
+      const data = await res.json()
+      const items: Array<{
+        id: string; name: string; sku: string | null; baseUnit: string
+        stock: number; active?: boolean
+      }> = data.items || []
+      const match = items.find(i => (i.sku?.toLowerCase() === query) || (i.name?.toLowerCase() === query))
+      if (!match) return null
+      return {
+        id: match.id,
+        name: match.name,
+        sku: match.sku || null,
+        baseUnit: match.baseUnit,
+        stock: match.stock ?? 0,
+        active: match.active !== false,
+      }
+    } catch {
+      return null
+    }
+  }, [poItemOptions])
+
+  const handlePoScanResult = useCallback(async (value: string): Promise<boolean> => {
+    const code = value.trim()
+    if (!code) return false
+
+    const match = await findInventoryItemByBarcode(code)
+    if (!match) {
+      toast.error(`Barcode "${code}" tidak ditemukan`)
+      return false
+    }
+
+    // Check if already in items list → increment qty. Else append a new row
+    // (same shape the smart-input path uses at line ~1907).
+    const existingIdx = poCreateItems.findIndex(i => i.inventoryItemId === match.id)
+    let targetIdx: number
+    if (existingIdx >= 0) {
+      const currentQty = parseFloat(poCreateItems[existingIdx].qty) || 0
+      handleUpdatePoItem(existingIdx, 'qty', String(currentQty + 1))
+      targetIdx = existingIdx
+    } else {
+      const emptyIdx = poCreateItems.findIndex(i => !i.inventoryItemId)
+      if (emptyIdx >= 0) {
+        handleSelectInvItem(emptyIdx, match)
+        targetIdx = emptyIdx
+      } else {
+        setPoCreateItems(prev => [...prev, {
+          inventoryItemId: match.id,
+          inventoryItemName: match.name,
+          inventoryItemSku: match.sku,
+          baseUnit: match.baseUnit,
+          qty: '1',
+          unit: match.baseUnit,
+          baseQty: '1',
+          conversionUnit: match.baseUnit,
+          pricePerItem: '0',
+          batch: '',
+          expiredDate: '',
+        }])
+        targetIdx = poCreateItems.length
+      }
+    }
+
+    toast.success(`+1 ${match.name} (scan)`)
+
+    // Focus the qty input of the affected row AFTER state flushes. The row
+    // container has id={`po-item-${idx}`} (line ~5432); the qty input is the
+    // first <input type="number"> inside it.
+    setTimeout(() => {
+      const row = document.getElementById(`po-item-${targetIdx}`)
+      const qtyInput = row?.querySelector('input[type="number"]') as HTMLInputElement | null
+      qtyInput?.focus()
+    }, 80)
+
+    return true
+    // closeOnSuccess is FALSE on this scanner → dialog stays open for next scan.
+  }, [poCreateItems, findInventoryItemByBarcode, handleSelectInvItem, handleUpdatePoItem])
 
   // ── Smart Input: Scan detection (timing-based like POS) ──
   // Barcode scanner = hardware yang kirim karakter satu-satu sangat cepat (< 80ms per char)
@@ -2174,17 +2445,19 @@ export default function PurchasePage() {
     try {
       const res = await fetch(`/api/purchases/${deletePoId}`, { method: 'DELETE' })
       if (res.ok) {
-        toast.success('Pembelian berhasil dihapus')
+        toast.success('Pembelian berhasil dibatalkan')
         setDeletePoId(null)
         setPoDetailOpen(false)
+        // Invalidate safety cache for deleted PO + related items (stock changed).
+        setPoSafetyCache(prev => { const next = { ...prev }; delete next[deletePoId]; return next })
         void fetchPurchaseOrders()
         void fetchInventoryItems()
       } else {
         const data = await res.json().catch(() => ({}))
-        toast.error(data.error || 'Gagal menghapus pembelian')
+        toast.error(data.error || 'Gagal membatalkan pembelian')
       }
     } catch {
-      toast.error('Gagal menghapus pembelian')
+      toast.error('Gagal membatalkan pembelian')
     } finally {
       setDeletingPo(false)
     }
@@ -2765,6 +3038,207 @@ export default function PurchasePage() {
       }
     } catch { /* ignore pagination fetch errors */ }
   }
+
+  // Handler for the dropdown "View Movement / Batch" action — opens the
+  // inventory detail dialog and immediately selects the Movements tab.
+  // (The Batch tab is one click away inside the dialog.)
+  const openInvDetailAtMovements = useCallback(async (item: InventoryItem) => {
+    setInvDetailOpen(true)
+    setInvDetailData(null)
+    setInvDetailError(null)
+    setInvDetailLoading(true)
+    setInvDetailTab('movements')
+    setInvDetailMovementPage(1)
+    try {
+      const res = await fetch(`/api/inventory/items/${item.id}?page=1`)
+      if (res.ok) {
+        const data = await res.json()
+        setInvDetailData(data)
+      } else {
+        const data = await res.json().catch(() => ({}))
+        setInvDetailError(data.error || 'Gagal memuat detail item')
+      }
+    } catch {
+      setInvDetailError('Gagal memuat detail item')
+    } finally {
+      setInvDetailLoading(false)
+    }
+  }, [])
+
+  // ══════════════════════════════════════════════════════════
+  // INVENTORY SCANNER ADAPTER (closeOnSuccess = TRUE)
+  // ══════════════════════════════════════════════════════════
+  // Behaviour:
+  //   1. Scan an INVENTORY barcode (matches an InventoryItem by sku/name)
+  //      → open that inventory's detail dialog → return true (scanner closes).
+  //   2. Scan a PRODUCT/VARIANT barcode → resolve inventory relations via
+  //      ProductComposition (GET /api/products/<id>/composition):
+  //        - ONE relation   → open that inventory detail → return true.
+  //        - MULTIPLE        → open picker (user picks one) → return true.
+  //        - NO relation     → toast.error('tidak terkait inventory') → return false.
+  //   3. Not a product/inventory → toast.error('tidak ditemukan') → return false.
+  //
+  // SIMPLE mode (no resolver) is used because LookupResult is product-shaped
+  // and cannot carry an inventoryItemId cleanly. onResult does ALL resolution
+  // itself and returns true/false. Dialog auto-closes ONLY when (true AND
+  // closeOnSuccess).
+  //
+  // Defined AFTER openInvDetail to avoid TDZ on the openInvDetail dep.
+  const mapApiItemToInventoryItem = (i: {
+    id: string
+    name: string
+    sku?: string | null
+    baseUnit: string
+    stock?: number
+    avgCost?: number
+  }): InventoryItem => ({
+    id: i.id,
+    name: i.name,
+    sku: i.sku ?? null,
+    baseUnit: i.baseUnit,
+    categoryId: null,
+    category: null,
+    stock: i.stock ?? 0,
+    avgCost: i.avgCost ?? 0,
+    lowStockAlert: 0,
+  })
+
+  const handleInvScanResult = useCallback(async (value: string): Promise<boolean> => {
+    const code = value.trim()
+    if (!code) return false
+    const query = code.toLowerCase()
+
+    // ── 1. Try exact inventory match by SKU/name ──
+    // The /api/inventory/items endpoint does substring search; we then pick
+    // the row whose sku OR name exactly equals the scanned code.
+    try {
+      const invRes = await fetch(`/api/inventory/items?search=${encodeURIComponent(code)}&activeOnly=false`)
+      if (invRes.ok) {
+        const invData = await invRes.json()
+        const items: Array<{
+          id: string; name: string; sku: string | null; baseUnit: string
+          stock: number; avgCost: number; categoryId: string | null
+        }> = invData.items || []
+        const match = items.find(i => (i.sku?.toLowerCase() === query) || (i.name?.toLowerCase() === query))
+        if (match) {
+          setInvSearch('')
+          setInvDebouncedSearch('')
+          setInvPage(1)
+          setSelectedInvIds(new Set())
+          openInvDetail(mapApiItemToInventoryItem(match))
+          invRowHighlight.highlight(match.id) // spec point 6: hasil scan
+          toast.success(`Item ditemukan: ${match.name}`)
+          return true
+        }
+      }
+    } catch {
+      // fall through to product lookup
+    }
+
+    // ── 2. Try product/variant lookup ──
+    let product: { id: string; name?: string } | null = null
+    let matchedVariantId: string | null = null
+    try {
+      const lookupRes = await fetch(`/api/pos/products/lookup?code=${encodeURIComponent(code)}`)
+      if (lookupRes.ok) {
+        const lookupData = await lookupRes.json()
+        product = lookupData.product ?? null
+        matchedVariantId = lookupData.matchedVariantId ?? null
+      }
+    } catch {
+      // network error — treat as not found
+    }
+    if (!product) {
+      toast.error(`Barcode "${code}" tidak ditemukan`)
+      return false
+    }
+
+    // ── 3. Resolve ProductComposition relations → list of inventory items ──
+    let relatedItems: Array<{ id: string; name: string; sku: string | null; baseUnit: string; stock: number; avgCost: number }> = []
+    try {
+      const compRes = await fetch(`/api/products/${product.id}/composition`)
+      if (compRes.ok) {
+        const compData = await compRes.json()
+        const seenIds = new Set<string>()
+        const addComp = (c: {
+          inventoryItemId?: string
+          inventoryItemName?: string
+          inventoryItemSku?: string | null
+          baseUnit?: string
+          stock?: number
+          avgCost?: number
+        } | undefined) => {
+          if (!c?.inventoryItemId || seenIds.has(c.inventoryItemId)) return
+          seenIds.add(c.inventoryItemId)
+          relatedItems.push({
+            id: c.inventoryItemId,
+            name: c.inventoryItemName ?? '(no name)',
+            sku: c.inventoryItemSku ?? null,
+            baseUnit: c.baseUnit ?? '',
+            stock: c.stock ?? 0,
+            avgCost: c.avgCost ?? 0,
+          })
+        }
+        if (compData.hasVariants) {
+          const variantComps: Array<{
+            variantId: string
+            compositions: Array<{
+              inventoryItemId: string
+              inventoryItemName: string
+              inventoryItemSku: string | null
+              baseUnit: string
+              stock: number
+              avgCost: number
+            }>
+          }> = compData.variantCompositions || []
+          if (matchedVariantId) {
+            // Barcode matched a specific variant → only its compositions count.
+            const matched = variantComps.find(v => v.variantId === matchedVariantId)
+            if (matched) matched.compositions.forEach(addComp)
+          } else {
+            // Barcode matched the parent product → flatten ALL variants' compositions.
+            variantComps.forEach(v => (v.compositions || []).forEach(addComp))
+          }
+        } else {
+          const items: Array<{
+            inventoryItemId: string
+            inventoryItemName: string
+            inventoryItemSku: string | null
+            baseUnit: string
+            stock: number
+            avgCost: number
+          }> = compData.items || []
+          items.forEach(addComp)
+        }
+      }
+    } catch {
+      // composition fetch failed — treat as no relations
+    }
+
+    if (relatedItems.length === 0) {
+      toast.error('Barcode produk tidak terkait inventory manapun')
+      return false
+    }
+
+    if (relatedItems.length === 1) {
+      const r = relatedItems[0]
+      setInvSearch('')
+      setInvDebouncedSearch('')
+      setInvPage(1)
+      setSelectedInvIds(new Set())
+      openInvDetail(mapApiItemToInventoryItem(r))
+      invRowHighlight.highlight(r.id) // spec point 6: hasil scan
+      toast.success(`Item ditemukan: ${r.name}`)
+      return true
+    }
+
+    // MULTIPLE relations — show picker. The picker takes over the handoff;
+    // the scanner auto-closes (closeOnSuccess=true → onResult returned true).
+    setInvScanPickerItems(relatedItems.map(mapApiItemToInventoryItem))
+    setInvScanPickerOpen(true)
+    toast.info(`Barcode produk terkait ${relatedItems.length} item inventory — pilih satu`)
+    return true
+  }, [openInvDetail])
 
   // ── Batch Timeline Fetch ──
   const fetchBatchTimeline = useCallback(async (inventoryItemId: string) => {
@@ -3677,7 +4151,9 @@ export default function PurchasePage() {
                         </TableCell>
                       </TableRow>
                     ) : (
-                      poList.map((po) => (
+                      poList.map((po) => {
+                        const poSafety = resolvePoSafety(po)
+                        return (
                         <TableRow key={po.id} className="border-white/[0.04] hover:bg-white/[0.02] transition-colors">
                           <TableCell className="text-xs text-slate-200 font-medium font-mono">{po.orderNumber}</TableCell>
                           <TableCell className="text-xs text-slate-400">{po.supplierName || '-'}</TableCell>
@@ -3722,64 +4198,80 @@ export default function PurchasePage() {
                                 size="sm"
                                 className={cn(
                                   "h-7 px-2 transition-colors",
-                                  po.hasRealBusinessHistory
+                                  !poSafety.canEdit
                                     ? "text-slate-600 cursor-not-allowed"
                                     : "text-slate-400 hover:text-white hover:bg-white/[0.04]"
                                 )}
                                 onClick={() => {
-                                  if (po.hasRealBusinessHistory) {
-                                    toast.error('Pembelian memiliki riwayat bisnis (transfer/penjualan) — tidak bisa diedit')
+                                  if (!poSafety.canEdit) {
+                                    toast.error('Pembelian tidak bisa diedit — lihat alasan di ikon info')
                                     return
                                   }
                                   openPoEdit(po)
                                 }}
-                                disabled={po.hasRealBusinessHistory}
-                                title={
-                                  po.hasRealBusinessHistory
-                                    ? 'Ada riwayat transfer/penjualan'
-                                    : 'Edit pembelian'
-                                }
+                                disabled={!poSafety.canEdit}
+                                title={poSafety.canEdit ? 'Edit pembelian' : 'Tidak dapat diedit'}
                               >
                                 <Pencil className="h-3.5 w-3.5" />
                               </Button>
+                              {!poSafety.canEdit && poSafety.reasons.length > 0 && (
+                                <StatusIconPopover
+                                  ariaLabel="Alasan pembelian tidak dapat diedit"
+                                  icon={<Info className="h-3.5 w-3.5" />}
+                                  tooltip="Tidak dapat diedit"
+                                  popoverContent={
+                                    <PopoverContentBody title="Tidak Dapat Diedit">
+                                      <ul className="space-y-0.5 list-disc list-inside">
+                                        {poSafety.reasons.map((r, i) => <li key={i}>{r}</li>)}
+                                      </ul>
+                                    </PopoverContentBody>
+                                  }
+                                  tone="amber"
+                                />
+                              )}
                               {isOwner && (
                               <Button
                                 variant="ghost"
                                 size="sm"
                                 className={cn(
                                   "h-7 px-2 hover:text-red-300 hover:bg-red-500/[0.06]",
-                                  (po.hasRealBusinessHistory || po.hasUsageHistory) 
-                                    ? "opacity-50 cursor-not-allowed text-red-400/50" 
-                                    : po.hasProductLinks
-                                      ? "text-amber-400 hover:text-amber-300 hover:bg-amber-500/[0.06]"
-                                      : "text-red-400"
+                                  !poSafety.canDelete
+                                    ? "opacity-50 cursor-not-allowed text-red-400/50"
+                                    : "text-red-400"
                                 )}
                                 onClick={() => {
-                                  if (po.hasRealBusinessHistory || po.hasUsageHistory) {
-                                    toast.error('Pembelian memiliki riwayat bisnis — tidak bisa dihapus')
+                                  if (!poSafety.canDelete) {
+                                    toast.error('Pembelian tidak dapat dibatalkan — lihat alasan di ikon info')
                                     return
-                                  }
-                                  if (po.hasProductLinks) {
-                                    toast.warning('Link ke produk akan dibersihkan otomatis')
                                   }
                                   setDeletePoId(po.id)
                                 }}
-                                disabled={po.hasRealBusinessHistory || po.hasUsageHistory}
-                                title={
-                                  (po.hasRealBusinessHistory || po.hasUsageHistory)
-                                    ? 'Ada riwayat bisnis — tidak bisa dihapus'
-                                    : po.hasProductLinks
-                                      ? 'Hapus (link produk akan dibersihkan)'
-                                      : 'Hapus pembelian'
-                                }
+                                disabled={!poSafety.canDelete}
+                                title={poSafety.canDelete ? 'Batalkan pembelian' : 'Tidak dapat dibatalkan'}
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
                               </Button>
                               )}
+                              {isOwner && !poSafety.canDelete && poSafety.reasons.length > 0 && (
+                                <StatusIconPopover
+                                  ariaLabel="Alasan pembelian tidak dapat dibatalkan"
+                                  icon={<Info className="h-3.5 w-3.5" />}
+                                  tooltip="Tidak dapat dibatalkan"
+                                  popoverContent={
+                                    <PopoverContentBody title="Tidak Dapat Dibatalkan">
+                                      <ul className="space-y-0.5 list-disc list-inside">
+                                        {poSafety.reasons.map((r, i) => <li key={i}>{r}</li>)}
+                                      </ul>
+                                    </PopoverContentBody>
+                                  }
+                                  tone="amber"
+                                />
+                              )}
                             </div>
                           </TableCell>
                         </TableRow>
-                      ))
+                        )
+                      })
                     )}
                   </TableBody>
                 </Table>
@@ -3814,6 +4306,7 @@ export default function PurchasePage() {
                     // Determine card accent based on expiry status
                     const hasExpiredItems = po._batchSummary?.expiredItems > 0
                     const hasExpiringSoon = po._batchSummary?.nearestExp && !hasExpiredItems
+                    const poSafety = resolvePoSafety(po)
                     
                     return (
                     <motion.div
@@ -3883,53 +4376,72 @@ export default function PurchasePage() {
                             <button
                               className={cn(
                                 "w-8 h-8 rounded-lg flex items-center justify-center transition-colors",
-                                po.hasRealBusinessHistory
+                                !poSafety.canEdit
                                   ? "text-slate-700 cursor-not-allowed"
                                   : "text-slate-500 hover:text-white hover:bg-white/[0.06]"
                               )}
                               onClick={() => {
-                                if (po.hasRealBusinessHistory) {
-                                  toast.error('Pembelian memiliki riwayat bisnis — tidak bisa diedit')
+                                if (!poSafety.canEdit) {
+                                  toast.error('Pembelian tidak bisa diedit — lihat alasan di ikon info')
                                   return
                                 }
                                 openPoEdit(po)
                               }}
-                              disabled={po.hasRealBusinessHistory}
-                              title={po.hasRealBusinessHistory ? 'Ada riwayat bisnis' : 'Edit'}
+                              disabled={!poSafety.canEdit}
+                              title={poSafety.canEdit ? 'Edit' : 'Tidak dapat diedit'}
                             >
                               <Pencil className="h-3.5 w-3.5" />
                             </button>
+                            {!poSafety.canEdit && poSafety.reasons.length > 0 && (
+                              <StatusIconPopover
+                                ariaLabel="Alasan pembelian tidak dapat diedit"
+                                icon={<Info className="h-3.5 w-3.5" />}
+                                tooltip="Tidak dapat diedit"
+                                popoverContent={
+                                  <PopoverContentBody title="Tidak Dapat Diedit">
+                                    <ul className="space-y-0.5 list-disc list-inside">
+                                      {poSafety.reasons.map((r, i) => <li key={i}>{r}</li>)}
+                                    </ul>
+                                  </PopoverContentBody>
+                                }
+                                tone="amber"
+                              />
+                            )}
                             {isOwner && (
                               <button
                                 className={cn(
                                   "w-8 h-8 rounded-lg flex items-center justify-center transition-colors",
-                                  (po.hasRealBusinessHistory || po.hasUsageHistory)
+                                  !poSafety.canDelete
                                     ? "text-red-400/20 cursor-not-allowed"
-                                    : po.hasProductLinks
-                                      ? "text-amber-400 hover:text-amber-300 hover:bg-amber-500/[0.08]"
-                                      : "text-slate-500 hover:text-red-400 hover:bg-red-500/[0.06]"
+                                    : "text-slate-500 hover:text-red-400 hover:bg-red-500/[0.06]"
                                 )}
                                 onClick={() => {
-                                  if (po.hasRealBusinessHistory || po.hasUsageHistory) {
-                                    toast.error('Pembelian memiliki riwayat bisnis — tidak bisa dihapus')
+                                  if (!poSafety.canDelete) {
+                                    toast.error('Pembelian tidak dapat dibatalkan — lihat alasan di ikon info')
                                     return
-                                  }
-                                  if (po.hasProductLinks) {
-                                    toast.warning('Link ke produk akan dibersihkan otomatis')
                                   }
                                   setDeletePoId(po.id)
                                 }}
-                                disabled={po.hasRealBusinessHistory || po.hasUsageHistory}
-                                title={
-                                  (po.hasRealBusinessHistory || po.hasUsageHistory)
-                                    ? 'Ada riwayat bisnis'
-                                    : po.hasProductLinks
-                                      ? 'Hapus (link dibersihkan)'
-                                      : 'Hapus'
-                                }
+                                disabled={!poSafety.canDelete}
+                                title={poSafety.canDelete ? 'Batalkan pembelian' : 'Tidak dapat dibatalkan'}
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
                               </button>
+                            )}
+                            {isOwner && !poSafety.canDelete && poSafety.reasons.length > 0 && (
+                              <StatusIconPopover
+                                ariaLabel="Alasan pembelian tidak dapat dibatalkan"
+                                icon={<Info className="h-3.5 w-3.5" />}
+                                tooltip="Tidak dapat dibatalkan"
+                                popoverContent={
+                                  <PopoverContentBody title="Tidak Dapat Dibatalkan">
+                                    <ul className="space-y-0.5 list-disc list-inside">
+                                      {poSafety.reasons.map((r, i) => <li key={i}>{r}</li>)}
+                                    </ul>
+                                  </PopoverContentBody>
+                                }
+                                tone="amber"
+                              />
                             )}
                           </div>
                         </div>
@@ -3958,13 +4470,29 @@ export default function PurchasePage() {
                   <Input
                     value={invSearch}
                     onChange={(e) => { setInvSearch(e.target.value); setInvPage(1); setSelectedInvIds(new Set()) }}
-                    placeholder="Cari item berdasarkan nama atau SKU..."
-                    className={cn(inputClass, 'pl-10 h-10 rounded-xl bg-white/[0.03] border-white/[0.08] focus:border-emerald-500/30 focus:bg-white/[0.05] transition-all', invLoading && invList.length > 0 && 'pr-10')}
+                    placeholder="Cari nama, SKU, barcode..."
+                    className={cn(inputClass, 'pl-10 pr-24 h-10 rounded-xl bg-white/[0.03] border-white/[0.08] focus:border-emerald-500/30 focus:bg-white/[0.05] transition-all')}
                   />
-                  {/* Inline loading spinner — shows when searching without clearing existing data */}
-                  {invLoading && invList.length > 0 && (
-                    <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-emerald-400 animate-spin" />
-                  )}
+                  <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-0.5">
+                    {invSearch && (
+                      <button
+                        onClick={() => { setInvSearch(''); setInvPage(1); setSelectedInvIds(new Set()) }}
+                        className="w-6 h-6 flex items-center justify-center text-slate-500 hover:text-white transition-colors"
+                        aria-label="Hapus pencarian"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                    <button
+                      onClick={() => setInvScannerOpen(true)}
+                      className="h-7 px-2 rounded-md flex items-center gap-1 text-[10px] font-semibold text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10 transition-colors"
+                      title="Scan barcode dengan kamera"
+                      aria-label="Scan barcode"
+                    >
+                      <ScanBarcode className="h-3.5 w-3.5" />
+                      <span className="hidden sm:inline">Scan</span>
+                    </button>
+                  </div>
                 </div>
                 {/* Reset Filters Button - appears when filters active */}
                 {(invSearch || invCategoryFilter !== 'all' || showInactiveItems) && (
@@ -4351,92 +4879,6 @@ export default function PurchasePage() {
 
             <div className="hidden md:block">
               <Card className="bg-nebula border-white/[0.06] overflow-hidden rounded-xl">
-                {/* Grouped Sort Filter Chips */}
-                <div className="px-4 pt-4 pb-2 space-y-2">
-                  <p className="text-[10px] text-slate-600 uppercase tracking-wider font-medium flex items-center gap-1.5">
-                    <ArrowUpDown className="h-3 w-3" />
-                    Urutkan berdasarkan
-                  </p>
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    {/* Sort by Name */}
-                    <div className="flex items-center gap-1 pr-2 border-r border-white/[0.06]">
-                      <span className="text-[9px] text-slate-600 uppercase">Nama</span>
-                      {[['name-asc', 'A-Z', 'ChevronsUpDown'], ['name-desc', 'Z-A', 'ChevronsUpDown']].map(([val, label, icon]) => (
-                        <button
-                          key={val}
-                          onClick={() => { setInvSortBy(val); setInvPage(1); setSelectedInvIds(new Set()) }}
-                          className={cn(
-                            'shrink-0 px-2 py-1 rounded-md text-[10px] font-medium transition-all whitespace-nowrap flex items-center gap-1',
-                            invSortBy === val
-                              ? 'bg-violet-500/15 text-violet-400 border border-violet-500/30 shadow-sm'
-                              : 'text-slate-500 hover:text-slate-300 hover:bg-white/[0.04] border border-transparent',
-                          )}
-                          title={`Urutkan ${label}`}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                    </div>
-                    {/* Sort by Stock */}
-                    <div className="flex items-center gap-1 pr-2 border-r border-white/[0.06]">
-                      <span className="text-[9px] text-slate-600 uppercase">Stok</span>
-                      {[['stock-desc', 'Terbanyak', 'TrendingUp'], ['stock-asc', 'Terendah', 'TrendingDown']].map(([val, label, icon]) => (
-                        <button
-                          key={val}
-                          onClick={() => { setInvSortBy(val); setInvPage(1); setSelectedInvIds(new Set()) }}
-                          className={cn(
-                            'shrink-0 px-2 py-1 rounded-md text-[10px] font-medium transition-all whitespace-nowrap flex items-center gap-1',
-                            invSortBy === val
-                              ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 shadow-sm'
-                              : 'text-slate-500 hover:text-slate-300 hover:bg-white/[0.04] border border-transparent',
-                          )}
-                          title={`Urutkan: ${label}`}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                    </div>
-                    {/* Sort by Value */}
-                    <div className="flex items-center gap-1 pr-2 border-r border-white/[0.06]">
-                      <span className="text-[9px] text-slate-600 uppercase">Nilai</span>
-                      {[['value-desc', 'Terbesar', 'TrendingUp'], ['value-asc', 'Terkecil', 'TrendingDown']].map(([val, label, icon]) => (
-                        <button
-                          key={val}
-                          onClick={() => { setInvSortBy(val); setInvPage(1); setSelectedInvIds(new Set()) }}
-                          className={cn(
-                            'shrink-0 px-2 py-1 rounded-md text-[10px] font-medium transition-all whitespace-nowrap flex items-center gap-1',
-                            invSortBy === val
-                              ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shadow-sm'
-                              : 'text-slate-500 hover:text-slate-300 hover:bg-white/[0.04] border border-transparent',
-                          )}
-                          title={`Urutkan: ${label}`}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                    </div>
-                    {/* Sort by Date */}
-                    <div className="flex items-center gap-1">
-                      <span className="text-[9px] text-slate-600 uppercase">Waktu</span>
-                      {[['updatedAt-desc', 'Terbaru', 'Clock'], ['updatedAt-asc', 'Terlama', 'Clock']].map(([val, label, icon]) => (
-                        <button
-                          key={val}
-                          onClick={() => { setInvSortBy(val); setInvPage(1); setSelectedInvIds(new Set()) }}
-                          className={cn(
-                            'shrink-0 px-2 py-1 rounded-md text-[10px] font-medium transition-all whitespace-nowrap flex items-center gap-1',
-                            invSortBy === val
-                              ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30 shadow-sm'
-                              : 'text-slate-500 hover:text-slate-300 hover:bg-white/[0.04] border border-transparent',
-                          )}
-                          title={`Urutkan: ${label}`}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-                
                 <div className="overflow-x-auto">
                   <Table>
                     <TableHeader>
@@ -4455,19 +4897,81 @@ export default function PurchasePage() {
                             )}
                           </div>
                         </TableHead>
-                        <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider min-w-[220px]">Nama Item</TableHead>
-                        <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider w-[130px]">Kategori</TableHead>
-                        <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider text-right w-[140px]">Stok</TableHead>
-                        <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider text-right w-[150px]">HPP Satuan</TableHead>
-                        <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider text-right w-[150px]">Total Nilai</TableHead>
-                        <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider text-right w-[90px]">Digunakan</TableHead>
-                        <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider text-right w-[120px]">Aksi</TableHead>
+                        <SortableTableHead
+                          activeSortBy={invColumnSortBy}
+                          activeSortOrder={invColumnSortOrder}
+                          columnId="name"
+                          onSort={handleInvColumnSort}
+                          className="min-w-[220px]"
+                        >
+                          Nama Item
+                        </SortableTableHead>
+                        <SortableTableHead
+                          activeSortBy={invColumnSortBy}
+                          activeSortOrder={invColumnSortOrder}
+                          columnId="category"
+                          onSort={handleInvColumnSort}
+                          className="w-[130px]"
+                        >
+                          Kategori
+                        </SortableTableHead>
+                        <SortableTableHead
+                          activeSortBy={invColumnSortBy}
+                          activeSortOrder={invColumnSortOrder}
+                          columnId="stock"
+                          onSort={handleInvColumnSort}
+                          align="right"
+                          className="w-[140px]"
+                        >
+                          Stok
+                        </SortableTableHead>
+                        <SortableTableHead
+                          activeSortBy={invColumnSortBy}
+                          activeSortOrder={invColumnSortOrder}
+                          columnId="unitCost"
+                          onSort={handleInvColumnSort}
+                          align="right"
+                          className="w-[150px]"
+                        >
+                          HPP Satuan
+                        </SortableTableHead>
+                        <SortableTableHead
+                          activeSortBy={invColumnSortBy}
+                          activeSortOrder={invColumnSortOrder}
+                          columnId="value"
+                          onSort={handleInvColumnSort}
+                          align="right"
+                          className="w-[150px]"
+                        >
+                          Total Nilai
+                        </SortableTableHead>
+                        <SortableTableHead
+                          activeSortBy={invColumnSortBy}
+                          activeSortOrder={invColumnSortOrder}
+                          columnId="usage"
+                          onSort={handleInvColumnSort}
+                          align="right"
+                          className="w-[90px]"
+                        >
+                          Digunakan
+                        </SortableTableHead>
+                        <SortableTableHead
+                          activeSortBy={invColumnSortBy}
+                          activeSortOrder={invColumnSortOrder}
+                          columnId="lastChangedAt"
+                          onSort={handleInvColumnSort}
+                          align="right"
+                          className="w-[140px]"
+                        >
+                          Terakhir Diubah
+                        </SortableTableHead>
+                        <TableHead className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider text-right w-[96px]">Aksi</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
                       {invList.length === 0 ? (
                         <TableRow className="border-white/[0.04] hover:bg-transparent">
-                          <TableCell colSpan={8} className="text-center py-20">
+                          <TableCell colSpan={9} className="text-center py-20">
                             <div className="flex flex-col items-center max-w-xs mx-auto">
                               {/* Enhanced Empty State Illustration */}
                               <div className="relative w-20 h-20 mb-5">
@@ -4503,29 +5007,25 @@ export default function PurchasePage() {
                           const deleteStatus = getDeleteSafetyStatus(item)
                           // Calculate edit block status
                           const editBlockStatus = getEditBlockStatus(item)
+                          // Same-day highlight: priority 1 = created today, 2 = changed today.
+                          const sameDayBadge = getSameDayBadge(item.createdAt ?? item.lastBusinessChangeAt ?? item.updatedAt, item.lastBusinessChangeAt ?? item.updatedAt)
                           return (
-                            <TableRow 
-                              key={item.id} 
+                            <TableRow
+                              key={item.id}
                               className={cn(
-                                'group relative border-b border-white/[0.04] transition-all duration-150',
-                                // Alternating row backgrounds
+                                'group relative border-b border-white/[0.04] transition-colors duration-300',
+                                // Alternating row backgrounds (subtle)
                                 index % 2 === 0 ? 'bg-transparent' : 'bg-white/[0.015]',
                                 // Hover effect
                                 'hover:bg-white/[0.04]',
                                 // Selected state
                                 isSelected && 'bg-emerald-500/[0.05] hover:bg-emerald-500/[0.08]',
-                                // Archived state
+                                // Archived state — dim but no warning tint
                                 isArchived && 'opacity-60',
+                                // Temporary row highlight (spec point 3 + 6) — overrides alternating bg
+                                invRowHighlight.classNameFor(item.id),
                               )}
                             >
-                              {/* Low stock left border indicator */}
-                              {isLow && !isArchived && (
-                                <div className="absolute left-0 top-0 bottom-0 w-[3px] bg-gradient-to-b from-red-500 to-red-500/50 rounded-r" />
-                              )}
-                              {/* Archived left border indicator */}
-                              {isArchived && (
-                                <div className="absolute left-0 top-0 bottom-0 w-[3px] bg-gradient-to-b from-amber-500 to-amber-500/50 rounded-r" />
-                              )}
                               <TableCell className="pl-4">
                                 <Checkbox
                                   checked={isSelected}
@@ -4535,49 +5035,64 @@ export default function PurchasePage() {
                               </TableCell>
                               <TableCell className="py-3">
                                 <div className="flex items-center gap-2">
-                                  <span className={cn(
-                                    'text-xs font-medium truncate max-w-[160px] block',
-                                    isArchived ? 'text-slate-500 line-through decoration-slate-600' : 'text-slate-100'
-                                  )}>
-                                    {item.name}
-                                  </span>
-                                  {isArchived && (
-                                    <Badge variant="secondary" className="text-[9px] px-2 py-0.5 bg-amber-500/15 text-amber-400 border-amber-500/25 rounded-full shrink-0">
-                                      <Archive className="h-2.5 w-2.5 mr-1" />
-                                      Nonaktif
-                                    </Badge>
-                                  )}
-                                  {isLow && !isArchived && (
-                                    <Badge variant="secondary" className="text-[9px] px-2 py-0.5 bg-red-500/15 text-red-400 border-red-500/25 rounded-full animate-pulse shrink-0">
-                                      <AlertTriangle className="h-2.5 w-2.5 mr-1" />
-                                      Stok Rendah
-                                    </Badge>
-                                  )}
-                                  {/* Delete Safety Indicator */}
-                                  {!isArchived && deleteStatus.riskLevel === 'safe' && (
-            <Badge variant="secondary" className="text-[8px] px-1.5 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/20 rounded-full shrink-0" title={deleteStatus.description}>
-              <ShieldCheck className="h-2.5 w-2.5 mr-0.5" />
-              Aman
-            </Badge>
-          )}
-          {!isArchived && deleteStatus.riskLevel === 'warning' && (
-            <Badge variant="secondary" className="text-[8px] px-1.5 py-0 bg-amber-500/10 text-amber-400 border-amber-500/20 rounded-full shrink-0" title={deleteStatus.description}>
-              <AlertCircle className="h-2.5 w-2.5 mr-0.5" />
-              Migrasi
-            </Badge>
-          )}
-          {!isArchived && deleteStatus.riskLevel === 'blocked' && (
-            <Badge variant="secondary" className="text-[8px] px-1.5 py-0 bg-red-500/10 text-red-400 border-red-500/20 rounded-full shrink-0" title={deleteStatus.description}>
-              <Lock className="h-2.5 w-2.5 mr-0.5" />
-              Terkunci
-            </Badge>
-          )}
+                                  <div className="flex flex-col min-w-0">
+                                    <span className="flex items-center gap-1.5 flex-wrap">
+                                      <span className={cn(
+                                        'text-xs font-medium truncate max-w-[180px] block',
+                                        isArchived ? 'text-slate-500 line-through decoration-slate-600' : 'text-slate-100'
+                                      )}>
+                                        {item.name}
+                                      </span>
+                                      {sameDayBadge === 'new' && <SameDayBadge variant="new" />}
+                                      {isArchived && (
+                                        <Badge variant="secondary" className="text-[9px] px-2 py-0.5 bg-amber-500/15 text-amber-400 border-amber-500/25 rounded-full shrink-0">
+                                          <Archive className="h-2.5 w-2.5 mr-1" />
+                                          Nonaktif
+                                        </Badge>
+                                      )}
+                                      {/* Delete Safety Indicators — compact status icons with popover.
+                                          "Update" badge removed — "Terakhir Diubah" column already shows it.
+                                          "Aman" dihilangkan dari list utama (spec point 2). */}
+                                      {!isArchived && deleteStatus.riskLevel === 'warning' && (
+                                        <StatusIconPopover
+                                          ariaLabel="Migrasi — item memiliki data historis"
+                                          icon={<AlertCircle className="h-3 w-3" />}
+                                          tooltip="Migrasi"
+                                          popoverContent={
+                                            <PopoverContentBody title="Migrasi">
+                                              Item ini memiliki data historis (transaksi / movement). Hapus dengan hati-hati.
+                                            </PopoverContentBody>
+                                          }
+                                          tone="amber"
+                                        />
+                                      )}
+                                      {!isArchived && deleteStatus.riskLevel === 'blocked' && (
+                                        <StatusIconPopover
+                                          ariaLabel="Terkunci — item tidak bisa dihapus"
+                                          icon={<Lock className="h-3 w-3" />}
+                                          tooltip="Terkunci"
+                                          popoverContent={
+                                            <PopoverContentBody title="Terkunci">
+                                              Item ini tidak dapat dihapus karena masih terikat relasi aktif.
+                                            </PopoverContentBody>
+                                          }
+                                          tone="red"
+                                        />
+                                      )}
+                                    </span>
+                                    {/* SKU below name (spec point 5) */}
+                                    {item.sku && (
+                                      <span className="text-[10px] text-slate-500 font-mono mt-0.5 truncate max-w-[180px] block">
+                                        {item.sku}
+                                      </span>
+                                    )}
+                                  </div>
                                 </div>
                               </TableCell>
                               <TableCell>
                                 {item.category && colorClasses ? (
-                                  <Badge 
-                                    variant="outline" 
+                                  <Badge
+                                    variant="outline"
                                     className={cn(
                                       'text-[10px] px-2.5 py-1 rounded-full border font-medium transition-colors',
                                       colorClasses.bg,
@@ -4593,15 +5108,16 @@ export default function PurchasePage() {
                                 )}
                               </TableCell>
                               <TableCell className="text-right">
-                                <span className={cn(
-                                  'inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg tabular-nums text-xs font-semibold',
-                                  isLow 
-                                    ? 'bg-red-500/10 text-red-400 ring-1 ring-red-500/20' 
-                                    : 'text-slate-200'
-                                )}>
-                                  {formatNumber(item.stock)}
+                                {/* Stok cell (spec point 2): numeric value (colored) + compact StockStatusBadge.
+                                    No ring, no animate-pulse. Badge replaces the old "Stok Rendah" badge
+                                    that was in the name cell. */}
+                                <div className="inline-flex items-center gap-1.5 justify-end tabular-nums text-xs font-semibold">
+                                  <span className={stockValueColorClass(item.stock, item.lowStockAlert)}>
+                                    {formatNumber(item.stock)}
+                                  </span>
                                   <span className={cn('font-normal text-[10px]', isLow ? 'text-red-400/70' : 'text-slate-500')}>{item.baseUnit}</span>
-                                </span>
+                                  <StockStatusBadge stock={item.stock} lowThreshold={item.lowStockAlert} />
+                                </div>
                               </TableCell>
                               <TableCell className="text-right">
                                 <span className="text-xs text-slate-400 tabular-nums">
@@ -4616,69 +5132,61 @@ export default function PurchasePage() {
                               <TableCell className="text-right">
                                 <span className={cn(
                                   'inline-flex items-center justify-center min-w-[24px] h-6 rounded-md text-xs tabular-nums font-medium',
-                                  (item._count?.compositions ?? 0) > 0 
-                                    ? 'bg-violet-500/15 text-violet-400' 
+                                  (item._count?.compositions ?? 0) > 0
+                                    ? 'bg-violet-500/15 text-violet-400'
                                     : 'text-slate-600'
                                 )}>
                                   {item._count?.compositions ?? 0}
                                 </span>
                               </TableCell>
+                              <TableCell className="text-[11px] text-slate-400 text-right tabular-nums whitespace-nowrap">
+                                {formatRelativeDateTime(item.lastBusinessChangeAt ?? item.updatedAt)}
+                              </TableCell>
                               <TableCell className="text-right">
-                                <div className="flex items-center justify-end gap-0.5 opacity-60 group-hover:opacity-100 transition-opacity">
-                                  <Button
-                                    variant="ghost"
+                                <div className="flex items-center justify-end opacity-60 group-hover:opacity-100 transition-opacity">
+                                  <RowActionsMenu
                                     size="sm"
-                                    className="h-7 w-7 p-0 text-slate-400 hover:text-blue-400 hover:bg-blue-500/10 rounded-lg transition-colors"
-                                    onClick={() => openInvDetail(item)}
-                                    title="Lihat detail item"
-                                  >
-                                    <Eye className="h-3.5 w-3.5" />
-                                  </Button>
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    className={cn(
-                                      "h-7 w-7 p-0 rounded-lg transition-colors",
-                                      editBlockStatus.isBlocked
-                                        ? 'text-slate-600 cursor-not-allowed'
-                                        : 'text-slate-400 hover:text-amber-400 hover:bg-amber-500/10'
-                                    )}
-                                    onClick={() => {
-                                      if (editBlockStatus.isBlocked) {
-                                        toast.error(editBlockStatus.reason || 'Tidak bisa diedit')
-                                        return
-                                      }
-                                      openInvForm(item)
+                                    primaryAction={{
+                                      label: 'Lihat Detail',
+                                      icon: <Eye className="h-3.5 w-3.5" />,
+                                      onClick: () => openInvDetail(item),
                                     }}
-                                    disabled={editBlockStatus.isBlocked}
-                                    title={editBlockStatus.isBlocked ? editBlockStatus.reason : 'Edit item'}
-                                  >
-                                    <Pencil className="h-3.5 w-3.5" />
-                                  </Button>
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    className={cn(
-                                      'h-7 w-7 p-0 rounded-lg transition-colors',
-                                      isArchived
-                                        ? 'text-amber-400 hover:text-amber-300 hover:bg-amber-500/10'
-                                        : 'text-slate-400 hover:text-red-400 hover:bg-red-500/10',
-                                    )}
-                                    onClick={() => {
-                                      if (isArchived) {
-                                        handleRestoreInv(item.id)
-                                      } else {
-                                        void openDeleteInvDialog(item.id)
-                                      }
-                                    }}
-                                    title={isArchived ? 'Aktifkan kembali' : 'Arsipkan item'}
-                                  >
-                                    {isArchived ? (
-                                      <RotateCcw className="h-3.5 w-3.5" />
-                                    ) : (
-                                      <Trash2 className="h-3.5 w-3.5" />
-                                    )}
-                                  </Button>
+                                    items={[
+                                      {
+                                        label: 'Edit',
+                                        icon: <Pencil className="h-3.5 w-3.5" />,
+                                        onClick: () => {
+                                          if (editBlockStatus.isBlocked) {
+                                            toast.error(editBlockStatus.reason || 'Tidak bisa diedit')
+                                            return
+                                          }
+                                          openInvForm(item)
+                                        },
+                                        disabled: editBlockStatus.isBlocked,
+                                        title: editBlockStatus.isBlocked ? editBlockStatus.reason : undefined,
+                                      },
+                                      {
+                                        label: 'Lihat Movement / Batch',
+                                        icon: <Activity className="h-3.5 w-3.5" />,
+                                        onClick: () => void openInvDetailAtMovements(item),
+                                      },
+                                    ]}
+                                    dangerItems={[
+                                      {
+                                        label: isArchived ? 'Aktifkan Kembali' : 'Hapus / Nonaktifkan',
+                                        icon: isArchived
+                                          ? <RotateCcw className="h-3.5 w-3.5" />
+                                          : <Trash2 className="h-3.5 w-3.5" />,
+                                        onClick: () => {
+                                          if (isArchived) {
+                                            handleRestoreInv(item.id)
+                                          } else {
+                                            void openDeleteInvDialog(item.id)
+                                          }
+                                        },
+                                      },
+                                    ]}
+                                  />
                                 </div>
                               </TableCell>
                             </TableRow>
@@ -4689,45 +5197,6 @@ export default function PurchasePage() {
                   </Table>
                 </div>
               </Card>
-            </div>
-
-            {/* Enhanced Mobile Sort Chips - Modern Glass Design */}
-            <div className="md:hidden">
-              <div className="flex items-center gap-2 overflow-x-auto custom-scrollbar pb-1 scrollbar-thin">
-                <div className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/[0.03] border border-white/[0.06] backdrop-blur-sm">
-                  <ArrowUpDown className="h-3 w-3 text-slate-500" />
-                  <span className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Sort</span>
-                </div>
-                {([
-                  ['name-asc', 'A-Z', 'violet'],
-                  ['name-desc', 'Z-A', 'violet'],
-                  ['stock-desc', 'Stok ↓', 'emerald'],
-                  ['stock-asc', 'Stok ↑', 'emerald'],
-                  ['value-desc', 'Nilai ↓', 'cyan'],
-                  ['value-asc', 'Nilai ↑', 'cyan'],
-                  ['updatedAt-desc', 'Baru', 'amber'],
-                  ['updatedAt-asc', 'Lama', 'amber'],
-                ] as const).map(([val, label, color]) => (
-                  <button
-                    key={val}
-                    onClick={() => { setInvSortBy(val); setInvPage(1); setSelectedInvIds(new Set()) }}
-                    className={cn(
-                      'shrink-0 px-3 py-1.5 rounded-full text-[10px] font-semibold transition-all duration-200 whitespace-nowrap backdrop-blur-sm',
-                      invSortBy === val
-                        ? cn(
-                            'shadow-lg ring-1 ring-white/10 scale-[1.02]',
-                            color === 'violet' && 'bg-gradient-to-r from-violet-500/20 to-purple-500/20 text-violet-300 border border-violet-400/30',
-                            color === 'cyan' && 'bg-gradient-to-r from-cyan-500/20 to-blue-500/20 text-cyan-300 border border-cyan-400/30',
-                            color === 'emerald' && 'bg-gradient-to-r from-emerald-500/20 to-green-500/20 text-emerald-300 border border-emerald-400/30',
-                            color === 'amber' && 'bg-gradient-to-r from-amber-500/20 to-orange-500/20 text-amber-300 border border-amber-400/30',
-                          )
-                        : 'text-slate-500 bg-white/[0.02] border border-transparent hover:text-slate-300 hover:bg-white/[0.05] hover:border-white/[0.08]',
-                    )}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
             </div>
 
             {/* Compact Mobile Cards - List Style Layout */}
@@ -4763,7 +5232,9 @@ export default function PurchasePage() {
                     const deleteStatus = getDeleteSafetyStatus(item)
                     // Calculate edit block status
                     const editBlockStatus = getEditBlockStatus(item)
-                    
+                    // Same-day highlight (spec point 4) — was missing on mobile.
+                    const sameDayBadge = getSameDayBadge(item.createdAt ?? item.lastBusinessChangeAt ?? item.updatedAt, item.lastBusinessChangeAt ?? item.updatedAt)
+
                     return (
                       <motion.div
                         key={item.id}
@@ -4773,32 +5244,32 @@ export default function PurchasePage() {
                         exit={{ opacity: 0, y: -8 }}
                         transition={{ duration: 0.15, delay: index * 0.015 }}
                       >
-                        {/* Compact List Item - Single Row */}
-                        <div 
+                        {/* Compact List Item - Single Row.
+                            CANONICAL CARD STRUCTURE (spec point 1 + 3):
+                            - Same border + bg for all cards — no stock-state tints.
+                            - No left accent bars.
+                            - Selected state keeps emerald ring (user action, not status).
+                            - Temporary emerald tint for scan/restock/adjust/sync. */}
+                        <div
                           className={cn(
-                            'flex items-center gap-2.5 p-2.5 rounded-xl border transition-colors active:bg-white/[0.03]',
-                            isSelected ? 'bg-emerald-500/[0.08] border-emerald-500/30' :
-                            isLow && !isArchived ? 'bg-red-500/[0.03] border-red-500/15' :
-                            isArchived ? 'bg-white/[0.01] border-white/[0.04] opacity-60' :
-                            'bg-white/[0.02] border-white/[0.06]'
+                            'flex items-center gap-2.5 p-2.5 rounded-xl border transition-colors duration-300 active:bg-white/[0.03]',
+                            isSelected
+                              ? 'bg-emerald-500/[0.08] border-emerald-500/30'
+                              : invRowHighlight.highlightedId === item.id
+                                ? 'bg-emerald-500/[0.06] border-emerald-500/20'
+                                : isArchived
+                                  ? 'bg-white/[0.01] border-white/[0.04] opacity-60'
+                                  : 'bg-white/[0.02] border-white/[0.06]'
                           )}
                           onClick={() => toggleInvSelect(item.id)}
                         >
-                          {/* Left accent bar */}
-                          {isLow && !isArchived && (
-                            <div className="w-[3px] h-10 rounded-full bg-red-500/60 shrink-0" />
-                          )}
-                          {isArchived && (
-                            <div className="w-[3px] h-10 rounded-full bg-amber-500/60 shrink-0" />
-                          )}
-                          
                           {/* Checkbox - Compact */}
                           <button
                             onClick={(e) => { e.stopPropagation(); toggleInvSelect(item.id) }}
                             className={cn(
                               'w-6 h-6 rounded-md border-2 flex items-center justify-center shrink-0 transition-all',
-                              isSelected 
-                                ? 'bg-emerald-500 border-emerald-500 text-white' 
+                              isSelected
+                                ? 'bg-emerald-500 border-emerald-500 text-white'
                                 : 'border-slate-600 hover:border-slate-500'
                             )}
                           >
@@ -4807,25 +5278,48 @@ export default function PurchasePage() {
 
                           {/* Main Content */}
                           <div className="flex-1 min-w-0">
-                            {/* Name + Status Badges */}
-                            <div className="flex items-center gap-1.5">
+                            {/* Name + Status Badges (spec point 2) */}
+                            <div className="flex items-center gap-1.5 flex-wrap">
                               <span className={cn(
                                 'text-sm font-semibold truncate',
                                 isArchived ? 'text-slate-500 line-through' : 'text-white'
                               )}>
                                 {item.name}
                               </span>
+                              {sameDayBadge === 'new' && <SameDayBadge variant="new" />}
                               {isArchived && (
-                                <span className="px-1 py-0 rounded bg-amber-500/15 text-amber-400 text-[8px] font-bold shrink-0">OFF</span>
-                              )}
-                              {isLow && !isArchived && (
-                                <span className="px-1 py-0 rounded bg-red-500/15 text-red-400 text-[8px] font-bold shrink-0">!</span>
-                              )}
-                              {!isArchived && deleteStatus.riskLevel === 'safe' && (
-                                <span className="px-1 py-0 rounded bg-emerald-500/15 text-emerald-400 shrink-0 flex items-center justify-center" title="Aman dihapus">
-                                  <Check className="h-2.5 w-2.5" />
+                                <span className="px-1.5 py-0 rounded bg-amber-500/15 text-amber-400 text-[9px] font-bold shrink-0 inline-flex items-center gap-0.5">
+                                  <Archive className="h-2 w-2" /> Nonaktif
                                 </span>
                               )}
+                              {!isArchived && deleteStatus.riskLevel === 'warning' && (
+                                <StatusIconPopover
+                                  ariaLabel="Migrasi — item memiliki data historis"
+                                  icon={<AlertCircle className="h-3.5 w-3.5" />}
+                                  tooltip="Migrasi"
+                                  popoverContent={
+                                    <PopoverContentBody title="Migrasi">
+                                      Item ini memiliki data historis (transaksi / movement). Hapus dengan hati-hati.
+                                    </PopoverContentBody>
+                                  }
+                                  tone="amber"
+                                />
+                              )}
+                              {!isArchived && deleteStatus.riskLevel === 'blocked' && (
+                                <StatusIconPopover
+                                  ariaLabel="Terkunci — item tidak bisa dihapus"
+                                  icon={<Lock className="h-3.5 w-3.5" />}
+                                  tooltip="Terkunci"
+                                  popoverContent={
+                                    <PopoverContentBody title="Terkunci">
+                                      Item ini tidak dapat dihapus karena masih terikat relasi aktif.
+                                    </PopoverContentBody>
+                                  }
+                                  tone="red"
+                                />
+                              )}
+                              {/* Compact StockStatusBadge (spec point 2) — replaces "!" + "OFF" */}
+                              <StockStatusBadge stock={item.stock} lowThreshold={item.lowStockAlert} className="!text-[9px] !px-1.5" />
                             </div>
                             {/* Category + Stock + Unit - Single Line */}
                             <div className="flex items-center gap-2 mt-0.5 text-slate-500">
@@ -4834,10 +5328,10 @@ export default function PurchasePage() {
                                   {item.category.name}
                                 </span>
                               ) : (
-                                <span className="text-[10px] text-slate-600">-</span>
+                                <span className="text-[10px] text-slate-600 italic">Tanpa kategori</span>
                               )}
                               <span className="text-[10px]">•</span>
-                              <span className={cn('text-[12px] font-bold tabular-nums', isLow && !isArchived ? 'text-red-400' : 'text-slate-300')}>
+                              <span className={cn('text-[12px] font-bold tabular-nums', stockValueColorClass(item.stock, item.lowStockAlert))}>
                                 {formatNumber(item.stock)}
                               </span>
                               <span className="text-[10px]">{item.baseUnit}</span>
@@ -4846,56 +5340,51 @@ export default function PurchasePage() {
                             </div>
                           </div>
 
-                          {/* Action Buttons - Compact Icon Only */}
-                          <div className="flex items-center gap-0.5 shrink-0" onClick={(e) => e.stopPropagation()}>
-                            <button
-                              className="w-7 h-7 rounded-md flex items-center justify-center text-slate-500 hover:text-blue-400 hover:bg-blue-500/10 transition-colors"
-                              onClick={() => openInvDetail(item)}
-                              title="Detail"
-                            >
-                              <Eye className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              className={cn(
-                                "w-7 h-7 rounded-md flex items-center justify-center transition-colors",
-                                editBlockStatus.isBlocked
-                                  ? "text-slate-700 cursor-not-allowed"
-                                  : "text-slate-500 hover:text-amber-400 hover:bg-amber-500/10"
-                              )}
-                              onClick={() => {
-                                if (editBlockStatus.isBlocked) {
-                                  toast.error(editBlockStatus.reason || 'Tidak bisa diedit')
-                                  return
-                                }
-                                openInvForm(item)
+                          {/* Action Menu - Slim pattern: primary View + kebab dropdown */}
+                          <div onClick={(e) => e.stopPropagation()}>
+                            <RowActionsMenu
+                              size="md"
+                              primaryAction={{
+                                label: 'Lihat Detail',
+                                icon: <Eye className="h-4 w-4" />,
+                                onClick: () => openInvDetail(item),
                               }}
-                              disabled={editBlockStatus.isBlocked}
-                              title={editBlockStatus.isBlocked ? editBlockStatus.reason : 'Edit'}
-                            >
-                              <Pencil className="h-3 w-3.5" />
-                            </button>
-                            <button
-                              className={cn(
-                                "w-7 h-7 rounded-md flex items-center justify-center transition-colors",
-                                isArchived
-                                  ? "text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
-                                  : "text-slate-500 hover:text-red-400 hover:bg-red-500/10"
-                              )}
-                              onClick={() => {
-                                if (isArchived) {
-                                  handleRestoreInv(item.id)
-                                } else {
-                                  void openDeleteInvDialog(item.id)
-                                }
-                              }}
-                              title={isArchived ? 'Aktifkan' : 'Hapus'}
-                            >
-                              {isArchived ? (
-                                <RotateCcw className="h-3 w-3.5" />
-                              ) : (
-                                <Trash2 className="h-3 w-3.5" />
-                              )}
-                            </button>
+                              items={[
+                                {
+                                  label: 'Edit',
+                                  icon: <Pencil className="h-3.5 w-3.5" />,
+                                  onClick: () => {
+                                    if (editBlockStatus.isBlocked) {
+                                      toast.error(editBlockStatus.reason || 'Tidak bisa diedit')
+                                      return
+                                    }
+                                    openInvForm(item)
+                                  },
+                                  disabled: editBlockStatus.isBlocked,
+                                  title: editBlockStatus.isBlocked ? editBlockStatus.reason : undefined,
+                                },
+                                {
+                                  label: 'Lihat Movement / Batch',
+                                  icon: <Activity className="h-3.5 w-3.5" />,
+                                  onClick: () => void openInvDetailAtMovements(item),
+                                },
+                              ]}
+                              dangerItems={[
+                                {
+                                  label: isArchived ? 'Aktifkan Kembali' : 'Hapus / Nonaktifkan',
+                                  icon: isArchived
+                                    ? <RotateCcw className="h-3.5 w-3.5" />
+                                    : <Trash2 className="h-3.5 w-3.5" />,
+                                  onClick: () => {
+                                    if (isArchived) {
+                                      handleRestoreInv(item.id)
+                                    } else {
+                                      void openDeleteInvDialog(item.id)
+                                    }
+                                  },
+                                },
+                              ]}
+                            />
                           </div>
                         </div>
                       </motion.div>
@@ -5036,89 +5525,81 @@ export default function PurchasePage() {
                 </p>
               )}
 
-              {/* Actions — Owner only */}
-              {isOwner && (
+              {/* Actions — Owner only. Uses canonical safety evaluator
+                  (fetched on openPoDetail) instead of list-hint flags. */}
+              {isOwner && poDetailData && (() => {
+                const detailSafety = resolvePoSafety(poDetailData)
+                return (
               <div>
                 <div className="flex gap-2 pt-2 border-t border-white/[0.04]">
-                  {/* EDIT BUTTON - SINKRON DENGAN TABLE LOGIC */}
+                  {/* EDIT BUTTON */}
                   <Button
                     size="sm"
                     variant="ghost"
                     className={cn(
                       "flex-1 h-8 text-xs gap-1.5",
-                      poDetailHasRealBusinessHistory
+                      !detailSafety.canEdit
                         ? "text-slate-600 cursor-not-allowed"
                         : "text-slate-400 hover:text-white hover:bg-white/[0.04]"
                     )}
                     onClick={() => {
-                      if (poDetailHasRealBusinessHistory) {
-                        toast.error('Pembelian memiliki riwayat bisnis (transfer/penjualan) — tidak bisa diedit')
+                      if (!detailSafety.canEdit) {
+                        toast.error('Pembelian tidak dapat diedit — lihat alasan di bawah')
                         return
                       }
                       openPoEdit(poDetailData!)
                     }}
-                    disabled={poDetailHasRealBusinessHistory}
-                    title={poDetailHasRealBusinessHistory ? 'Ada riwayat transfer/penjualan' : 'Edit pembelian'}
+                    disabled={!detailSafety.canEdit}
+                    title={detailSafety.canEdit ? 'Edit pembelian' : 'Tidak dapat diedit'}
                   >
                     <Edit3 className="h-3.5 w-3.5" />
                     Edit
                   </Button>
-                  {/* HAPUS BUTTON - SINKRON DENGAN TABLE LOGIC */}
+                  {/* BATALKAN BUTTON (reverse + hard delete) */}
                   <Button
                     size="sm"
                     variant="ghost"
                     className={cn(
                       "flex-1 h-8 text-xs gap-1.5",
-                      (poDetailHasRealBusinessHistory || poDetailHasUsageHistory)
+                      !detailSafety.canDelete
                         ? "text-red-400/40 cursor-not-allowed"
-                        : poDetailHasLinked
-                          ? "text-amber-400 hover:text-amber-300 hover:bg-amber-500/[0.06]"
-                          : "text-red-400 hover:text-red-300 hover:bg-red-500/[0.06]"
+                        : "text-red-400 hover:text-red-300 hover:bg-red-500/[0.06]"
                     )}
                     onClick={() => {
-                      if (poDetailHasRealBusinessHistory || poDetailHasUsageHistory) {
-                        toast.error('Pembelian memiliki riwayat bisnis — tidak bisa dihapus')
+                      if (!detailSafety.canDelete) {
+                        toast.error('Pembelian tidak dapat dibatalkan — lihat alasan di bawah')
                         return
-                      }
-                      if (poDetailHasLinked) {
-                        toast.warning('Link ke produk akan dibersihkan otomatis')
                       }
                       setDeletePoId(poDetailData!.id)
                     }}
-                    disabled={poDetailHasRealBusinessHistory || poDetailHasUsageHistory}
-                    title={
-                      (poDetailHasRealBusinessHistory || poDetailHasUsageHistory)
-                        ? 'Ada riwayat bisnis — tidak bisa dihapus'
-                        : poDetailHasLinked
-                          ? 'Hapus (link produk akan dibersihkan)'
-                          : 'Hapus pembelian'
-                    }
+                    disabled={!detailSafety.canDelete}
+                    title={detailSafety.canDelete ? 'Batalkan pembelian' : 'Tidak dapat dibatalkan'}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
-                    Hapus
+                    Batalkan
                   </Button>
                 </div>
-                {/* Warning message - sinkron dengan table logic */}
-                {poDetailHasRealBusinessHistory && (
-                  <p className="text-[10px] text-red-400/70 text-center -mt-1 flex items-center justify-center gap-1">
-                    <AlertTriangle className="h-3 w-3 shrink-0" />
-                    <span>Pembelian memiliki riwayat transfer/penjualan — tidak bisa edit/hapus</span>
-                  </p>
-                )}
-                {!poDetailHasRealBusinessHistory && poDetailHasLinked && (
-                  <p className="text-[10px] text-amber-400/70 text-center -mt-1 flex items-center justify-center gap-1">
-                    <AlertTriangle className="h-3 w-3 shrink-0" />
-                    <span>Item terkait produk — hapus pembelian bisa mengubah komposisi</span>
-                  </p>
-                )}
-                {!poDetailHasRealBusinessHistory && !poDetailHasLinked && poDetailHasUsageHistory && (
-                  <p className="text-[10px] text-amber-400/70 text-center -mt-1 flex items-center justify-center gap-1">
-                    <AlertTriangle className="h-3 w-3 shrink-0" />
-                    <span>Item sudah terpakai dalam transaksi — tidak bisa dihapus</span>
-                  </p>
+                {/* Reason list — shown when either action is locked.
+                    Uses canonical evaluator reasons (specific + Indonesian). */}
+                {((!detailSafety.canEdit || !detailSafety.canDelete) && detailSafety.reasons.length > 0) && (
+                  <div className="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/[0.04] p-2.5">
+                    <p className="text-[10px] font-semibold text-amber-400 uppercase tracking-wide mb-1 flex items-center gap-1">
+                      <AlertTriangle className="h-3 w-3 shrink-0" />
+                      Tidak dapat diedit/dibatalkan
+                    </p>
+                    <ul className="space-y-0.5">
+                      {detailSafety.reasons.map((r, i) => (
+                        <li key={i} className="text-[11px] text-amber-300/80 flex items-start gap-1.5">
+                          <span className="text-amber-500/60 mt-0.5">•</span>
+                          <span>{r}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
                 )}
               </div>
-              )}
+                )
+              })()}
             </div>
           ) : null}
         </ResponsiveDialogContent>
@@ -5287,10 +5768,24 @@ export default function PurchasePage() {
                 {/* ══════════════════════════════════════════════════════ */}
                 {inputMethod === 'manual' && (
                   <div className="space-y-3">
-                    {/* ── Section Label ── */}
-                    <div className="flex items-center gap-2">
-                      <Package className="h-3.5 w-3.5 text-slate-400" />
-                      <span className="text-[11px] text-slate-400 font-medium">Daftar Barang yang Dibeli</span>
+                    {/* ── Section Label + Camera Scan Button ── */}
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <Package className="h-3.5 w-3.5 text-slate-400" />
+                        <span className="text-[11px] text-slate-400 font-medium">Daftar Barang yang Dibeli</span>
+                      </div>
+                      {/* Adapter B: camera scan button — opens BarcodeScannerDialog.
+                          ADDITIVE on top of the hardware-scanner smart input below. */}
+                      <button
+                        type="button"
+                        onClick={() => setPoScanOpen(true)}
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-medium text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10 border border-emerald-500/20 transition-colors"
+                        title="Scan barcode dengan kamera (tambah ke daftar belanja)"
+                        aria-label="Scan barcode dengan kamera"
+                      >
+                        <Camera className="h-3.5 w-3.5" />
+                        <span>Scan Kamera</span>
+                      </button>
                     </div>
 
                     {/* ── Smart Input Bar ── */}
@@ -5935,65 +6430,122 @@ export default function PurchasePage() {
             )}
           </div>
 
-          {/* ── Sticky Summary + Footer ── */}
+          {/* ── Sticky Summary + Footer (compact, collapsible) ──
+              Layout: Total Pembelian row + compact counts row + "Lihat Detail"
+              toggle. Dampak/HPP lists only render when expanded. Keeps the
+              summary under ~30% of modal height so the item editor stays the
+              primary area. Footer (Batal/Simpan) always visible below. */}
           <div className="pt-3 mt-auto border-t border-white/[0.06]">
-            <div className="rounded-xl p-3.5 border border-white/[0.06] bg-white/[0.02] mb-3 space-y-2.5">
-              {/* Total Pembelian */}
+            <div className="rounded-xl p-3 border border-white/[0.06] bg-white/[0.02] mb-2.5 space-y-2">
+              {/* Row 1: Total Pembelian (always shown) */}
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Banknote className="h-4 w-4 text-emerald-400" />
                   <span className="text-xs text-slate-400">Total Pembelian</span>
                 </div>
-                <span className="text-lg font-bold text-emerald-400">{formatCurrency(poTotalCost)}</span>
+                <span className="text-base font-bold text-emerald-400">{formatCurrency(poTotalCost)}</span>
               </div>
 
-              {/* Dampak ke Inventory */}
-              {poCreateInventoryImpact.length > 0 && (
-                <div className="space-y-1 pt-1 border-t border-white/[0.04]">
-                  <div className="flex items-center gap-1.5 pt-1">
-                    <PackagePlus className="h-3 w-3 text-sky-400" />
-                    <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wide">Dampak ke Inventory</span>
+              {/* Row 2: Compact counts + "Lihat Detail" toggle.
+                  Only show this row when there's detail to expand. */}
+              {(() => {
+                const selectedItemCount = poCreateItems.filter(i => i.inventoryItemId).length
+                const inventoryImpacted = poCreateInventoryImpact.length
+                const hppChanged = poCreateItems.filter(i => i.inventoryItemId).filter(i => {
+                  const hpp = estimatedHpp(i)
+                  return hpp != null && hpp > 0 && i.baseUnit
+                }).length
+                const hasDetail = inventoryImpacted > 0 || hppChanged > 0
+                if (!hasDetail && selectedItemCount === 0) return null
+                return (
+                  <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-white/[0.04]">
+                    <div className="flex items-center gap-3 text-[10px] text-slate-400">
+                      {selectedItemCount > 0 && (
+                        <span className="flex items-center gap-1">
+                          <PackagePlus className="h-3 w-3 text-sky-400" />
+                          <span><span className="text-slate-200 font-semibold tabular-nums">{selectedItemCount}</span> item</span>
+                        </span>
+                      )}
+                      {inventoryImpacted > 0 && (
+                        <span className="flex items-center gap-1">
+                          <PackagePlus className="h-3 w-3 text-sky-400" />
+                          <span><span className="text-slate-200 font-semibold tabular-nums">{inventoryImpacted}</span> inventory terdampak</span>
+                        </span>
+                      )}
+                      {hppChanged > 0 && (
+                        <span className="flex items-center gap-1">
+                          <Calculator className="h-3 w-3 text-amber-400" />
+                          <span><span className="text-slate-200 font-semibold tabular-nums">{hppChanged}</span> HPP berubah</span>
+                        </span>
+                      )}
+                    </div>
+                    {hasDetail && (
+                      <button
+                        type="button"
+                        onClick={() => setPoSummaryDetailOpen(prev => !prev)}
+                        className="text-[10px] text-slate-400 hover:text-white flex items-center gap-0.5 transition-colors shrink-0"
+                      >
+                        {poSummaryDetailOpen ? 'Sembunyikan' : 'Lihat Detail'}
+                        <ChevronDown className={cn('h-3 w-3 transition-transform', poSummaryDetailOpen && 'rotate-180')} />
+                      </button>
+                    )}
                   </div>
-                  <div className="space-y-0.5 max-h-32 overflow-y-auto">
-                    {poCreateInventoryImpact.map((imp, i) => (
-                      <div key={i} className="flex items-center justify-between text-[11px]">
-                        <span className="text-slate-300 truncate flex-1 min-w-0 pr-2">
-                          {imp.name}
-                          {imp.isNew && <span className="text-amber-400/70 ml-1">(baru)</span>}
-                        </span>
-                        <span className={cn('font-semibold shrink-0', imp.impact == null ? 'text-red-400' : 'text-emerald-400')}>
-                          {imp.impact == null ? 'konversi invalid' : `+${formatNumber(imp.impact)} ${imp.baseUnit}`}
-                        </span>
+                )
+              })()}
+
+              {/* Collapsible detail: Dampak ke Inventory + Estimasi HPP.
+                  Only renders when expanded AND there's content. */}
+              {poSummaryDetailOpen && (
+                <div className="space-y-2 pt-1.5 border-t border-white/[0.04]">
+                  {/* Dampak ke Inventory */}
+                  {poCreateInventoryImpact.length > 0 && (
+                    <div className="space-y-0.5">
+                      <div className="flex items-center gap-1.5">
+                        <PackagePlus className="h-3 w-3 text-sky-400" />
+                        <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wide">Dampak ke Inventory</span>
                       </div>
-                    ))}
-                  </div>
+                      <div className="space-y-0.5 max-h-28 overflow-y-auto">
+                        {poCreateInventoryImpact.map((imp, i) => (
+                          <div key={i} className="flex items-center justify-between text-[11px]">
+                            <span className="text-slate-300 truncate flex-1 min-w-0 pr-2">
+                              {imp.name}
+                              {imp.isNew && <span className="text-amber-400/70 ml-1">(baru)</span>}
+                            </span>
+                            <span className={cn('font-semibold shrink-0', imp.impact == null ? 'text-red-400' : 'text-emerald-400')}>
+                              {imp.impact == null ? 'konversi invalid' : `+${formatNumber(imp.impact)} ${imp.baseUnit}`}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Estimasi HPP */}
+                  {poCreateItems.filter(i => i.inventoryItemId).some(i => estimatedHpp(i) != null && (estimatedHpp(i) || 0) > 0) && (
+                    <div className="space-y-0.5">
+                      <div className="flex items-center gap-1.5">
+                        <Calculator className="h-3 w-3 text-amber-400" />
+                        <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wide">Estimasi HPP</span>
+                      </div>
+                      <div className="space-y-0.5 max-h-24 overflow-y-auto">
+                        {poCreateItems.filter(i => i.inventoryItemId).map((i, mapIdx) => {
+                          const hpp = estimatedHpp(i)
+                          if (hpp == null || hpp <= 0 || !i.baseUnit) return null
+                          return (
+                            <div key={mapIdx} className="flex items-center justify-between text-[11px]">
+                              <span className="text-slate-300 truncate flex-1 min-w-0 pr-2">{i.inventoryItemName}</span>
+                              <span className="text-amber-400/90 font-medium shrink-0">{formatCurrency(hpp)}/{i.baseUnit}</span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                      <p className="text-[9px] text-slate-600 pt-0.5">HPP final dihitung backend setelah simpan (weighted average untuk item existing).</p>
+                    </div>
+                  )}
                 </div>
               )}
 
-              {/* Estimasi HPP */}
-              {poCreateItems.filter(i => i.inventoryItemId).some(i => estimatedHpp(i) != null && (estimatedHpp(i) || 0) > 0) && (
-                <div className="space-y-1 pt-1 border-t border-white/[0.04]">
-                  <div className="flex items-center gap-1.5 pt-1">
-                    <Calculator className="h-3 w-3 text-amber-400" />
-                    <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wide">Estimasi HPP</span>
-                  </div>
-                  <div className="space-y-0.5 max-h-24 overflow-y-auto">
-                    {poCreateItems.filter(i => i.inventoryItemId).map((i, mapIdx) => {
-                      const hpp = estimatedHpp(i)
-                      if (hpp == null || hpp <= 0 || !i.baseUnit) return null
-                      return (
-                        <div key={mapIdx} className="flex items-center justify-between text-[11px]">
-                          <span className="text-slate-300 truncate flex-1 min-w-0 pr-2">{i.inventoryItemName}</span>
-                          <span className="text-amber-400/90 font-medium shrink-0">{formatCurrency(hpp)}/{i.baseUnit}</span>
-                        </div>
-                      )
-                    })}
-                  </div>
-                  <p className="text-[9px] text-slate-600 pt-0.5">HPP final dihitung backend setelah simpan (weighted average untuk item existing).</p>
-                </div>
-              )}
-
-              {/* Helper notes */}
+              {/* Helper notes — always shown (warning, not detail) */}
               {poCreateItems.some(i => i.inventoryItemId.startsWith('__pending_')) && (
                 <p className="text-[10px] text-amber-400/70 flex items-center gap-1 pt-1 border-t border-white/[0.04]">
                   <PackageOpen className="h-3 w-3" />
@@ -6668,9 +7220,9 @@ export default function PurchasePage() {
       <AlertDialog open={!!deletePoId} onOpenChange={(open) => { if (!open) setDeletePoId(null) }}>
         <AlertDialogContent className="bg-nebula border-white/[0.06]">
           <AlertDialogHeader>
-            <AlertDialogTitle className="text-white">Hapus Pembelian?</AlertDialogTitle>
+            <AlertDialogTitle className="text-white">Batalkan Pembelian?</AlertDialogTitle>
             <AlertDialogDescription className="text-slate-400">
-              Pembelian yang dihapus tidak dapat dikembalikan. Stok item yang sudah masuk dari pembelian ini juga akan dikurangi.
+              Stok item yang sudah masuk dari pembelian ini akan dikurangi kembali (reverse). Batch inventory yang terkait akan dihapus. Pembelian yang sudah dibatalkan tidak dapat dikembalikan.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="gap-2">
@@ -6680,7 +7232,7 @@ export default function PurchasePage() {
               onClick={handleDeletePo}
               disabled={deletingPo}
             >
-              {deletingPo ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Hapus'}
+              {deletingPo ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Batalkan Pembelian'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -9391,6 +9943,74 @@ export default function PurchasePage() {
           )}
         </ResponsiveDialogContent>
       </ResponsiveDialog>
+
+      {/* Barcode Scanner Dialog — shared camera scan UI for inventory search.
+          Adapter A: closeOnSuccess=TRUE. onResult does all resolution:
+          inventory SKU/name → open detail; product barcode → composition →
+          detail / picker / not-found. NEVER auto-closes on errors/not-found. */}
+      <BarcodeScannerDialog
+        open={invScannerOpen}
+        onOpenChange={setInvScannerOpen}
+        onResult={handleInvScanResult}
+        closeOnSuccess
+        title="Scan Barcode Inventory"
+        inputPlaceholder="Ketik barcode / SKU item..."
+      />
+
+      {/* Picker for MULTIPLE inventory relations (Adapter A).
+          Shown when a scanned product/variant barcode maps to >1 inventory
+          items via ProductComposition. User picks one → opens detail. */}
+      <Dialog open={invScanPickerOpen} onOpenChange={setInvScanPickerOpen}>
+        <DialogContent className="sm:max-w-md bg-nebula border-white/[0.06]">
+          <DialogHeader>
+            <DialogTitle className="text-white text-base">Pilih Item Inventory</DialogTitle>
+            <DialogDescription className="text-slate-400 text-xs">
+              Barcode produk ini terkait beberapa item inventory. Pilih salah satu untuk melihat detail.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5 max-h-80 overflow-y-auto pr-1 -mr-1">
+            {invScanPickerItems.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => {
+                  setInvScanPickerOpen(false)
+                  openInvDetail(item)
+                }}
+                className="w-full text-left rounded-lg border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] hover:border-emerald-500/30 transition-all px-3 py-2.5"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-white truncate">{item.name}</p>
+                    {item.sku && (
+                      <p className="text-[10px] text-slate-500 font-mono truncate">SKU: {item.sku}</p>
+                    )}
+                  </div>
+                  <div className="text-right shrink-0">
+                    <p className="text-xs font-semibold text-emerald-400">
+                      {formatNumber(item.stock)} <span className="text-[10px] text-slate-400 font-normal">{item.baseUnit}</span>
+                    </p>
+                    <p className="text-[10px] text-slate-500">{formatCurrency(item.avgCost)}/{item.baseUnit}</p>
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Barcode Scanner Dialog — PO create form (Adapter B).
+          closeOnSuccess=FALSE → continuous scanning. onResult adds the matched
+          inventory item to poCreateItems (+1 qty if already present) and focuses
+          the qty input of the affected row. ADDITIVE on top of the existing
+          hardware-scanner smart input — does NOT replace it. */}
+      <BarcodeScannerDialog
+        open={poScanOpen}
+        onOpenChange={setPoScanOpen}
+        onResult={handlePoScanResult}
+        title="Scan Barcode Item Inventory"
+        inputPlaceholder="Ketik barcode / SKU item..."
+      />
     </motion.div>
   )
 }
