@@ -40,6 +40,8 @@
  */
 
 import { Prisma } from '@prisma/client'
+import type { CheckoutPerf } from '@/lib/perf-timer'
+import { txPhase } from '@/lib/tx-phase'
 
 // ════════════════════════════════════════════════════════════
 // Types
@@ -96,7 +98,7 @@ interface CompositionRow {
 // Transaction Client Type
 // ════════════════════════════════════════════════════════════
 
-type TxClient = Parameters<Parameters<typeof Prisma.prototype.$transaction>[0]>[0]
+type TxClient = Prisma.TransactionClient
 
 // ════════════════════════════════════════════════════════════
 // Service
@@ -119,6 +121,7 @@ export class InventoryConsumptionService {
    */
   static async consumeForTransaction(
     tx: TxClient,
+    perf: CheckoutPerf | null,
     params: {
       items: ConsumptionItem[]
       transactionId: string
@@ -128,6 +131,8 @@ export class InventoryConsumptionService {
     }
   ): Promise<ConsumptionResult> {
     const { items, transactionId, invoiceNumber, outletId, userId } = params
+
+    const trackQuery = () => perf?.trackQuery()
 
     if (items.length === 0) {
       return { success: true, deductions: [], totalMaterialCost: 0 }
@@ -139,7 +144,9 @@ export class InventoryConsumptionService {
 
     // ── 2. LANGSUNG query ProductComposition — bukan via hasComposition flag ──
     //    Ini adalah fix utama: kita cek data aktual, bukan flag yang bisa stale.
-    const allComps: CompositionRow[] = await tx.productComposition.findMany({
+    trackQuery()
+    const allComps: CompositionRow[] = await txPhase(perf, 'invConsume.fetchCompositions', () =>
+      tx.productComposition.findMany({
       where: {
         productId: { in: allProductIds },
         // Fetch: product-level compositions (variantId: null) OR
@@ -154,7 +161,7 @@ export class InventoryConsumptionService {
           select: { id: true, name: true, stock: true, avgCost: true },
         },
       },
-    })
+    }))
 
     // Jika tidak ada komposisi sama sekali → tidak ada yang perlu di-deduct
     if (allComps.length === 0) {
@@ -226,10 +233,13 @@ export class InventoryConsumptionService {
     //    Race-condition-free: UPDATE SET stock = stock - qty WHERE stock >= qty
     //    Jika affected = 0 → stok tidak cukup (mungkin transaksi lain ambil duluan)
     const invItemIds = [...deductions.keys()]
-    const invItems = await tx.inventoryItem.findMany({
-      where: { id: { in: invItemIds } },
-      select: { id: true, name: true, stock: true, avgCost: true },
-    })
+    trackQuery()
+    const invItems = await txPhase(perf, 'invConsume.fetchInvItems', () =>
+      tx.inventoryItem.findMany({
+        where: { id: { in: invItemIds } },
+        select: { id: true, name: true, stock: true, avgCost: true },
+      })
+    )
     const stockMap = new Map<string, number>(invItems.map(i => [i.id, i.stock]))
     const costMap = new Map<string, number>(invItems.map(i => [i.id, Number(i.avgCost)]))
 
@@ -239,11 +249,17 @@ export class InventoryConsumptionService {
     for (const [invItemId, deduction] of deductions) {
       const previousStock = stockMap.get(invItemId) ?? 0
 
-      // Atomic: check + decrement in one SQL operation
-      const affected = (await tx.$executeRaw`
-        UPDATE "InventoryItem" SET stock = stock - ${deduction.totalDeducted}
-        WHERE id = ${invItemId} AND stock >= ${deduction.totalDeducted}
-      `) as number
+      // Atomic: check + decrement in one SQL operation.
+      // txPhase rethrows on DB error — NEVER swallow (PostgreSQL 25P02 rule):
+      // a failed UPDATE poisons the transaction; catching it would make the
+      // next query (FEFO / createMany) fail with 25P02 downstream.
+      trackQuery()
+      const affected = (await txPhase(perf, `invConsume.deductStock.${invItemId.slice(-6)}`, () =>
+        tx.$executeRaw`
+          UPDATE "InventoryItem" SET stock = stock - ${deduction.totalDeducted}
+          WHERE id = ${invItemId} AND stock >= ${deduction.totalDeducted}
+        `
+      )) as number
       if (affected === 0) {
         const sourceDesc = deduction.sources
           .map(s => s.variantName ? `${s.productName} (${s.variantName})` : s.productName)
@@ -282,19 +298,41 @@ export class InventoryConsumptionService {
     //    and compute Actual COGS (Σ batch.qty × batch.unitCost) for each deduction.
     //    For non-batch items (Mode B), recordBatchConsumption returns null and
     //    we keep the avgCost-based fallback (weighted-average costing).
-    try {
+    //
+    //    PERF: Batch-optimized — ALL deductions are processed in a SINGLE call
+    //    to FEFOEngine.recordBatchConsumptionBatch, which fetches/marks/updates
+    //    ALL affected batches in a handful of batched Prisma/Raw-SQL calls
+    //    (vs N × ~10 queries for the per-item loop). For a cart with 2
+    //    composition products sharing 1 inventory item, this drops the
+    //    `invConsume` phase query count from ~20 to ~6-10.
+    //
+    //    25P02 FIX (CRITICAL): the previous code wrapped this call in a
+    //    try/catch and SWALLOWED DB errors ("NON-FATAL, do NOT re-throw").
+    //    That pattern is FATAL on PostgreSQL: if any query inside
+    //    recordBatchConsumptionBatch fails, the transaction is ABORTED and
+    //    every later query — including the `inventoryMovement.createMany()`
+    //    at step 7 — fails with 25P02 "current transaction is aborted".
+    //    The swallowed error hid the REAL first failure. Now we let errors
+    //    propagate so Prisma rolls back cleanly and the outer handler sees
+    //    the true root cause (annotated with `.checkoutPhase`).
+    if (resultDeductions.length > 0) {
       const { FEFOEngine } = await import('@/lib/fefo-engine')
-      for (const deduction of resultDeductions) {
-        const batchResult = await FEFOEngine.recordBatchConsumption(tx, {
-          inventoryItemId: deduction.inventoryItemId,
-          quantityNeeded: deduction.totalDeducted,
+      const batchResults = await txPhase(perf, 'invConsume.fefoBatch', () =>
+        FEFOEngine.recordBatchConsumptionBatch(tx, perf, {
           transactionId,
           invoiceNumber,
           outletId,
           userId,
-          sourceDetails: JSON.stringify(deduction.sources),
+          deductions: resultDeductions.map(d => ({
+            inventoryItemId: d.inventoryItemId,
+            quantityNeeded: d.totalDeducted,
+            sourceDetails: JSON.stringify(d.sources),
+          })),
         })
+      )
 
+      for (const deduction of resultDeductions) {
+        const batchResult = batchResults.get(deduction.inventoryItemId)
         if (batchResult && batchResult.batchConsumptions.length > 0) {
           // Actual COGS = Σ(batch.quantityConsumed × batch.unitCost)
           const actualMaterialCost = batchResult.batchConsumptions.reduce(
@@ -315,18 +353,6 @@ export class InventoryConsumptionService {
         }
         // else: no batches for this item (Mode B non-batch). Keep avgCost fallback.
       }
-    } catch (batchError) {
-      // INV-HC-05 (REVISED): FEFO batch recording errors are now NON-FATAL.
-      // The InventoryItem.stock was already deducted atomically above (the
-      // authoritative ledger). Batch tracking is a CAPABILITY, not a requirement.
-      // If batch recording fails (e.g., unexpected DB error), we log the error
-      // but do NOT rollback the sale — the customer's transaction succeeds.
-      // The materialCost stays at the avgCost fallback (best-effort Actual COGS).
-      const msg = batchError instanceof Error ? batchError.message : String(batchError)
-      console.error(
-        `[InvConsumption] ${invoiceNumber} — FEFO batch recording failed (NON-FATAL, sale continues, avgCost fallback used for COGS): ${msg}`
-      )
-      // Do NOT re-throw — let the transaction commit with stock deduction intact.
     }
 
     // Recompute totalMaterialCost from per-deduction actual costs (post-FEFO)
@@ -338,25 +364,33 @@ export class InventoryConsumptionService {
     )
 
     // ── 7. CREATE INVENTORY MOVEMENTS ──
+    //    25P02 FIX: wrapped in txPhase so a DB error here is annotated with
+    //    the phase name and rethrown (NOT swallowed). If this createMany fails
+    //    with 25P02, it means an EARLIER query in the transaction already
+    //    aborted it — the `.checkoutPhase` annotation on the error will point
+    //    to the real first failure (e.g. invConsume.fefoBatch.*).
     if (resultDeductions.length > 0) {
-      await tx.inventoryMovement.createMany({
-        data: resultDeductions.map(d => ({
-          type: 'CONSUMPTION',
-          inventoryItemId: d.inventoryItemId,
-          quantity: -d.totalDeducted,
-          previousStock: d.previousStock,
-          newStock: d.newStock,
-          referenceId: transactionId,
-          referenceType: 'TRANSACTION',
-          notes: `Konsumsi: ${d.sources.map(s =>
-            s.variantName
-              ? `${s.productName} (${s.variantName}) ×${s.productQty} [${s.batchesUsed} batch × ${s.materialPerBatch} ${d.baseUnit}]`
-              : `${s.productName} ×${s.productQty} [${s.batchesUsed} batch × ${s.materialPerBatch} ${d.baseUnit}]`
-          ).join(', ')} (${invoiceNumber})`,
-          outletId,
-          userId,
-        })),
-      })
+      trackQuery()
+      await txPhase(perf, 'invConsume.createMovements', () =>
+        tx.inventoryMovement.createMany({
+          data: resultDeductions.map(d => ({
+            type: 'CONSUMPTION',
+            inventoryItemId: d.inventoryItemId,
+            quantity: -d.totalDeducted,
+            previousStock: d.previousStock,
+            newStock: d.newStock,
+            referenceId: transactionId,
+            referenceType: 'TRANSACTION',
+            notes: `Konsumsi: ${d.sources.map(s =>
+              s.variantName
+                ? `${s.productName} (${s.variantName}) ×${s.productQty} [${s.batchesUsed} batch × ${s.materialPerBatch} ${d.baseUnit}]`
+                : `${s.productName} ×${s.productQty} [${s.batchesUsed} batch × ${s.materialPerBatch} ${d.baseUnit}]`
+            ).join(', ')} (${invoiceNumber})`,
+            outletId,
+            userId,
+          })),
+        })
+      )
     }
 
     // ── 8. NO PER-DEDUCTION AUDIT LOG (AuditLog V2 — event-oriented) ──
